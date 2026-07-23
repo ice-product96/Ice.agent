@@ -801,9 +801,9 @@ async def create_mcp(payload: McpBody, request: Request, db: AsyncSession = Depe
                 "env": decrypt_mcp_env(server),
             })
             result["connection_status"] = "connected"
-        except Exception as exc:
+        except BaseException as exc:
             result["connection_status"] = "error"
-            result["connection_error"] = str(exc)
+            result["connection_error"] = str(exc) or type(exc).__name__
     return result
 
 
@@ -841,7 +841,6 @@ async def update_mcp(server_id: str, request: Request, db: AsyncSession = Depend
         await db.rollback()
         raise HTTPException(status_code=409, detail=f"Unable to update MCP server: {exc}") from exc
     await db.refresh(server)
-    await request.app.state.mcp.disconnect(old_name)
     result = mcp_json(server)
     result["connection_status"] = "disconnected"
     if server.enabled:
@@ -851,16 +850,19 @@ async def update_mcp(server_id: str, request: Request, db: AsyncSession = Depend
                 "env": decrypt_mcp_env(server),
             })
             result["connection_status"] = "connected"
-        except Exception as exc:
+        except BaseException as exc:
             result["connection_status"] = "error"
-            result["connection_error"] = str(exc)
+            result["connection_error"] = str(exc) or type(exc).__name__
     return result
 
 
 @router.delete("/mcp/servers/{server_id}", dependencies=auth, status_code=204)
 async def delete_mcp(server_id: str, request: Request, db: AsyncSession = Depends(get_db)) -> Response:
     server = await one(db, McpServer, server_id)
-    await request.app.state.mcp.disconnect(server.name)
+    try:
+        await request.app.state.mcp.disconnect(server.name)
+    except BaseException:
+        pass
     await db.delete(server)
     await db.commit()
     return Response(status_code=204)

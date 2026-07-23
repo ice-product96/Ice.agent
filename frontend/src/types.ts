@@ -68,6 +68,8 @@ export interface McpServer {
   env?: Record<string, string>
   enabled: boolean
   status?: Status
+  connection_status?: 'connected' | 'disconnected' | 'error'
+  connection_error?: string
   tools?: string[]
 }
 
