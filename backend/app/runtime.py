@@ -307,6 +307,13 @@ class AgentRuntime:
                 McpServer.enabled.is_(True),
             )
         ))
+        # If no explicit attach rows, enable all connected MCP servers when agent has the mcp tool
+        tools = set((agent.config or {}).get("tools") or [])
+        if not mcp_server_names and "mcp" in tools:
+            mcp_server_names = {
+                name
+                for name in (self.mcp.sessions if self.mcp else {})
+            }
         client = LLMClient(
             api_key=api_key,
             base_url=profile.base_url,

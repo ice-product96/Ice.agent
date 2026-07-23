@@ -276,12 +276,14 @@ class McpManager:
         self.sessions: dict[str, Any] = {}
         self._stacks: dict[str, AsyncExitStack] = {}
 
-    async def _session(self, name: str, transport: Any) -> None:
+    async def _session(self, name: str, transport: Any, http_client: Any = None) -> None:
         from mcp import ClientSession
 
         await self.disconnect(name)
         stack = AsyncExitStack()
         try:
+            if http_client is not None:
+                await stack.enter_async_context(http_client)
             streams = await stack.enter_async_context(transport)
             read, write = streams[:2]
             session = await stack.enter_async_context(ClientSession(read, write))
@@ -298,24 +300,45 @@ class McpManager:
 
         await self._session(name, stdio_client(StdioServerParameters(command=command, args=args, env=env)))
 
-    async def connect_sse(self, name: str, url: str) -> None:
+    async def connect_sse(self, name: str, url: str, headers: dict[str, str] | None = None) -> None:
         from mcp.client.sse import sse_client
 
-        await self._session(name, sse_client(url))
+        await self._session(name, sse_client(url, headers=headers or None))
 
-    async def connect_streamable_http(self, name: str, url: str) -> None:
+    async def connect_streamable_http(
+        self,
+        name: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        import inspect
+
+        import httpx
         from mcp.client.streamable_http import streamable_http_client
 
+        params = inspect.signature(streamable_http_client).parameters
+        if "headers" in params:
+            await self._session(name, streamable_http_client(url, headers=headers or None))
+            return
+        if "http_client" in params:
+            client = httpx.AsyncClient(
+                headers=headers or {},
+                timeout=httpx.Timeout(30.0, read=300.0),
+                follow_redirects=True,
+            )
+            await self._session(name, streamable_http_client(url, http_client=client), http_client=client)
+            return
         await self._session(name, streamable_http_client(url))
 
     async def hot_reload(self, name: str, config: dict[str, Any]) -> None:
         transport = config.get("transport", "stdio")
+        env = {str(k): str(v) for k, v in (config.get("env") or {}).items()}
         if transport == "stdio":
-            await self.connect_stdio(name, config["command"], config.get("args", []), config.get("env"))
+            await self.connect_stdio(name, config["command"], config.get("args", []), env or None)
         elif transport == "sse":
-            await self.connect_sse(name, config["url"])
+            await self.connect_sse(name, config["url"], headers=env or None)
         elif transport == "streamable-http":
-            await self.connect_streamable_http(name, config["url"])
+            await self.connect_streamable_http(name, config["url"], headers=env or None)
         else:
             raise ValueError(f"Unsupported MCP transport: {transport}")
 
