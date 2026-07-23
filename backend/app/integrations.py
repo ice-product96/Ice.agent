@@ -274,79 +274,118 @@ class WebSearch:
 class McpManager:
     def __init__(self) -> None:
         self.sessions: dict[str, Any] = {}
-        self._stacks: dict[str, AsyncExitStack] = {}
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._stops: dict[str, asyncio.Event] = {}
 
-    async def _session(self, name: str, transport: Any, http_client: Any = None) -> None:
-        from mcp import ClientSession
-
-        await self.disconnect(name)
-        stack = AsyncExitStack()
-        try:
-            if http_client is not None:
-                await stack.enter_async_context(http_client)
-            streams = await stack.enter_async_context(transport)
-            read, write = streams[:2]
-            session = await stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
-        except Exception:
-            await stack.aclose()
-            raise
-        self._stacks[name] = stack
-        self.sessions[name] = session
-
-    async def connect_stdio(self, name: str, command: str, args: list[str], env: dict[str, str] | None = None) -> None:
-        from mcp import StdioServerParameters
-        from mcp.client.stdio import stdio_client
-
-        await self._session(name, stdio_client(StdioServerParameters(command=command, args=args, env=env)))
-
-    async def connect_sse(self, name: str, url: str, headers: dict[str, str] | None = None) -> None:
-        from mcp.client.sse import sse_client
-
-        await self._session(name, sse_client(url, headers=headers or None))
-
-    async def connect_streamable_http(
+    async def _run_connection(
         self,
         name: str,
-        url: str,
-        headers: dict[str, str] | None = None,
+        config: dict[str, Any],
+        stop: asyncio.Event,
+        ready: asyncio.Future[None],
     ) -> None:
         import inspect
 
         import httpx
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.sse import sse_client
+        from mcp.client.stdio import stdio_client
         from mcp.client.streamable_http import streamable_http_client
 
-        params = inspect.signature(streamable_http_client).parameters
-        if "headers" in params:
-            await self._session(name, streamable_http_client(url, headers=headers or None))
-            return
-        if "http_client" in params:
-            client = httpx.AsyncClient(
-                headers=headers or {},
-                timeout=httpx.Timeout(30.0, read=300.0),
-                follow_redirects=True,
-            )
-            await self._session(name, streamable_http_client(url, http_client=client), http_client=client)
-            return
-        await self._session(name, streamable_http_client(url))
+        transport_name = config.get("transport", "stdio")
+        headers = {
+            str(key): str(value)
+            for key, value in (config.get("env") or {}).items()
+        }
+        session: Any = None
+        try:
+            async with AsyncExitStack() as stack:
+                if transport_name == "stdio":
+                    transport = stdio_client(
+                        StdioServerParameters(
+                            command=config["command"],
+                            args=config.get("args", []),
+                            env=headers or None,
+                        )
+                    )
+                elif transport_name == "sse":
+                    transport = sse_client(
+                        config["url"],
+                        headers=headers or None,
+                    )
+                elif transport_name == "streamable-http":
+                    params = inspect.signature(streamable_http_client).parameters
+                    if "headers" in params:
+                        transport = streamable_http_client(
+                            config["url"],
+                            headers=headers or None,
+                        )
+                    elif "http_client" in params:
+                        http_client = await stack.enter_async_context(
+                            httpx.AsyncClient(
+                                headers=headers,
+                                timeout=httpx.Timeout(30.0, read=300.0),
+                                follow_redirects=True,
+                            )
+                        )
+                        transport = streamable_http_client(
+                            config["url"],
+                            http_client=http_client,
+                        )
+                    else:
+                        transport = streamable_http_client(config["url"])
+                else:
+                    raise ValueError(
+                        f"Unsupported MCP transport: {transport_name}"
+                    )
+
+                streams = await stack.enter_async_context(transport)
+                read, write = streams[:2]
+                session = await stack.enter_async_context(
+                    ClientSession(read, write)
+                )
+                await session.initialize()
+                self.sessions[name] = session
+                if not ready.done():
+                    ready.set_result(None)
+                await stop.wait()
+        except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            elif not isinstance(exc, asyncio.CancelledError):
+                raise
+        finally:
+            if self.sessions.get(name) is session:
+                self.sessions.pop(name, None)
 
     async def hot_reload(self, name: str, config: dict[str, Any]) -> None:
-        transport = config.get("transport", "stdio")
-        env = {str(k): str(v) for k, v in (config.get("env") or {}).items()}
-        if transport == "stdio":
-            await self.connect_stdio(name, config["command"], config.get("args", []), env or None)
-        elif transport == "sse":
-            await self.connect_sse(name, config["url"], headers=env or None)
-        elif transport == "streamable-http":
-            await self.connect_streamable_http(name, config["url"], headers=env or None)
-        else:
-            raise ValueError(f"Unsupported MCP transport: {transport}")
+        await self.disconnect(name)
+        stop = asyncio.Event()
+        ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(
+            self._run_connection(name, dict(config), stop, ready),
+            name=f"mcp-session-{name}",
+        )
+        self._stops[name] = stop
+        self._tasks[name] = task
+        try:
+            async with asyncio.timeout(15):
+                await asyncio.shield(ready)
+        except BaseException:
+            stop.set()
+            await asyncio.gather(task, return_exceptions=True)
+            self._stops.pop(name, None)
+            self._tasks.pop(name, None)
+            raise
 
     async def disconnect(self, name: str) -> None:
+        stop = self._stops.pop(name, None)
+        task = self._tasks.pop(name, None)
+        if stop is not None:
+            stop.set()
+        if task is not None and task is not asyncio.current_task():
+            await asyncio.gather(task, return_exceptions=True)
         self.sessions.pop(name, None)
-        stack = self._stacks.pop(name, None)
-        if stack:
-            await stack.aclose()
 
     async def register_tools(
         self,
@@ -369,4 +408,8 @@ class McpManager:
                 )
 
     async def close(self) -> None:
-        await asyncio.gather(*(self.disconnect(name) for name in tuple(self.sessions)), return_exceptions=True)
+        names = set(self.sessions) | set(self._tasks)
+        await asyncio.gather(
+            *(self.disconnect(name) for name in names),
+            return_exceptions=True,
+        )
