@@ -312,110 +312,114 @@ class AgentRuntime:
             base_url=profile.base_url,
             model=agent.model_name or profile.default_model,
             max_rounds=runtime_settings.max_tool_rounds,
+            http_proxy=profile.http_proxy,
         )
-        is_telegram = context.get("source") == "telegram" and account is not None
+        try:
+            is_telegram = context.get("source") == "telegram" and account is not None
 
-        async def summarize(prompt: str) -> str:
-            return await client.complete(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You summarize conversation history for future context. "
-                            "Do not invent facts and retain temporal details."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                ToolRegistry(),
-                set(),
-            )
-
-        state = None
-        inbound_at: datetime
-        if is_telegram:
-            conversation_context, state, inbound = await self.conversations.prepare(
-                db,
-                agent_id=agent.id,
-                account_id=account.id,
-                message=message,
-                context=context,
-                settings=runtime_settings,
-                summarizer=summarize,
-            )
-            inbound_at = as_utc(inbound.message_at or inbound.created_at)
-        else:
-            inbound_at = as_utc(context.get("message_at") or context.get("date"))
-            db.add(
-                MessageLog(
-                    agent_id=agent.id,
-                    direction="in",
-                    message_at=inbound_at,
-                    text=message,
-                    metadata_json=context,
+            async def summarize(prompt: str) -> str:
+                return await client.complete(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You summarize conversation history for future context. "
+                                "Do not invent facts and retain temporal details."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    ToolRegistry(),
+                    set(),
                 )
-            )
-            await db.commit()
-            conversation_context = self.conversations.temporal_context(runtime_settings)
-        messages = [
-            {"role": "system", "content": agent.prompt},
-            {
-                "role": "system",
-                "content": (
-                    "Relevant long-term memories:\n" + memory_context
-                    if memory_context
-                    else "No relevant long-term memories were found."
+
+            state = None
+            inbound_at: datetime
+            if is_telegram:
+                conversation_context, state, inbound = await self.conversations.prepare(
+                    db,
+                    agent_id=agent.id,
+                    account_id=account.id,
+                    message=message,
+                    context=context,
+                    settings=runtime_settings,
+                    summarizer=summarize,
+                )
+                inbound_at = as_utc(inbound.message_at or inbound.created_at)
+            else:
+                inbound_at = as_utc(context.get("message_at") or context.get("date"))
+                db.add(
+                    MessageLog(
+                        agent_id=agent.id,
+                        direction="in",
+                        message_at=inbound_at,
+                        text=message,
+                        metadata_json=context,
+                    )
+                )
+                await db.commit()
+                conversation_context = self.conversations.temporal_context(runtime_settings)
+            messages = [
+                {"role": "system", "content": agent.prompt},
+                {
+                    "role": "system",
+                    "content": (
+                        "Relevant long-term memories:\n" + memory_context
+                        if memory_context
+                        else "No relevant long-term memories were found."
+                    ),
+                },
+                {"role": "system", "content": conversation_context},
+                {"role": "user", "content": message},
+            ]
+            permissions = set((agent.config or {}).get("tool_permissions", []))
+            result = await client.complete(
+                messages,
+                await self.registry(
+                    agent,
+                    account.phone if account else None,
+                    mcp_server_names,
+                    runtime_settings.memory_enabled,
                 ),
-            },
-            {"role": "system", "content": conversation_context},
-            {"role": "user", "content": message},
-        ]
-        permissions = set((agent.config or {}).get("tool_permissions", []))
-        result = await client.complete(
-            messages,
-            await self.registry(
-                agent,
-                account.phone if account else None,
-                mcp_server_names,
-                runtime_settings.memory_enabled,
-            ),
-            permissions,
-        )
-        outbound_at = as_utc(None)
-        if runtime_settings.memory_enabled:
-            try:
-                await self.memory.add(
-                    f"User: {message}\nAssistant: {result}",
-                    user_id=user_id,
-                    agent_id=str(agent.id),
-                    metadata={
-                        "kind": "exchange",
-                        "agent_name": agent.name,
-                        "chat_id": str(context.get("chat_id") or ""),
-                        "inbound_at": iso_utc(inbound_at),
-                        "outbound_at": iso_utc(outbound_at),
-                        "last_message_at": iso_utc(outbound_at),
-                    },
-                )
-            except Exception:
-                pass
-        if state is not None:
-            await self.conversations.record_outbound(
-                db, state, result, context, at=outbound_at
+                permissions,
             )
-        else:
-            db.add(
-                MessageLog(
-                    agent_id=agent.id,
-                    direction="out",
-                    message_at=outbound_at,
-                    text=result,
-                    metadata_json={"source": context.get("source", "runtime")},
+            outbound_at = as_utc(None)
+            if runtime_settings.memory_enabled:
+                try:
+                    await self.memory.add(
+                        f"User: {message}\nAssistant: {result}",
+                        user_id=user_id,
+                        agent_id=str(agent.id),
+                        metadata={
+                            "kind": "exchange",
+                            "agent_name": agent.name,
+                            "chat_id": str(context.get("chat_id") or ""),
+                            "inbound_at": iso_utc(inbound_at),
+                            "outbound_at": iso_utc(outbound_at),
+                            "last_message_at": iso_utc(outbound_at),
+                        },
+                    )
+                except Exception:
+                    pass
+            if state is not None:
+                await self.conversations.record_outbound(
+                    db, state, result, context, at=outbound_at
                 )
-            )
-            await db.commit()
-        await self.events.publish("agent.completed", {"agent_id": agent.id, "text": result})
-        return result
+            else:
+                db.add(
+                    MessageLog(
+                        agent_id=agent.id,
+                        direction="out",
+                        message_at=outbound_at,
+                        text=result,
+                        metadata_json={"source": context.get("source", "runtime")},
+                    )
+                )
+                await db.commit()
+            await self.events.publish("agent.completed", {"agent_id": agent.id, "text": result})
+            return result
+        finally:
+            await client.aclose()
 
     async def update_telegram_outbound(
         self,

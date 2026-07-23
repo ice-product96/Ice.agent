@@ -170,6 +170,7 @@ class LlmProfileBody(BaseModel):
     base_url: str | None = None
     api_key: str = ""
     clear_api_key: bool = False
+    http_proxy: str | None = None
     default_model: str
     enabled: bool = True
 

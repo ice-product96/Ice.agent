@@ -190,7 +190,40 @@ class TelegramGateway:
             str(path.with_suffix("")) if path.suffix == ".session" else str(path),
             account.api_id,
             api_hash,
+            proxy=self._socks5_proxy(account),
         )
+
+    def _socks5_proxy(self, account: Any) -> tuple[Any, ...] | None:
+        host = (getattr(account, "socks5_host", None) or "").strip()
+        port = getattr(account, "socks5_port", None)
+        if not host or not port:
+            return None
+        from python_socks import ProxyType
+
+        username = (getattr(account, "socks5_username", None) or "").strip() or None
+        password = self.secrets.decrypt(getattr(account, "socks5_password_ciphertext", None))
+        return (
+            ProxyType.SOCKS5,
+            host,
+            int(port),
+            True,
+            username,
+            password,
+        )
+
+    async def reconnect(self, account: Any) -> str:
+        phone = account.phone
+        await self.disconnect(phone)
+        if not account.enabled or not account.authorized:
+            return "disconnected"
+        client = self._client(account)
+        await client.connect()
+        if await client.is_user_authorized():
+            self.clients[phone] = client
+            self._register_handlers(phone, client)
+            return "restored"
+        await client.disconnect()
+        return "unauthorized"
 
     def register_callback(self, event_name: str, callback: EventCallback) -> None:
         if event_name not in {"new_message", "message_edited", "callback_query"}:

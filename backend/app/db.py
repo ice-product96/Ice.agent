@@ -2,7 +2,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, Table, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, Table, Text, UniqueConstraint, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -38,6 +38,10 @@ class TelegramAccount(TimestampMixin, Base):
     session_path: Mapped[str] = mapped_column(String(512), unique=True)
     api_id: Mapped[int | None] = mapped_column(Integer)
     api_hash_ciphertext: Mapped[str | None] = mapped_column(Text)
+    socks5_host: Mapped[str | None] = mapped_column(String(255))
+    socks5_port: Mapped[int | None] = mapped_column(Integer)
+    socks5_username: Mapped[str | None] = mapped_column(String(255))
+    socks5_password_ciphertext: Mapped[str | None] = mapped_column(Text)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     authorized: Mapped[bool] = mapped_column(Boolean, default=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -51,6 +55,7 @@ class LlmProfile(TimestampMixin, Base):
     provider: Mapped[str] = mapped_column(String(48))
     base_url: Mapped[str | None] = mapped_column(String(1024))
     api_key_ciphertext: Mapped[str | None] = mapped_column(Text)
+    http_proxy: Mapped[str | None] = mapped_column(String(1024))
     default_model: Mapped[str] = mapped_column(String(120))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     agents: Mapped[list["Agent"]] = relationship(back_populates="llm_profile")
@@ -231,3 +236,12 @@ async def get_db() -> AsyncIterator[AsyncSession]:
 async def create_schema() -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        # create_all does not add columns to existing tables
+        for statement in (
+            "ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS http_proxy VARCHAR(1024)",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS socks5_host VARCHAR(255)",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS socks5_port INTEGER",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS socks5_username VARCHAR(255)",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS socks5_password_ciphertext TEXT",
+        ):
+            await connection.execute(text(statement))

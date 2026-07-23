@@ -71,6 +71,19 @@ class TelegramLoginBody(BaseModel):
     phone: str
     api_id: int
     api_hash: str
+    socks5_host: str | None = None
+    socks5_port: int | None = None
+    socks5_username: str | None = None
+    socks5_password: str = ""
+
+
+class TelegramProxyBody(BaseModel):
+    socks5_host: str | None = None
+    socks5_port: int | None = None
+    socks5_username: str | None = None
+    socks5_password: str = ""
+    clear_socks5_password: bool = False
+    clear_socks5: bool = False
 
 
 class TelegramVerifyBody(BaseModel):
@@ -435,6 +448,7 @@ def llm_profile_json(profile: LlmProfile) -> dict[str, Any]:
         "name": profile.name,
         "provider": profile.provider,
         "base_url": profile.base_url,
+        "http_proxy": profile.http_proxy,
         "default_model": profile.default_model,
         "enabled": profile.enabled,
         "has_api_key": bool(profile.api_key_ciphertext),
@@ -452,6 +466,7 @@ def apply_llm_profile(
     profile.name = payload.name
     profile.provider = payload.provider
     profile.base_url = payload.base_url
+    profile.http_proxy = (payload.http_proxy or "").strip() or None
     profile.default_model = payload.default_model
     profile.enabled = payload.enabled
     if payload.clear_api_key:
@@ -541,10 +556,38 @@ async def test_llm_profile(
             base_url=profile.base_url,
             model=profile.default_model,
             max_rounds=1,
+            http_proxy=profile.http_proxy,
         ).test_connection()
     except Exception as exc:
         return {"ok": False, "status": "error", "detail": str(exc)}
     return {"ok": True, "status": "connected", "detail": "Connection successful"}
+
+
+def apply_telegram_socks5(
+    account: TelegramAccount,
+    *,
+    socks5_host: str | None,
+    socks5_port: int | None,
+    socks5_username: str | None,
+    socks5_password: str = "",
+    clear_socks5_password: bool = False,
+    clear_socks5: bool = False,
+    secrets: SecretStore,
+) -> None:
+    if clear_socks5:
+        account.socks5_host = None
+        account.socks5_port = None
+        account.socks5_username = None
+        account.socks5_password_ciphertext = None
+        return
+    host = (socks5_host or "").strip() or None
+    account.socks5_host = host
+    account.socks5_port = int(socks5_port) if host and socks5_port else None
+    account.socks5_username = (socks5_username or "").strip() or None if host else None
+    if clear_socks5_password or not host:
+        account.socks5_password_ciphertext = None
+    elif socks5_password:
+        account.socks5_password_ciphertext = secrets.encrypt(socks5_password)
 
 
 def telegram_json(account: TelegramAccount) -> dict[str, Any]:
@@ -556,6 +599,11 @@ def telegram_json(account: TelegramAccount) -> dict[str, Any]:
         "api_id": account.api_id,
         "has_api_hash": bool(account.api_hash_ciphertext),
         "api_hash_masked": masked_secret(account.api_hash_ciphertext),
+        "socks5_host": account.socks5_host,
+        "socks5_port": account.socks5_port,
+        "socks5_username": account.socks5_username,
+        "has_socks5_password": bool(account.socks5_password_ciphertext),
+        "socks5_enabled": bool(account.socks5_host and account.socks5_port),
         "enabled": account.enabled,
         "authorized": account.authorized,
         "status": "connected" if account.authorized else "pending",
@@ -575,6 +623,33 @@ async def delete_telegram_account(account_id: str, db: AsyncSession = Depends(ge
     await db.delete(await one(db, TelegramAccount, account_id))
     await db.commit()
     return Response(status_code=204)
+
+
+@router.patch("/telegram/accounts/{account_id}/proxy", dependencies=auth)
+async def update_telegram_proxy(
+    account_id: str,
+    payload: TelegramProxyBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    account = await one(db, TelegramAccount, account_id)
+    apply_telegram_socks5(
+        account,
+        socks5_host=payload.socks5_host,
+        socks5_port=payload.socks5_port,
+        socks5_username=payload.socks5_username,
+        socks5_password=payload.socks5_password,
+        clear_socks5_password=payload.clear_socks5_password,
+        clear_socks5=payload.clear_socks5,
+        secrets=SecretStore.from_settings(get_settings()),
+    )
+    await db.commit()
+    await db.refresh(account)
+    try:
+        await request.app.state.telegram.reconnect(account)
+    except Exception:
+        pass
+    return telegram_json(account)
 
 
 @router.post("/telegram/accounts/login", dependencies=auth)
@@ -600,6 +675,16 @@ async def telegram_login(payload: TelegramLoginBody, request: Request, db: Async
         account.api_id = payload.api_id
         account.api_hash_ciphertext = secrets.encrypt(payload.api_hash)
         await db.commit()
+    apply_telegram_socks5(
+        account,
+        socks5_host=payload.socks5_host,
+        socks5_port=payload.socks5_port,
+        socks5_username=payload.socks5_username,
+        socks5_password=payload.socks5_password,
+        secrets=secrets,
+    )
+    await db.commit()
+    await db.refresh(account)
     try:
         code_hash = await request.app.state.telegram.request_code(account)
     except Exception as exc:

@@ -21,13 +21,29 @@ class LLMClient:
         base_url: str | None,
         model: str,
         max_rounds: int,
+        http_proxy: str | None = None,
     ) -> None:
         self.model = model
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._http_client: httpx.AsyncClient | None = None
+        if http_proxy:
+            self._http_client = httpx.AsyncClient(proxy=http_proxy.strip(), timeout=60.0)
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            http_client=self._http_client,
+        )
         self.max_rounds = max_rounds
 
+    async def aclose(self) -> None:
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
+
     async def test_connection(self) -> None:
-        await self.client.models.list()
+        try:
+            await self.client.models.list()
+        finally:
+            await self.aclose()
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8), reraise=True)
     async def complete(

@@ -29,14 +29,22 @@ export interface Agent {
 
 export interface TelegramAccount {
   id: ID
+  session_id?: ID
   name: string
   phone: string
   api_id: number
   has_api_hash: boolean
+  socks5_host?: string | null
+  socks5_port?: number | null
+  socks5_username?: string | null
+  has_socks5_password?: boolean
+  socks5_enabled?: boolean
   readiness?: string
   username?: string
   status: Status
   agent_id?: ID
+  authorized?: boolean
+  enabled?: boolean
   created_at?: string
 }
 
@@ -112,6 +120,7 @@ export interface LlmProfile {
   name: string
   provider: LlmProvider
   base_url: string
+  http_proxy?: string | null
   default_model: string
   enabled: boolean
   has_api_key: boolean
