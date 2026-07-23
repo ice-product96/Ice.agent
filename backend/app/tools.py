@@ -15,7 +15,7 @@ class ToolPolicy:
         "delete", "remove", "shell", "exec", "payment", "purchase", "transfer",
         "send_message", "send_file", "forward_message", "edit_message", "join_channel",
         "leave_channel", "reaction", "draft", "escalate", "ban", "kick",
-        "change_permissions",
+        "change_permissions", "schedule_self",
     }
 
     def check(self, tool_name: str, arguments: dict[str, Any], allowed: set[str] | None = None) -> None:
@@ -79,6 +79,7 @@ class ToolRegistry:
     def __init__(self, policy: ToolPolicy | None = None) -> None:
         self.policy = policy or ToolPolicy()
         self.tools: dict[str, RegisteredTool] = {}
+        self.audit: list[dict[str, Any]] = []
 
     def register(
         self,
@@ -99,12 +100,20 @@ class ToolRegistry:
         return [tool.schema() for tool in self.tools.values()]
 
     async def call(self, name: str, arguments: dict[str, Any], permissions: set[str] | None = None) -> Any:
-        self.policy.check(name, arguments, permissions)
-        tool = self.tools.get(name)
-        if tool is None:
-            raise KeyError(f"Unknown tool: {name}")
-        result = tool.function(**arguments)
-        return await result if inspect.isawaitable(result) else result
+        record: dict[str, Any] = {"tool": name, "arguments": arguments, "status": "running"}
+        self.audit.append(record)
+        try:
+            self.policy.check(name, arguments, permissions)
+            tool = self.tools.get(name)
+            if tool is None:
+                raise KeyError(f"Unknown tool: {name}")
+            result = tool.function(**arguments)
+            result = await result if inspect.isawaitable(result) else result
+            record.update(status="success", result=result)
+            return result
+        except BaseException as exc:
+            record.update(status="error", error=str(exc))
+            raise
 
 
 async def sleep(seconds: float) -> str:

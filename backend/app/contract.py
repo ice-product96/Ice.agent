@@ -12,6 +12,7 @@ from .db import (
     ConversationState, MessageLog, RuntimeSettings, TelegramAccount, get_db,
 )
 from .events import events
+from .integrations import exception_text
 from .schemas import LlmProfileBody, RuntimeSettingsBody
 from .secrets import SecretStore, masked_secret
 from .security import issue_token, require_admin, valid_password, verify_token
@@ -60,6 +61,7 @@ class AgentBody(BaseModel):
     telegram_account_id: int | str | None = None
     llm_profile_id: int | str | None = None
     tools: list[Any] = Field(default_factory=list)
+    tool_permissions: list[str] = Field(default_factory=list)
     links: list[Any] = Field(default_factory=list)
     typing_enabled: bool = True
     enabled: bool = True
@@ -324,6 +326,7 @@ async def agent_json(db: AsyncSession, agent: Agent) -> dict[str, Any]:
         "telegram_account_id": agent.telegram_account_id,
         "llm_profile_id": agent.llm_profile_id,
         "tools": config.get("tools", []),
+        "tool_permissions": config.get("tool_permissions", []),
         "links": [
             {
                 "id": link.id,
@@ -381,7 +384,12 @@ def apply_agent(agent: Agent, payload: AgentBody) -> None:
     )
     agent.enabled = payload.enabled and payload.status not in {"disabled", "inactive", "offline"}
     config = dict(agent.config or {})
-    config.update(description=payload.description, tools=payload.tools, typing_enabled=payload.typing_enabled)
+    config.update(
+        description=payload.description,
+        tools=payload.tools,
+        tool_permissions=payload.tool_permissions,
+        typing_enabled=payload.typing_enabled,
+    )
     agent.config = config
 
 
@@ -699,10 +707,29 @@ async def memory_search(
     search: str = "",
     agent_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    user_id = agent_id or "global"
-    if search:
-        return await request.app.state.memory.search(search, user_id)
-    return await request.app.state.memory.list(user_id)
+    items = (
+        await request.app.state.memory.search(search, agent_id=agent_id)
+        if search
+        else await request.app.state.memory.get_all(agent_id=agent_id)
+    )
+    normalized = []
+    for item in items:
+        metadata = item.get("metadata") or {}
+        normalized.append({
+            "id": str(item.get("id", "")),
+            "agent_id": item.get("agent_id", metadata.get("agent_id")),
+            "scope": str(item.get("user_id", metadata.get("user_id", "global"))),
+            "key": str(metadata.get("kind") or item.get("key") or item.get("id", "memory")),
+            "content": str(item.get("memory", item.get("text", item.get("content", "")))),
+            "metadata": metadata,
+            "created_at": (
+                item.get("created_at")
+                or item.get("updated_at")
+                or metadata.get("last_message_at")
+                or ""
+            ),
+        })
+    return normalized
 
 
 @router.delete("/memory/{memory_id}", dependencies=auth, status_code=204)
@@ -803,7 +830,7 @@ async def create_mcp(payload: McpBody, request: Request, db: AsyncSession = Depe
             result["connection_status"] = "connected"
         except BaseException as exc:
             result["connection_status"] = "error"
-            result["connection_error"] = str(exc) or type(exc).__name__
+            result["connection_error"] = exception_text(exc)
     return result
 
 
@@ -852,7 +879,7 @@ async def update_mcp(server_id: str, request: Request, db: AsyncSession = Depend
             result["connection_status"] = "connected"
         except BaseException as exc:
             result["connection_status"] = "error"
-            result["connection_error"] = str(exc) or type(exc).__name__
+            result["connection_error"] = exception_text(exc)
     return result
 
 
@@ -1210,7 +1237,26 @@ async def logs(
     offset: int = Query(0, ge=0),
 ) -> list[dict[str, Any]]:
     items = (await db.scalars(select(MessageLog).order_by(MessageLog.created_at.desc()).offset(offset).limit(limit))).all()
-    return [row(item) for item in items]
+    return [
+        {
+            "id": item.id,
+            "timestamp": iso(item.created_at),
+            "level": (
+                "error"
+                if item.direction == "tool"
+                and (item.metadata_json or {}).get("status") == "error"
+                else "info"
+            ),
+            "source": (
+                str((item.metadata_json or {}).get("tool", "tool"))
+                if item.direction == "tool"
+                else f"agent.{item.direction}"
+            ),
+            "message": item.text,
+            "context": item.metadata_json or {},
+        }
+        for item in items
+    ]
 
 
 @router.get("/tasks", dependencies=auth)

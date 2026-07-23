@@ -19,6 +19,7 @@ export interface Agent {
   llm_profile_id?: ID
   telegram_account_id?: ID
   tools: string[]
+  tool_permissions?: string[]
   links: AgentLinkRef[]
   typing_enabled: boolean
   enabled: boolean

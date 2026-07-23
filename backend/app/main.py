@@ -14,7 +14,7 @@ from .db import (
     TelegramAccount, create_schema,
 )
 from .events import events
-from .integrations import McpManager, MemoryStore, WebSearch
+from .integrations import McpManager, MemoryStore, WebSearch, exception_text
 from .routing import TelegramEventRouter
 from .runtime import AgentRuntime, TaskBus
 from .scheduler import CronManager
@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
         except BaseException as exc:
             await events.publish(
                 "mcp.connection_failed",
-                {"server": server.name, "error": str(exc) or type(exc).__name__},
+                {"server": server.name, "error": exception_text(exc)},
             )
         finally:
             await mcp.disconnect(server.name)
@@ -123,9 +123,15 @@ async def lifespan(app: FastAPI):
         async with SessionLocal() as db:
             agent = await db.get(Agent, agent_id)
             if agent:
-                await runtime.run(db, agent, str(payload.get("message", "")), payload)
+                result = await runtime.run(db, agent, str(payload.get("message", "")), payload)
+                phone = payload.get("reply_phone")
+                chat_id = payload.get("reply_chat_id")
+                if phone and chat_id:
+                    entity = int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
+                    await telegram.send_message(str(phone), entity, result)
 
     scheduler = CronManager(SessionLocal, run_scheduled)
+    runtime.bind_scheduler(scheduler)
     await scheduler.load()
     scheduler.start()
     if runtime_settings.task_workers > 0:

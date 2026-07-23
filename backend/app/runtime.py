@@ -1,7 +1,9 @@
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -12,6 +14,7 @@ from .db import (
     Agent,
     AgentLink,
     AgentTask,
+    CronJob,
     LlmProfile,
     McpServer,
     MessageLog,
@@ -216,10 +219,14 @@ class AgentRuntime:
         self.telegram = telegram
         self.mcp = mcp
         self.task_bus: TaskBus | None = None
+        self.scheduler: Any = None
         self.conversations = ConversationContextService()
 
     def bind_task_bus(self, task_bus: TaskBus) -> None:
         self.task_bus = task_bus
+
+    def bind_scheduler(self, scheduler: Any) -> None:
+        self.scheduler = scheduler
 
     async def registry(
         self,
@@ -227,6 +234,9 @@ class AgentRuntime:
         phone: str | None = None,
         mcp_server_names: set[str] | None = None,
         memory_enabled: bool = True,
+        db: AsyncSession | None = None,
+        runtime_settings: RuntimeSettings | None = None,
+        context: dict[str, Any] | None = None,
     ) -> ToolRegistry:
         registry = common_registry()
         registry.register(self.search.search, "web_search", "Search the public web")
@@ -253,6 +263,50 @@ class AgentRuntime:
 
             registry.register(agent_create_task, "agent_create_task", "Delegate a task to a linked agent")
             registry.register(agent_notify, "agent_notify", "Notify a linked agent")
+        if self.scheduler and db is not None and runtime_settings is not None:
+            async def schedule_self(run_at: str, message: str, name: str = "") -> dict[str, Any]:
+                """Schedule this agent to execute a one-time task at an ISO date and time."""
+                try:
+                    target = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise ValueError("run_at must be an ISO date and time") from exc
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=ZoneInfo(runtime_settings.timezone))
+                target = target.astimezone(timezone.utc)
+                if target <= datetime.now(timezone.utc):
+                    raise ValueError("run_at must be in the future")
+                source = context or {}
+                payload = {
+                    "message": message,
+                    "run_once_at": target.isoformat(),
+                    "timezone": runtime_settings.timezone,
+                    "source": "scheduled",
+                    "reply_phone": phone,
+                    "reply_chat_id": source.get("chat_id") or source.get("entity"),
+                }
+                job = CronJob(
+                    name=name.strip() or f"once-{agent.id}-{uuid4().hex[:12]}",
+                    agent_id=agent.id,
+                    cron="@once",
+                    payload=payload,
+                    enabled=True,
+                )
+                db.add(job)
+                await db.commit()
+                await db.refresh(job)
+                self.scheduler.upsert(job)
+                return {
+                    "ok": True,
+                    "job_id": job.id,
+                    "run_at": target.isoformat(),
+                    "message": message,
+                }
+
+            registry.register(
+                schedule_self,
+                "schedule_self",
+                "Schedule this agent to execute a one-time task at an ISO date and time",
+            )
         return registry
 
     async def run(
@@ -371,6 +425,13 @@ class AgentRuntime:
                 {
                     "role": "system",
                     "content": (
+                        "Never claim that an external action succeeded unless its tool call "
+                        "returned successfully. Report tool errors truthfully and explicitly."
+                    ),
+                },
+                {
+                    "role": "system",
+                    "content": (
                         "Relevant long-term memories:\n" + memory_context
                         if memory_context
                         else "No relevant long-term memories were found."
@@ -380,16 +441,39 @@ class AgentRuntime:
                 {"role": "user", "content": message},
             ]
             permissions = set((agent.config or {}).get("tool_permissions", []))
+            registry = await self.registry(
+                agent,
+                account.phone if account else None,
+                mcp_server_names,
+                runtime_settings.memory_enabled,
+                db,
+                runtime_settings,
+                context,
+            )
             result = await client.complete(
                 messages,
-                await self.registry(
-                    agent,
-                    account.phone if account else None,
-                    mcp_server_names,
-                    runtime_settings.memory_enabled,
-                ),
+                registry,
                 permissions,
             )
+            for call in registry.audit:
+                safe_call = json.loads(json.dumps(call, ensure_ascii=False, default=str))
+                db.add(
+                    MessageLog(
+                        agent_id=agent.id,
+                        account_id=account.id if account else None,
+                        direction="tool",
+                        chat_id=str(context.get("chat_id") or "") or None,
+                        message_at=as_utc(None),
+                        text=f"{call['tool']}: {call['status']}",
+                        metadata_json=safe_call,
+                    )
+                )
+                await self.events.publish(
+                    "tool.called",
+                    {"agent_id": agent.id, **safe_call},
+                )
+            if registry.audit:
+                await db.commit()
             outbound_at = as_utc(None)
             if runtime_settings.memory_enabled:
                 try:

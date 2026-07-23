@@ -167,7 +167,7 @@ class MemoryStore:
     async def search(
         self,
         query: str,
-        user_id: str,
+        user_id: str | None = None,
         agent_id: str | None = None,
         filters: dict[str, Any] | None = None,
         limit: int = 10,
@@ -269,6 +269,16 @@ class WebSearch:
             return await asyncio.to_thread(lambda: list(DDGS().text(query, max_results=limit)))
         except Exception:
             return []
+
+
+def exception_text(exc: BaseException) -> str:
+    """Flatten ExceptionGroup so connection errors are actionable in the UI."""
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        messages = [exception_text(item) for item in nested]
+        return "; ".join(dict.fromkeys(message for message in messages if message))
+    message = str(exc).strip()
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
 class McpManager:
@@ -399,7 +409,13 @@ class McpManager:
             for definition in result.tools:
                 async def invoke(_server=server_name, _tool=definition.name, **kwargs: Any) -> Any:
                     response = await self.sessions[_server].call_tool(_tool, kwargs)
-                    return [content.model_dump() for content in response.content]
+                    content = [item.model_dump() for item in response.content]
+                    if getattr(response, "isError", False):
+                        detail = "; ".join(
+                            str(item.get("text") or item) for item in content
+                        )
+                        raise RuntimeError(detail or f"MCP tool {_tool} failed")
+                    return content
                 registry.register(
                     invoke,
                     f"mcp_{server_name}_{definition.name}",

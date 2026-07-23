@@ -403,7 +403,13 @@ class TelegramGateway:
         return telegram_json(await self._get(phone).edit_message(entity, message, text))
 
     async def delete_messages(self, phone: str, entity: str | int, message_ids: list[int], revoke: bool = True) -> Any:
+        """Delete selected messages from a Telegram dialog."""
         return telegram_json(await self._get(phone).delete_messages(entity, message_ids, revoke=revoke))
+
+    async def delete_dialog(self, phone: str, entity: str | int, revoke: bool = False) -> dict[str, Any]:
+        """Delete a Telegram dialog and optionally revoke its history for both sides."""
+        await self._get(phone).delete_dialog(entity, revoke=revoke)
+        return {"ok": True, "entity": str(entity), "revoke": revoke}
 
     async def forward_messages(self, phone: str, entity: str | int, messages: list[int], from_peer: str | int) -> Any:
         return telegram_json(await self._get(phone).forward_messages(entity, messages, from_peer=from_peer))
@@ -417,6 +423,7 @@ class TelegramGateway:
         return telegram_json(await self._get(phone)(JoinChannelRequest(entity)))
 
     async def leave_channel(self, phone: str, entity: str | int) -> Any:
+        """Leave a Telegram channel or group."""
         from telethon.tl.functions.channels import LeaveChannelRequest
 
         return telegram_json(await self._get(phone)(LeaveChannelRequest(entity)))
@@ -467,7 +474,7 @@ class TelegramGateway:
         registry = ToolRegistry()
         operations = (
             "get_dialogs", "get_history", "get_conversation_history", "get_messages", "send_message", "send_file",
-            "edit_message", "delete_messages", "forward_messages", "get_participants",
+            "edit_message", "delete_messages", "delete_dialog", "forward_messages", "get_participants",
             "join_channel", "leave_channel", "send_reaction", "acknowledge_read",
             "save_draft", "get_drafts", "download_media", "get_entity", "escalate",
         )

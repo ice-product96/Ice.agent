@@ -250,7 +250,7 @@ function DashboardScreen({ go }: { go: (p: Page) => void }) {
 
 const emptyAgent: Omit<Agent, 'id'> = {
   name: '', description: '', prompt: '', model: '',
-  tools: [], links: [], typing_enabled: true, enabled: true,
+  tools: [], tool_permissions: [], links: [], typing_enabled: true, enabled: true,
 }
 function AgentsScreen() {
   const { data = [], setData, loading, error, refresh } = useLoad(api.agents.list, [])
@@ -288,6 +288,12 @@ function AgentForm({ value, agents, profiles, telegram, onClose, onSave }: { val
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const toolOptions = ['web_search', 'memory', 'code_execution', 'telegram', 'filesystem', 'mcp']
+  const permissionOptions = [
+    ['telegram_delete_dialog', 'Удалять диалоги Telegram'],
+    ['telegram_delete_messages', 'Удалять сообщения Telegram'],
+    ['telegram_leave_channel', 'Покидать каналы и группы'],
+    ['schedule_self', 'Создавать отложенные задачи'],
+  ] as const
   const linkTarget = (link: Agent['links'][number]) =>
     typeof link === 'string' ? link : String(link.target_agent_id ?? link.agent_id ?? link.id)
   const linked = (id: string) => (form.links || []).some(link => linkTarget(link) === String(id))
@@ -307,6 +313,7 @@ function AgentForm({ value, agents, profiles, telegram, onClose, onSave }: { val
         <Field label="Аккаунт Telegram" hint="Необязательная мессенджер-идентичность"><select value={form.telegram_account_id || ''} onChange={e => patch({ telegram_account_id: e.target.value || undefined })}><option value="">Без аккаунта Telegram</option>{telegram.map(a => <option value={a.id} key={a.id}>{a.name} · {a.phone}{a.readiness && a.readiness !== 'ready' ? ` (${a.readiness})` : ''}</option>)}</select></Field>
         <Field label="Системный промпт" wide><textarea required rows={7} value={form.prompt || ''} onChange={e => patch({ prompt: e.target.value })} placeholder="Вы полезный агент…"/></Field>
         <Field label="Инструменты" wide><div className="check-grid">{toolOptions.map(tool => <label className="check" key={tool}><input type="checkbox" checked={(form.tools || []).includes(tool)} onChange={() => patch({ tools: (form.tools || []).includes(tool) ? form.tools!.filter(t => t !== tool) : [...(form.tools || []), tool] })}/><span>{toolDisplayName(tool)}</span></label>)}</div></Field>
+        <Field label="Опасные действия" hint="Явные разрешения на необратимые операции" wide><div className="check-grid">{permissionOptions.map(([permission, label]) => <label className="check" key={permission}><input type="checkbox" checked={(form.tool_permissions || []).includes(permission)} onChange={() => patch({ tool_permissions: (form.tool_permissions || []).includes(permission) ? form.tool_permissions!.filter(item => item !== permission) : [...(form.tool_permissions || []), permission] })}/><span>{label}</span></label>)}</div></Field>
         <Field label="Связи с агентами" hint="Разрешить делегирование работы" wide><div className="check-grid">{agents.filter(a => String(a.id) !== String(form.id)).map(a => <label className="check" key={a.id}><input type="checkbox" checked={linked(a.id)} onChange={() => patch({ links: linked(a.id) ? (form.links || []).filter(link => linkTarget(link) !== String(a.id)) : [...(form.links || []), a.id] })}/><span>{a.name}</span></label>)}</div></Field>
         <div className="toggle-box"><Toggle label="Показывать индикатор набора" checked={form.typing_enabled ?? true} onChange={v => patch({ typing_enabled: v })}/></div>
         <div className="toggle-box"><Toggle label="Агент включён" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div>
@@ -593,12 +600,38 @@ function MemoryScreen() {
     <form className="filter-bar" onSubmit={e => { e.preventDefault(); setQuery(search) }}><div className="search-box"><Search size={17}/><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Поиск по содержимому, ключам или области…"/></div><button className="secondary">Поиск</button></form>
     {loaded.error && <Alert message={loaded.error}/>}
     {loaded.loading ? <Loading/> : items.length === 0 ? <Empty icon={BrainCircuit} title="Подходящих записей нет" text="Записи памяти агентов появятся по мере создания."/> :
-      <div className="memory-list">{items.map(item => <article className="memory-card" key={item.id}><div className="memory-head"><div><span className="scope">{item.scope}</span><strong>{item.key}</strong></div><button className="icon-button danger-ghost" onClick={() => setDeleting(item)}><Trash2 size={16}/></button></div><p>{item.content}</p><div className="entity-meta"><span>{item.agent_id ? `Агент ${item.agent_id}` : 'Глобально'}</span><time>{new Date(item.created_at).toLocaleString()}</time></div></article>)}</div>}
+      <div className="memory-list">{items.map(item => <article className="memory-card" key={item.id}><div className="memory-head"><div><span className="scope">{item.scope}</span><strong>{item.key}</strong></div><button className="icon-button danger-ghost" onClick={() => setDeleting(item)}><Trash2 size={16}/></button></div><p>{item.content}</p><div className="entity-meta"><span>{item.agent_id ? `Агент ${item.agent_id}` : 'Глобально'}</span>{item.created_at && <time>{new Date(item.created_at).toLocaleString()}</time>}</div></article>)}</div>}
     {deleting && <ConfirmDelete name={deleting.key} onClose={() => setDeleting(null)} onDelete={async () => { await api.memory.remove(deleting.id); loaded.setData(Array.isArray(loaded.data) ? loaded.data.filter(i => i.id !== deleting.id) : loaded.data ? { ...loaded.data, items: loaded.data.items.filter(i => i.id !== deleting.id) } : loaded.data) }}/>}
   </>
 }
 
 const emptyMcp: Omit<McpServer, 'id'> = { name: '', url: '', transport: 'sse', command: '', args: [], env: {}, enabled: true }
+
+function parseMcpHeaders(value: string): Record<string, string> {
+  const trimmed = value.trim()
+  if (!trimmed) return {}
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>
+      const servers = parsed.mcpServers as Record<string, { headers?: Record<string, unknown> }> | undefined
+      const source = servers
+        ? Object.values(servers)[0]?.headers || {}
+        : parsed
+      return Object.fromEntries(Object.entries(source).map(([key, item]) => [key, String(item)]))
+    } catch {
+      // Allow partially typed JSON; line parser below keeps the form editable.
+    }
+  }
+  return Object.fromEntries(value.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+    const equals = line.indexOf('=')
+    const colon = line.indexOf(':')
+    const index = equals >= 0 ? equals : colon
+    return index < 0
+      ? [line, '']
+      : [line.slice(0, index).trim(), line.slice(index + 1).trim()]
+  }))
+}
+
 function McpScreen() {
   const loaded = useLoad(api.mcp.list, []); const data = loaded.data || []
   const [editing, setEditing] = useState<Partial<McpServer> | null>(null); const [deleting, setDeleting] = useState<McpServer | null>(null)
@@ -629,7 +662,7 @@ function McpForm({ value, onClose, onSave }: { value: Partial<McpServer>; onClos
   return <Modal title={form.id ? 'Изменение MCP-сервера' : 'Добавление MCP-сервера'} subtitle="Секреты окружения шифруются и только для записи." onClose={onClose}><form onSubmit={async e => { e.preventDefault(); setBusy(true); const payload = { ...form }; if (form.id && Object.keys(form.env || {}).length === 0) delete payload.env; try { await onSave(payload) } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить'); setBusy(false); patch({ env: {} }) } }}>
     {error && <Alert message={error}/>}<div className="form-grid"><Field label="Имя"><input required value={form.name || ''} onChange={e => patch({ name: e.target.value })} placeholder="Внутренние инструменты"/></Field><Field label="Транспорт"><select value={form.transport} onChange={e => patch({ transport: e.target.value as McpServer['transport'] })}><option value="sse">SSE</option><option value="streamable-http">Streamable HTTP</option><option value="stdio">stdio</option></select></Field>
     {form.transport === 'stdio' ? <><Field label="Команда"><input required value={form.command || ''} onChange={e => patch({ command: e.target.value })} placeholder="npx"/></Field><Field label="Аргументы" hint="По одному на строку"><textarea rows={3} value={(form.args || []).join('\n')} onChange={e => patch({ args: e.target.value.split('\n').filter(Boolean) })}/></Field></> : <Field label="URL сервера" wide><input required type="url" value={form.url || ''} onChange={e => patch({ url: e.target.value })} placeholder="https://tools.example.com/mcp"/></Field>}
-    <Field label={form.transport === 'stdio' ? 'Переменные окружения' : 'HTTP-заголовки'} hint={form.transport === 'stdio' ? (form.id ? 'Шифруются при хранении. Оставьте пустым для сохранения значений; секреты не подставляются обратно.' : 'KEY=value, по одному на строку. Шифруются при хранении.') : (form.id ? 'Для remote MCP. Пример: Authorization=Bearer … Оставьте пустым, чтобы сохранить.' : 'Для remote MCP передаются как HTTP-заголовки. Пример:\nAuthorization=Bearer ict_mcp_…')} wide><textarea autoComplete="off" rows={4} value={Object.entries(form.env || {}).map(([k, v]) => `${k}=${v}`).join('\n')} onChange={e => patch({ env: Object.fromEntries(e.target.value.split('\n').filter(Boolean).map(line => { const i = line.indexOf('='); return i < 0 ? [line, ''] : [line.slice(0, i), line.slice(i + 1)] })) })} placeholder={form.transport === 'stdio' ? 'KEY=value' : 'Authorization=Bearer ict_mcp_…'}/></Field><div className="toggle-box wide"><Toggle label="Сервер включён" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div></div>
+    <Field label={form.transport === 'stdio' ? 'Переменные окружения' : 'HTTP-заголовки'} hint={form.transport === 'stdio' ? (form.id ? 'Шифруются при хранении. Оставьте пустым для сохранения значений; секреты не подставляются обратно.' : 'KEY=value, по одному на строку. Шифруются при хранении.') : (form.id ? 'Формат KEY=value, Header: value или JSON. Оставьте пустым, чтобы сохранить.' : 'Формат KEY=value, Header: value или JSON. Пример:\nAuthorization=Bearer ict_mcp_…')} wide><textarea autoComplete="off" rows={4} value={Object.entries(form.env || {}).map(([k, v]) => `${k}=${v}`).join('\n')} onChange={e => patch({ env: parseMcpHeaders(e.target.value) })} placeholder={form.transport === 'stdio' ? 'KEY=value' : 'Authorization=Bearer ict_mcp_…'}/></Field><div className="toggle-box wide"><Toggle label="Сервер включён" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div></div>
     <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Отмена</button><button className="primary" disabled={busy}>Сохранить сервер</button></div></form></Modal>
 }
 

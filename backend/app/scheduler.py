@@ -1,8 +1,10 @@
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import select
+from apscheduler.triggers.date import DateTrigger
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .db import CronJob
@@ -21,16 +23,40 @@ class CronManager:
             self.upsert(job)
 
     def upsert(self, job: CronJob) -> None:
+        payload = job.payload or {}
+        run_once_at = payload.get("run_once_at")
+        trigger = (
+            DateTrigger(run_date=datetime.fromisoformat(str(run_once_at).replace("Z", "+00:00")))
+            if run_once_at
+            else CronTrigger.from_crontab(job.cron, timezone=payload.get("timezone", "UTC"))
+        )
         self.scheduler.add_job(
-            self.callback,
-            CronTrigger.from_crontab(job.cron, timezone=(job.payload or {}).get("timezone", "UTC")),
+            self._run,
+            trigger,
             id=f"cron-{job.id}",
-            args=[job.agent_id, job.payload],
+            args=[job.id, job.agent_id, payload, bool(run_once_at)],
             replace_existing=True,
             coalesce=True,
             max_instances=1,
-            misfire_grace_time=300,
+            misfire_grace_time=None if run_once_at else 300,
         )
+
+    async def _run(
+        self,
+        job_id: int,
+        agent_id: int,
+        payload: dict[str, Any],
+        run_once: bool,
+    ) -> None:
+        try:
+            await self.callback(agent_id, payload)
+        finally:
+            values: dict[str, Any] = {"last_run_at": datetime.now(timezone.utc)}
+            if run_once:
+                values["enabled"] = False
+            async with self.sessions() as db:
+                await db.execute(update(CronJob).where(CronJob.id == job_id).values(**values))
+                await db.commit()
 
     def remove(self, job_id: int) -> None:
         if self.scheduler.get_job(f"cron-{job_id}"):
