@@ -60,6 +60,12 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 18
+      start_period: 40s
     restart: unless-stopped
     networks:
       - iceagent_net
@@ -74,7 +80,8 @@ services:
       # 3000/3010/3090 заняты другими проектами — 3040 на всех интерфейсах (LAN + localhost)
       - "3040:80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - iceagent_net

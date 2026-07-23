@@ -66,21 +66,27 @@ async def lifespan(app: FastAPI):
         telegram.set_admin_ids(admin_settings.telegram_ids)
     telegram.configure_runtime(runtime_settings)
     search.configure(runtime_settings.search_provider, runtime_settings.searxng_url)
-    memory_llm = None
-    if memory_profile and memory_profile.enabled:
-        memory_key = secrets.decrypt(memory_profile.api_key_ciphertext)
-        if memory_key:
-            memory_llm = {
-                "api_key": memory_key,
-                "base_url": memory_profile.base_url,
-                "model": memory_profile.default_model,
-            }
-    await memory.reconfigure(
-        runtime_settings,
-        secrets.decrypt(runtime_settings.mem0_api_key_ciphertext),
-        memory_llm,
-    )
-    await telegram.restore(accounts)
+    try:
+        memory_llm = None
+        if memory_profile and memory_profile.enabled:
+            memory_key = secrets.decrypt(memory_profile.api_key_ciphertext)
+            if memory_key:
+                memory_llm = {
+                    "api_key": memory_key,
+                    "base_url": memory_profile.base_url,
+                    "model": memory_profile.default_model,
+                }
+        await memory.reconfigure(
+            runtime_settings,
+            secrets.decrypt(runtime_settings.mem0_api_key_ciphertext),
+            memory_llm,
+        )
+    except Exception as exc:
+        await events.publish("memory.startup_failed", {"error": str(exc)})
+    try:
+        await telegram.restore(accounts)
+    except Exception as exc:
+        await events.publish("telegram.startup_failed", {"error": str(exc)})
     for server in servers:
         try:
             await mcp.hot_reload(server.name, {
