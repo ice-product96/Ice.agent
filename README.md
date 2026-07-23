@@ -43,8 +43,8 @@ npm run dev
 
 | Сервис | Host bind | Зачем |
 |--------|-----------|--------|
-| UI | `127.0.0.1:3040` | панель (не 3000/3010/3090) |
-| API | `127.0.0.1:8040` | прямой доступ к API при отладке |
+| UI | `0.0.0.0:3040` | панель (LAN + localhost; не 3000/3010/3090) |
+| API | `0.0.0.0:8040` | прямой доступ к API при отладке |
 | Postgres / Qdrant | нет publish | только внутренняя сеть |
 
 ```bash
@@ -53,8 +53,15 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Панель: http://127.0.0.1:3040  
-API: http://127.0.0.1:8040/docs  
+Панель: http://SERVER_IP:3040 (например http://192.168.10.64:3040)  
+API: http://SERVER_IP:8040/docs  
+
+Если из LAN не открывается — проверьте firewall:
+
+```bash
+sudo ufw allow 3040/tcp
+sudo ufw reload
+```
 
 На сервере уже есть SearXNG (`:8080`). В Runtime панели укажите, например:
 `http://172.17.0.1:8080` (IP docker0 / host gateway), а Qdrant —

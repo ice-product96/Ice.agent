@@ -53,8 +53,8 @@ services:
     volumes:
       - iceagent_agent_data:/app/data
     ports:
-      # свободный localhost-порт; 8000 внутри контейнера без конфликта с pokerclub (у них без host publish)
-      - "127.0.0.1:8040:8000"
+      # LAN + localhost; 8000 внутри контейнера не конфликтует с pokerclub (у них без host publish)
+      - "8040:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -71,8 +71,8 @@ services:
         VITE_API_URL: /api/v1
     container_name: iceagent-ui
     ports:
-      # 3000/3010/3090 заняты паттерном других проектов — берём 3040
-      - "127.0.0.1:3040:80"
+      # 3000/3010/3090 заняты другими проектами — 3040 на всех интерфейсах (LAN + localhost)
+      - "3040:80"
     depends_on:
       - api
     restart: unless-stopped
