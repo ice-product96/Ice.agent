@@ -87,7 +87,7 @@ function Shell({ page, setPage, logout, children }: {
     <main>
       <header className="topbar">
         <button className="menu-button" onClick={() => setOpen(true)}><Menu/></button>
-        <div><h1>{title[page][0]}</h1><p>{title[page][1]}</p></div>
+        <div><h1>{(title[page] || title.dashboard)[0]}</h1><p>{(title[page] || title.dashboard)[1]}</p></div>
         <div className="top-actions"><span className="live-pill"><span className="pulse"/>Live</span><button className="avatar">IA</button></div>
       </header>
       <div className="page">{children}</div>
@@ -167,22 +167,28 @@ function DashboardScreen({ go }: { go: (p: Page) => void }) {
   const { data, loading, error, refresh } = useLoad(api.dashboard, [])
   if (loading) return <Loading/>
   if (error) return <><Alert message={error}/><button className="secondary" onClick={refresh}>Retry</button></>
-  const d = data!
+  if (!data) return <Empty title="No dashboard data" text="The API returned an empty overview payload."/>
+  const d = data
+  const agents = d.agents ?? { total: d.counts?.agents ?? d.agents_count ?? 0, online: 0, errors: 0 }
+  const telegram = d.telegram_accounts ?? { total: d.counts?.telegram_accounts ?? d.telegram_accounts_count ?? 0, connected: 0 }
+  const tasks = d.tasks ?? { running: 0, queued: 0, completed_today: 0 }
+  const mcp = d.mcp_servers ?? { total: d.counts?.mcp_servers ?? d.mcp_servers_count ?? 0, online: 0 }
+  const memoryItems = d.memory_items ?? 0
   const configuration = healthItems(d)
   const conversationCount = d.counts?.conversations ?? d.counts?.active_conversations ?? d.conversations_count ?? d.active_conversations_count
   const stats = [
-    ['Active agents', d.agents.online, `${d.agents.total} configured`, Bot, 'violet'],
-    ['Telegram', d.telegram_accounts.connected, `${d.telegram_accounts.total} accounts`, MessageCircle, 'blue'],
-    ['Running tasks', d.tasks.running, `${d.tasks.queued} queued`, Zap, 'amber'],
-    ['Memory records', d.memory_items, 'Stored context', BrainCircuit, 'cyan'],
+    ['Active agents', agents.online, `${agents.total} configured`, Bot, 'violet'],
+    ['Telegram', telegram.connected, `${telegram.total} accounts`, MessageCircle, 'blue'],
+    ['Running tasks', tasks.running, `${tasks.queued} queued`, Zap, 'amber'],
+    ['Memory records', memoryItems, 'Stored context', BrainCircuit, 'cyan'],
     ...(conversationCount === undefined
       ? []
       : [['Active conversations', conversationCount, 'Conversation contexts', MessagesSquare, 'violet'] as const]),
   ] as const
   return <>
     <div className="hero-card">
-      <div><span className="eyebrow"><Activity size={14}/> Workspace health</span><h2>Everything is running smoothly.</h2><p>{d.agents.online} agents are active and ready to handle requests.</p></div>
-      <div className="health-ring"><strong>{d.agents.errors ? '!' : '99.9%'}</strong><span>{d.agents.errors ? 'attention' : 'uptime'}</span></div>
+      <div><span className="eyebrow"><Activity size={14}/> Workspace health</span><h2>Everything is running smoothly.</h2><p>{agents.online} agents are active and ready to handle requests.</p></div>
+      <div className="health-ring"><strong>{agents.errors ? '!' : '99.9%'}</strong><span>{agents.errors ? 'attention' : 'uptime'}</span></div>
     </div>
     <div className="stat-grid">{stats.map(([label, value, sub, Icon, color]) =>
       <div className="stat-card" key={label}><span className={`stat-icon ${color}`}><Icon/></span><div className="stat-value">{value}</div><strong>{label}</strong><small>{sub}</small></div>
@@ -190,19 +196,19 @@ function DashboardScreen({ go }: { go: (p: Page) => void }) {
     {configuration.length > 0 && <section className="panel health-panel">
       <SectionHead title="Configuration readiness" text="Provider and connection checks reported by the API" action={<button className="secondary compact" onClick={() => go('connections')}>Manage</button>}/>
       <div className="health-grid">{configuration.map((item, index) => {
-        const ready = item.ready ?? ['ready', 'online', 'active', 'ok', 'connected'].includes(String(item.status).toLowerCase())
+        const ready = item.ready ?? ['ready', 'online', 'active', 'ok', 'connected', 'configured'].includes(String(item.status).toLowerCase())
         return <div className={`health-item ${ready ? 'ready' : 'attention'}`} key={`${item.name}-${index}`}>
-          {ready ? <CheckCircle2 size={18}/> : <CircleAlert size={18}/>}<div><strong>{item.name.replaceAll('_', ' ')}</strong><small>{item.detail || item.status || (ready ? 'Ready' : 'Needs configuration')}</small></div>
+          {ready ? <CheckCircle2 size={18}/> : <CircleAlert size={18}/>}<div><strong>{String(item.name).replaceAll('_', ' ')}</strong><small>{item.detail || item.status || (ready ? 'Ready' : 'Needs configuration')}</small></div>
         </div>
       })}</div>
     </section>}
     <div className="dashboard-grid">
       <section className="panel"><SectionHead title="Service status" text="Infrastructure connections"/>
         <div className="service-list">
-          {[['Agent runtime', `${d.agents.online}/${d.agents.total}`, d.agents.errors ? 'error' : 'online'],
-            ['MCP gateway', `${d.mcp_servers.online}/${d.mcp_servers.total}`, d.mcp_servers.online ? 'online' : 'offline'],
-            ['Telegram bridge', `${d.telegram_accounts.connected} connected`, d.telegram_accounts.connected ? 'online' : 'offline'],
-            ['Task worker', `${d.tasks.running} running`, 'online']].map(([name, val, status]) =>
+          {[['Agent runtime', `${agents.online}/${agents.total}`, agents.errors ? 'error' : 'online'],
+            ['MCP gateway', `${mcp.online}/${mcp.total}`, mcp.online ? 'online' : 'offline'],
+            ['Telegram bridge', `${telegram.connected} connected`, telegram.connected ? 'online' : 'offline'],
+            ['Task worker', `${tasks.running} running`, 'online']].map(([name, val, status]) =>
             <div className="service-row" key={name}><span className={`service-icon ${status}`}><Wifi size={17}/></span><div><strong>{name}</strong><small>{val}</small></div><StatusDot status={status as Status}/></div>)}
         </div>
       </section>
@@ -652,8 +658,12 @@ function LiveScreen({ mode }: { mode: 'logs' | 'tasks' }) {
 }
 
 export default function App() {
+  const pages = new Set<Page>(nav.map(item => item.id))
   const [authenticated, setAuthenticated] = useState(Boolean(localStorage.getItem('ice_token')))
-  const [page, setPage] = useState<Page>(() => (sessionStorage.getItem('ice_page') as Page) || 'dashboard')
+  const [page, setPage] = useState<Page>(() => {
+    const stored = sessionStorage.getItem('ice_page') as Page | null
+    return stored && pages.has(stored) ? stored : 'dashboard'
+  })
   useEffect(() => { const unauthorized = () => { localStorage.removeItem('ice_token'); setAuthenticated(false) }; window.addEventListener('ice:unauthorized', unauthorized); return () => window.removeEventListener('ice:unauthorized', unauthorized) }, [])
   useEffect(() => { sessionStorage.setItem('ice_page', page) }, [page])
   if (!authenticated) return <Login onLogin={() => setAuthenticated(true)}/>
@@ -661,6 +671,6 @@ export default function App() {
     dashboard: <DashboardScreen go={setPage}/>, agents: <AgentsScreen/>, telegram: <TelegramScreen/>,
     conversations: <ConversationsScreen/>, connections: <ConnectionsScreen/>, runtime: <RuntimeScreen/>, memory: <MemoryScreen/>, mcp: <McpScreen/>, cron: <CronScreen/>, settings: <SettingsScreen/>,
     logs: <LiveScreen mode="logs"/>, tasks: <LiveScreen mode="tasks"/>,
-  }[page]
+  }[page] ?? <DashboardScreen go={setPage}/>
   return <Shell page={page} setPage={setPage} logout={() => { localStorage.removeItem('ice_token'); setAuthenticated(false) }}>{screen}</Shell>
 }

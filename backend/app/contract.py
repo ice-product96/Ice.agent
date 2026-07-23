@@ -237,6 +237,23 @@ async def dashboard(
             "connected": connected_mcp,
         },
     }
+    agents_total = counts["agents"]
+    agents_online = sum(1 for item in agent_readiness if item["ready"])
+    agents_errors = sum(1 for item in agent_readiness if item["reasons"])
+    telegram_connected = sum(1 for item in accounts.values() if item.authorized and item.enabled)
+    tasks_running = int(
+        await db.scalar(select(func.count()).select_from(AgentTask).where(AgentTask.status == "running")) or 0
+    )
+    tasks_queued = int(
+        await db.scalar(select(func.count()).select_from(AgentTask).where(AgentTask.status == "queued")) or 0
+    )
+    memory_items = 0
+    try:
+        listed = await request.app.state.memory.get_all()
+        memory_items = len(listed or [])
+    except Exception:
+        memory_items = 0
+
     return {
         "counts": counts,
         **{f"{key}_count": value for key, value in counts.items()},
@@ -245,6 +262,26 @@ async def dashboard(
         "status": "ok",
         "connections": connections,
         "agent_readiness": agent_readiness,
+        # Shape expected by the admin UI Overview screen
+        "agents": {
+            "total": agents_total,
+            "online": agents_online,
+            "errors": agents_errors,
+        },
+        "telegram_accounts": {
+            "total": counts["telegram_accounts"],
+            "connected": telegram_connected,
+        },
+        "tasks": {
+            "running": tasks_running,
+            "queued": tasks_queued,
+            "completed_today": 0,
+        },
+        "memory_items": memory_items,
+        "mcp_servers": {
+            "total": counts["mcp_servers"],
+            "online": connected_mcp,
+        },
     }
 
 

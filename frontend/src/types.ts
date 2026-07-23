@@ -151,19 +151,25 @@ export interface ConnectionHealth {
 }
 
 export interface Dashboard {
-  agents: { total: number; online: number; errors: number }
-  telegram_accounts: { total: number; connected: number }
-  tasks: { running: number; queued: number; completed_today: number }
-  memory_items: number
-  mcp_servers: { total: number; online: number }
+  agents?: { total: number; online: number; errors: number }
+  telegram_accounts?: { total: number; connected: number }
+  tasks?: { running: number; queued: number; completed_today: number }
+  memory_items?: number
+  mcp_servers?: { total: number; online: number }
   uptime_seconds?: number
   connections?: ConnectionHealth[] | Record<string, ConnectionHealth | boolean | string>
   readiness?: ConnectionHealth[] | Record<string, ConnectionHealth | boolean | string>
   conversations_count?: number
   active_conversations_count?: number
+  agents_count?: number
+  telegram_accounts_count?: number
+  mcp_servers_count?: number
   counts?: {
     conversations?: number
     active_conversations?: number
+    agents?: number
+    telegram_accounts?: number
+    mcp_servers?: number
     [key: string]: number | undefined
   }
 }
