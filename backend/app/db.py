@@ -38,6 +38,11 @@ class TelegramAccount(TimestampMixin, Base):
     session_path: Mapped[str] = mapped_column(String(512), unique=True)
     api_id: Mapped[int | None] = mapped_column(Integer)
     api_hash_ciphertext: Mapped[str | None] = mapped_column(Text)
+    http_proxy: Mapped[str | None] = mapped_column(String(1024))
+    mtproto_host: Mapped[str | None] = mapped_column(String(255))
+    mtproto_port: Mapped[int | None] = mapped_column(Integer)
+    mtproto_dc_id: Mapped[int | None] = mapped_column(Integer)
+    # legacy socks5 columns kept for existing DBs; unused by the app
     socks5_host: Mapped[str | None] = mapped_column(String(255))
     socks5_port: Mapped[int | None] = mapped_column(Integer)
     socks5_username: Mapped[str | None] = mapped_column(String(255))
@@ -243,5 +248,9 @@ async def create_schema() -> None:
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS socks5_port INTEGER",
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS socks5_username VARCHAR(255)",
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS socks5_password_ciphertext TEXT",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS http_proxy VARCHAR(1024)",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS mtproto_host VARCHAR(255)",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS mtproto_port INTEGER",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS mtproto_dc_id INTEGER",
         ):
             await connection.execute(text(statement))

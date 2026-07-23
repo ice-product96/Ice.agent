@@ -34,11 +34,11 @@ export interface TelegramAccount {
   phone: string
   api_id: number
   has_api_hash: boolean
-  socks5_host?: string | null
-  socks5_port?: number | null
-  socks5_username?: string | null
-  has_socks5_password?: boolean
-  socks5_enabled?: boolean
+  http_proxy?: string | null
+  mtproto_host?: string | null
+  mtproto_port?: number | null
+  mtproto_dc_id?: number | null
+  proxy_enabled?: boolean
   readiness?: string
   username?: string
   status: Status

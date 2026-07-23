@@ -377,23 +377,29 @@ function TelegramScreen() {
   const [flow, setFlow] = useState<'details' | 'code' | null>(null)
   const [name, setName] = useState(''); const [phone, setPhone] = useState(''); const [code, setCode] = useState(''); const [password, setPassword] = useState('')
   const [apiId, setApiId] = useState(''); const [apiHash, setApiHash] = useState('')
-  const [socksHost, setSocksHost] = useState(''); const [socksPort, setSocksPort] = useState(''); const [socksUser, setSocksUser] = useState(''); const [socksPass, setSocksPass] = useState('')
+  const [httpProxy, setHttpProxy] = useState(''); const [mtHost, setMtHost] = useState(''); const [mtPort, setMtPort] = useState('443'); const [mtDc, setMtDc] = useState('')
   const [session, setSession] = useState(''); const [busy, setBusy] = useState(false); const [flowError, setFlowError] = useState('')
   const [deleting, setDeleting] = useState<TelegramAccount | null>(null)
   const [editingProxy, setEditingProxy] = useState<TelegramAccount | null>(null)
   if (loading) return <Loading/>
-  function resetSocks() { setSocksHost(''); setSocksPort(''); setSocksUser(''); setSocksPass('') }
+  function resetNetwork() { setHttpProxy(''); setMtHost(''); setMtPort('443'); setMtDc('') }
+  function networkHint(a: TelegramAccount) {
+    const parts: string[] = []
+    if (a.http_proxy) parts.push(`HTTP ${a.http_proxy.replace(/\/\/[^@]+@/, '//***@')}`)
+    if (a.mtproto_host && a.mtproto_dc_id) parts.push(`MTProto DC${a.mtproto_dc_id} ${a.mtproto_host}:${a.mtproto_port || 443}`)
+    return parts.length ? parts.join(' · ') : 'без прокси'
+  }
   async function start(e: FormEvent) {
     e.preventDefault(); setBusy(true); setFlowError('')
     try {
       const result = await api.telegram.startLogin({
         name, phone, api_id: Number(apiId), api_hash: apiHash,
-        socks5_host: socksHost.trim() || undefined,
-        socks5_port: socksPort ? Number(socksPort) : undefined,
-        socks5_username: socksUser.trim() || undefined,
-        socks5_password: socksPass || undefined,
+        http_proxy: httpProxy.trim() || undefined,
+        mtproto_host: mtHost.trim() || undefined,
+        mtproto_port: mtHost.trim() && mtPort ? Number(mtPort) : undefined,
+        mtproto_dc_id: mtHost.trim() && mtDc ? Number(mtDc) : undefined,
       })
-      setApiHash(''); setSocksPass(''); setSession(result.session_id); setFlow('code')
+      setApiHash(''); setSession(result.session_id); setFlow('code')
     }
     catch (err) { setFlowError(err instanceof Error ? err.message : 'Не удалось отправить код') } finally { setBusy(false) }
   }
@@ -401,7 +407,7 @@ function TelegramScreen() {
     e.preventDefault(); setBusy(true); setFlowError('')
     try {
       const account = await api.telegram.verifyCode({ session_id: session, code, password: password || undefined })
-      setData([...data.filter(a => a.id !== account.id), account]); setFlow(null); setName(''); setPhone(''); setApiId(''); setApiHash(''); setPassword(''); setCode(''); resetSocks()
+      setData([...data.filter(a => a.id !== account.id), account]); setFlow(null); setName(''); setPhone(''); setApiId(''); setApiHash(''); setPassword(''); setCode(''); resetNetwork()
     }
     catch (err) { setFlowError(err instanceof Error ? err.message : 'Проверка не удалась') } finally { setBusy(false) }
   }
@@ -409,10 +415,10 @@ function TelegramScreen() {
     {error && <Alert message={error}/>}
     <SectionHead title={`${data.length} аккаунтов Telegram`} text="Пользовательские сессии для агентов" action={<button className="primary" onClick={() => setFlow('details')}><Plus size={17}/>Подключить аккаунт</button>}/>
     {data.length === 0 ? <Empty icon={MessageCircle} title="Нет аккаунтов Telegram" text="Подключите аккаунт по номеру телефона и коду подтверждения."/> :
-      <div className="list-panel">{data.map(a => <div className="account-row" key={a.id}><span className="entity-avatar telegram"><MessageCircle/></span><div className="grow"><strong>{a.name}</strong><small>{a.username ? `@${a.username}` : a.phone} · API ID {a.api_id} · {a.has_api_hash ? 'хеш приложения защищён' : 'хеш приложения отсутствует'} · {a.socks5_enabled ? `SOCKS5 ${a.socks5_host}:${a.socks5_port}` : 'без SOCKS5'}</small></div><StatusDot status={(a.readiness === 'ready' ? 'online' : a.readiness ? 'pending' : a.status) as Status}/><button className="secondary compact" onClick={() => setEditingProxy(a)}>Прокси</button><button className="icon-button danger-ghost" onClick={() => setDeleting(a)}><Trash2 size={17}/></button></div>)}</div>}
-    {flow && <Modal title={flow === 'details' ? 'Подключение Telegram' : 'Введите код подтверждения'} subtitle={flow === 'details' ? 'Мы отправим код входа в приложение Telegram.' : `Код отправлен на ${phone}`} onClose={() => { setApiHash(''); setPassword(''); setSocksPass(''); setFlow(null) }}>
+      <div className="list-panel">{data.map(a => <div className="account-row" key={a.id}><span className="entity-avatar telegram"><MessageCircle/></span><div className="grow"><strong>{a.name}</strong><small>{a.username ? `@${a.username}` : a.phone} · API ID {a.api_id} · {a.has_api_hash ? 'хеш приложения защищён' : 'хеш приложения отсутствует'} · {networkHint(a)}</small></div><StatusDot status={(a.readiness === 'ready' ? 'online' : a.readiness ? 'pending' : a.status) as Status}/><button className="secondary compact" onClick={() => setEditingProxy(a)}>Сеть</button><button className="icon-button danger-ghost" onClick={() => setDeleting(a)}><Trash2 size={17}/></button></div>)}</div>}
+    {flow && <Modal title={flow === 'details' ? 'Подключение Telegram' : 'Введите код подтверждения'} subtitle={flow === 'details' ? 'Мы отправим код входа в приложение Telegram.' : `Код отправлен на ${phone}`} onClose={() => { setApiHash(''); setPassword(''); setFlow(null) }}>
       {flowError && <Alert message={flowError}/>}
-      {flow === 'details' ? <form onSubmit={start}><div className="notice wide"><KeyRound size={16}/><span>Создайте приложение на <a href="https://my.telegram.org/apps" target="_blank" rel="noreferrer">my.telegram.org</a>, затем введите его API ID и hash. Hash отправляется один раз и больше не отображается.</span></div><div className="form-grid"><Field label="Имя аккаунта"><input required value={name} onChange={e => setName(e.target.value)} placeholder="Аккаунт поддержки"/></Field><Field label="Номер телефона" hint="Укажите международный код страны"><input required value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 000 0000"/></Field><Field label="Telegram API ID"><input required min="1" inputMode="numeric" type="number" value={apiId} onChange={e => setApiId(e.target.value)} placeholder="12345678"/></Field><Field label="Telegram API hash"><input required autoComplete="new-password" type="password" value={apiHash} onChange={e => setApiHash(e.target.value)} placeholder="32-символьный хеш приложения"/></Field><Field label="SOCKS5 хост" hint="Необязательно — для обхода блокировок"><input value={socksHost} onChange={e => setSocksHost(e.target.value)} placeholder="127.0.0.1" autoComplete="off"/></Field><Field label="SOCKS5 порт"><input inputMode="numeric" type="number" min="1" max="65535" value={socksPort} onChange={e => setSocksPort(e.target.value)} placeholder="1080" disabled={!socksHost.trim()}/></Field><Field label="SOCKS5 логин"><input value={socksUser} onChange={e => setSocksUser(e.target.value)} placeholder="Необязательно" disabled={!socksHost.trim()} autoComplete="off"/></Field><Field label="SOCKS5 пароль"><input type="password" value={socksPass} onChange={e => setSocksPass(e.target.value)} placeholder="Необязательно" disabled={!socksHost.trim()} autoComplete="new-password"/></Field></div><div className="modal-actions"><button type="button" className="secondary" onClick={() => { setApiHash(''); setSocksPass(''); setFlow(null) }}>Отмена</button><button className="primary" disabled={busy}>Отправить код</button></div></form> :
+      {flow === 'details' ? <form onSubmit={start}><div className="notice wide"><KeyRound size={16}/><span>Создайте приложение на <a href="https://my.telegram.org/apps" target="_blank" rel="noreferrer">my.telegram.org</a>, затем введите его API ID и hash. Hash отправляется один раз и больше не отображается.</span></div><div className="form-grid"><Field label="Имя аккаунта"><input required value={name} onChange={e => setName(e.target.value)} placeholder="Аккаунт поддержки"/></Field><Field label="Номер телефона" hint="Укажите международный код страны"><input required value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 000 0000"/></Field><Field label="Telegram API ID"><input required min="1" inputMode="numeric" type="number" value={apiId} onChange={e => setApiId(e.target.value)} placeholder="12345678"/></Field><Field label="Telegram API hash"><input required autoComplete="new-password" type="password" value={apiHash} onChange={e => setApiHash(e.target.value)} placeholder="32-символьный хеш приложения"/></Field><Field label="HTTP-прокси" hint="Необязательно. Пример: http://user:pass@host:8080" wide><input value={httpProxy} onChange={e => setHttpProxy(e.target.value)} placeholder="http://127.0.0.1:8080" autoComplete="off"/></Field><Field label="MTProto host" hint="Необязательно — адрес DC Telegram"><input value={mtHost} onChange={e => setMtHost(e.target.value)} placeholder="149.154.167.50" autoComplete="off"/></Field><Field label="MTProto DC ID"><input required={Boolean(mtHost.trim())} inputMode="numeric" type="number" min="1" max="5" value={mtDc} onChange={e => setMtDc(e.target.value)} placeholder="2" disabled={!mtHost.trim()}/></Field><Field label="MTProto порт"><input inputMode="numeric" type="number" min="1" max="65535" value={mtPort} onChange={e => setMtPort(e.target.value)} placeholder="443" disabled={!mtHost.trim()}/></Field></div><div className="modal-actions"><button type="button" className="secondary" onClick={() => { setApiHash(''); setFlow(null) }}>Отмена</button><button className="primary" disabled={busy}>Отправить код</button></div></form> :
       <form onSubmit={verify}><div className="form-grid"><Field label="Код подтверждения"><input autoFocus required value={code} onChange={e => setCode(e.target.value)} placeholder="12345"/></Field><Field label="Пароль 2FA" hint="Только если включено на аккаунте"><input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Необязательно"/></Field></div><div className="modal-actions"><button type="button" className="secondary" onClick={() => setFlow('details')}>Назад</button><button className="primary" disabled={busy}>Подтвердить и подключить</button></div></form>}
     </Modal>}
     {editingProxy && <TelegramProxyForm account={editingProxy} onClose={() => setEditingProxy(null)} onSave={async payload => {
@@ -427,41 +433,40 @@ function TelegramProxyForm({ account, onClose, onSave }: {
   account: TelegramAccount
   onClose: () => void
   onSave: (payload: {
-    socks5_host?: string | null; socks5_port?: number | null; socks5_username?: string | null
-    socks5_password?: string; clear_socks5_password?: boolean; clear_socks5?: boolean
+    http_proxy?: string | null
+    mtproto_host?: string | null
+    mtproto_port?: number | null
+    mtproto_dc_id?: number | null
+    clear_proxy?: boolean
   }) => Promise<void>
 }) {
-  const [host, setHost] = useState(account.socks5_host || '')
-  const [port, setPort] = useState(account.socks5_port ? String(account.socks5_port) : '')
-  const [username, setUsername] = useState(account.socks5_username || '')
-  const [password, setPassword] = useState('')
+  const [httpProxy, setHttpProxy] = useState(account.http_proxy || '')
+  const [mtHost, setMtHost] = useState(account.mtproto_host || '')
+  const [mtPort, setMtPort] = useState(String(account.mtproto_port || 443))
+  const [mtDc, setMtDc] = useState(account.mtproto_dc_id ? String(account.mtproto_dc_id) : '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  return <Modal title="SOCKS5-прокси Telegram" subtitle={`${account.name} · ${account.phone}`} onClose={onClose}>
+  return <Modal title="Сеть Telegram" subtitle={`${account.name} · ${account.phone}`} onClose={onClose}>
     <form onSubmit={async e => {
       e.preventDefault(); setBusy(true); setError('')
       try {
-        if (!host.trim()) await onSave({ clear_socks5: true })
-        else {
-          const payload: {
-            socks5_host: string; socks5_port: number; socks5_username: string | null
-            socks5_password?: string
-          } = {
-            socks5_host: host.trim(),
-            socks5_port: Number(port),
-            socks5_username: username.trim() || null,
-          }
-          if (password) payload.socks5_password = password
-          await onSave(payload)
-        }
-      } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить прокси'); setBusy(false) }
+        const proxy = httpProxy.trim()
+        const host = mtHost.trim()
+        if (!proxy && !host) await onSave({ clear_proxy: true })
+        else await onSave({
+          http_proxy: proxy || null,
+          mtproto_host: host || null,
+          mtproto_port: host ? Number(mtPort || 443) : null,
+          mtproto_dc_id: host && mtDc ? Number(mtDc) : null,
+        })
+      } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить настройки сети'); setBusy(false) }
     }}>
       {error && <Alert message={error}/>}
       <div className="form-grid">
-        <Field label="Хост" hint="Оставьте пустым, чтобы отключить прокси"><input value={host} onChange={e => setHost(e.target.value)} placeholder="127.0.0.1" autoComplete="off"/></Field>
-        <Field label="Порт"><input required={Boolean(host.trim())} inputMode="numeric" type="number" min="1" max="65535" value={port} onChange={e => setPort(e.target.value)} placeholder="1080" disabled={!host.trim()}/></Field>
-        <Field label="Логин"><input value={username} onChange={e => setUsername(e.target.value)} placeholder="Необязательно" disabled={!host.trim()} autoComplete="off"/></Field>
-        <Field label="Пароль" hint={account.has_socks5_password ? 'Настроен · ••••••••. Оставьте пустым, чтобы сохранить' : 'Необязательно'}><input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder={account.has_socks5_password ? 'Оставьте пустым для сохранения' : 'Необязательно'} disabled={!host.trim()} autoComplete="new-password"/></Field>
+        <Field label="HTTP-прокси" hint="Одна строка. Пример: http://user:pass@host:8080. Пусто — без HTTP-прокси" wide><input value={httpProxy} onChange={e => setHttpProxy(e.target.value)} placeholder="http://127.0.0.1:8080" autoComplete="off"/></Field>
+        <Field label="MTProto host" hint="Адрес DC Telegram. Пусто — DC по умолчанию"><input value={mtHost} onChange={e => setMtHost(e.target.value)} placeholder="149.154.167.50" autoComplete="off"/></Field>
+        <Field label="MTProto DC ID"><input required={Boolean(mtHost.trim())} inputMode="numeric" type="number" min="1" max="5" value={mtDc} onChange={e => setMtDc(e.target.value)} placeholder="2" disabled={!mtHost.trim()}/></Field>
+        <Field label="MTProto порт"><input inputMode="numeric" type="number" min="1" max="65535" value={mtPort} onChange={e => setMtPort(e.target.value)} placeholder="443" disabled={!mtHost.trim()}/></Field>
       </div>
       <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Отмена</button><button className="primary" disabled={busy}>{busy && <LoaderCircle className="spin" size={16}/>}Сохранить</button></div>
     </form>

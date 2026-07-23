@@ -87,14 +87,17 @@ export const api = {
     list: () => request<TelegramAccount[]>('/telegram/accounts'),
     startLogin: (data: {
       name: string; phone: string; api_id: number; api_hash: string
-      socks5_host?: string; socks5_port?: number; socks5_username?: string; socks5_password?: string
+      http_proxy?: string; mtproto_host?: string; mtproto_port?: number; mtproto_dc_id?: number
     }) =>
       request<{ session_id: string; phone_code_hash?: string }>('/telegram/accounts/login', { method: 'POST', ...body(data) }),
     verifyCode: (data: { session_id: string; code: string; password?: string }) =>
       request<TelegramAccount>('/telegram/accounts/verify', { method: 'POST', ...body(data) }),
     updateProxy: (id: string, data: {
-      socks5_host?: string | null; socks5_port?: number | null; socks5_username?: string | null
-      socks5_password?: string; clear_socks5_password?: boolean; clear_socks5?: boolean
+      http_proxy?: string | null
+      mtproto_host?: string | null
+      mtproto_port?: number | null
+      mtproto_dc_id?: number | null
+      clear_proxy?: boolean
     }) =>
       request<TelegramAccount>(`/telegram/accounts/${id}/proxy`, { method: 'PATCH', ...body(data) }),
     remove: (id: string) => request<void>(`/telegram/accounts/${id}`, { method: 'DELETE' }),

@@ -71,19 +71,18 @@ class TelegramLoginBody(BaseModel):
     phone: str
     api_id: int
     api_hash: str
-    socks5_host: str | None = None
-    socks5_port: int | None = None
-    socks5_username: str | None = None
-    socks5_password: str = ""
+    http_proxy: str | None = None
+    mtproto_host: str | None = None
+    mtproto_port: int | None = None
+    mtproto_dc_id: int | None = None
 
 
 class TelegramProxyBody(BaseModel):
-    socks5_host: str | None = None
-    socks5_port: int | None = None
-    socks5_username: str | None = None
-    socks5_password: str = ""
-    clear_socks5_password: bool = False
-    clear_socks5: bool = False
+    http_proxy: str | None = None
+    mtproto_host: str | None = None
+    mtproto_port: int | None = None
+    mtproto_dc_id: int | None = None
+    clear_proxy: bool = False
 
 
 class TelegramVerifyBody(BaseModel):
@@ -563,31 +562,26 @@ async def test_llm_profile(
     return {"ok": True, "status": "connected", "detail": "Connection successful"}
 
 
-def apply_telegram_socks5(
+def apply_telegram_network(
     account: TelegramAccount,
     *,
-    socks5_host: str | None,
-    socks5_port: int | None,
-    socks5_username: str | None,
-    socks5_password: str = "",
-    clear_socks5_password: bool = False,
-    clear_socks5: bool = False,
-    secrets: SecretStore,
+    http_proxy: str | None = None,
+    mtproto_host: str | None = None,
+    mtproto_port: int | None = None,
+    mtproto_dc_id: int | None = None,
+    clear_proxy: bool = False,
 ) -> None:
-    if clear_socks5:
-        account.socks5_host = None
-        account.socks5_port = None
-        account.socks5_username = None
-        account.socks5_password_ciphertext = None
+    if clear_proxy:
+        account.http_proxy = None
+        account.mtproto_host = None
+        account.mtproto_port = None
+        account.mtproto_dc_id = None
         return
-    host = (socks5_host or "").strip() or None
-    account.socks5_host = host
-    account.socks5_port = int(socks5_port) if host and socks5_port else None
-    account.socks5_username = (socks5_username or "").strip() or None if host else None
-    if clear_socks5_password or not host:
-        account.socks5_password_ciphertext = None
-    elif socks5_password:
-        account.socks5_password_ciphertext = secrets.encrypt(socks5_password)
+    account.http_proxy = (http_proxy or "").strip() or None
+    host = (mtproto_host or "").strip() or None
+    account.mtproto_host = host
+    account.mtproto_dc_id = int(mtproto_dc_id) if host and mtproto_dc_id else None
+    account.mtproto_port = int(mtproto_port) if host and mtproto_port else (443 if host else None)
 
 
 def telegram_json(account: TelegramAccount) -> dict[str, Any]:
@@ -599,11 +593,11 @@ def telegram_json(account: TelegramAccount) -> dict[str, Any]:
         "api_id": account.api_id,
         "has_api_hash": bool(account.api_hash_ciphertext),
         "api_hash_masked": masked_secret(account.api_hash_ciphertext),
-        "socks5_host": account.socks5_host,
-        "socks5_port": account.socks5_port,
-        "socks5_username": account.socks5_username,
-        "has_socks5_password": bool(account.socks5_password_ciphertext),
-        "socks5_enabled": bool(account.socks5_host and account.socks5_port),
+        "http_proxy": account.http_proxy,
+        "mtproto_host": account.mtproto_host,
+        "mtproto_port": account.mtproto_port,
+        "mtproto_dc_id": account.mtproto_dc_id,
+        "proxy_enabled": bool(account.http_proxy or (account.mtproto_host and account.mtproto_dc_id)),
         "enabled": account.enabled,
         "authorized": account.authorized,
         "status": "connected" if account.authorized else "pending",
@@ -633,15 +627,13 @@ async def update_telegram_proxy(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     account = await one(db, TelegramAccount, account_id)
-    apply_telegram_socks5(
+    apply_telegram_network(
         account,
-        socks5_host=payload.socks5_host,
-        socks5_port=payload.socks5_port,
-        socks5_username=payload.socks5_username,
-        socks5_password=payload.socks5_password,
-        clear_socks5_password=payload.clear_socks5_password,
-        clear_socks5=payload.clear_socks5,
-        secrets=SecretStore.from_settings(get_settings()),
+        http_proxy=payload.http_proxy,
+        mtproto_host=payload.mtproto_host,
+        mtproto_port=payload.mtproto_port,
+        mtproto_dc_id=payload.mtproto_dc_id,
+        clear_proxy=payload.clear_proxy,
     )
     await db.commit()
     await db.refresh(account)
@@ -675,13 +667,12 @@ async def telegram_login(payload: TelegramLoginBody, request: Request, db: Async
         account.api_id = payload.api_id
         account.api_hash_ciphertext = secrets.encrypt(payload.api_hash)
         await db.commit()
-    apply_telegram_socks5(
+    apply_telegram_network(
         account,
-        socks5_host=payload.socks5_host,
-        socks5_port=payload.socks5_port,
-        socks5_username=payload.socks5_username,
-        socks5_password=payload.socks5_password,
-        secrets=secrets,
+        http_proxy=payload.http_proxy,
+        mtproto_host=payload.mtproto_host,
+        mtproto_port=payload.mtproto_port,
+        mtproto_dc_id=payload.mtproto_dc_id,
     )
     await db.commit()
     await db.refresh(account)

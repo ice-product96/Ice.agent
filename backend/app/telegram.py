@@ -186,30 +186,41 @@ class TelegramGateway:
             if account.session_path
             else self.settings.session_dir / safe
         )
-        return TelegramClient(
+        client = TelegramClient(
             str(path.with_suffix("")) if path.suffix == ".session" else str(path),
             account.api_id,
             api_hash,
-            proxy=self._socks5_proxy(account),
+            proxy=self._http_proxy(account),
         )
+        host = (getattr(account, "mtproto_host", None) or "").strip()
+        dc_id = getattr(account, "mtproto_dc_id", None)
+        if host and dc_id:
+            port = int(getattr(account, "mtproto_port", None) or 443)
+            client.session.set_dc(int(dc_id), host, port)
+        return client
 
-    def _socks5_proxy(self, account: Any) -> tuple[Any, ...] | None:
-        host = (getattr(account, "socks5_host", None) or "").strip()
-        port = getattr(account, "socks5_port", None)
-        if not host or not port:
+    def _http_proxy(self, account: Any) -> dict[str, Any] | None:
+        from urllib.parse import unquote, urlparse
+
+        raw = (getattr(account, "http_proxy", None) or "").strip()
+        if not raw:
             return None
-        from python_socks import ProxyType
-
-        username = (getattr(account, "socks5_username", None) or "").strip() or None
-        password = self.secrets.decrypt(getattr(account, "socks5_password_ciphertext", None))
-        return (
-            ProxyType.SOCKS5,
-            host,
-            int(port),
-            True,
-            username,
-            password,
-        )
+        parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+        if not parsed.hostname:
+            raise RuntimeError("Telegram HTTP proxy URL is invalid")
+        scheme = (parsed.scheme or "http").lower()
+        if scheme not in {"http", "https"}:
+            raise RuntimeError("Telegram proxy must be an HTTP(S) URL")
+        proxy: dict[str, Any] = {
+            "proxy_type": scheme,
+            "addr": parsed.hostname,
+            "port": parsed.port or (443 if scheme == "https" else 80),
+        }
+        if parsed.username:
+            proxy["username"] = unquote(parsed.username)
+        if parsed.password:
+            proxy["password"] = unquote(parsed.password)
+        return proxy
 
     async def reconnect(self, account: Any) -> str:
         phone = account.phone
