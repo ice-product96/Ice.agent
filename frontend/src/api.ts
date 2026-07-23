@@ -34,7 +34,7 @@ function errorMessage(status: number, details: unknown): string {
     if (Array.isArray(detail)) return detail.map(item => typeof item === 'object' && item && 'msg' in item ? String((item as { msg: unknown }).msg) : String(item)).join('; ')
     return String(detail)
   }
-  return `Request failed (${status})`
+  return `Ошибка запроса (${status})`
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
