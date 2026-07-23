@@ -16,23 +16,43 @@ function token() {
   return localStorage.getItem('ice_token')
 }
 
+async function readBody(response: Response): Promise<unknown> {
+  const raw = await response.text()
+  if (!raw) return undefined
+  try {
+    return JSON.parse(raw) as unknown
+  } catch {
+    return raw
+  }
+}
+
+function errorMessage(status: number, details: unknown): string {
+  if (typeof details === 'string' && details.trim()) return details.trim().slice(0, 300)
+  if (typeof details === 'object' && details && 'detail' in details) {
+    const detail = (details as { detail: unknown }).detail
+    if (typeof detail === 'string') return detail
+    if (Array.isArray(detail)) return detail.map(item => typeof item === 'object' && item && 'msg' in item ? String((item as { msg: unknown }).msg) : String(item)).join('; ')
+    return String(detail)
+  }
+  return `Request failed (${status})`
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers)
   if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json')
   const auth = token()
   if (auth) headers.set('Authorization', `Bearer ${auth}`)
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers })
-  if (response.status === 401) window.dispatchEvent(new Event('ice:unauthorized'))
+  // Wrong password on login is also 401 — only kick session for authenticated routes
+  if (response.status === 401 && path !== '/auth/login') {
+    window.dispatchEvent(new Event('ice:unauthorized'))
+  }
+  const payload = await readBody(response)
   if (!response.ok) {
-    let details: unknown
-    try { details = await response.json() } catch { details = await response.text() }
-    const message = typeof details === 'object' && details && 'detail' in details
-      ? String((details as { detail: unknown }).detail)
-      : `Request failed (${response.status})`
-    throw new ApiError(response.status, message, details)
+    throw new ApiError(response.status, errorMessage(response.status, payload), payload)
   }
   if (response.status === 204) return undefined as T
-  return response.json() as Promise<T>
+  return payload as T
 }
 
 const body = (data: unknown): RequestInit => ({ body: JSON.stringify(data) })

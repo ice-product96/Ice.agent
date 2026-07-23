@@ -50,4 +50,9 @@ async def require_admin(
 
 
 def valid_password(provided: str, settings: Settings) -> bool:
-    return hmac.compare_digest(provided.encode(), settings.admin_password.get_secret_value().encode())
+    expected = settings.admin_password.get_secret_value().encode()
+    candidate = provided.encode()
+    if len(candidate) != len(expected):
+        hmac.compare_digest(expected, expected)
+        return False
+    return hmac.compare_digest(candidate, expected)
