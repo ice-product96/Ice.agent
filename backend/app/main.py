@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -87,17 +88,36 @@ async def lifespan(app: FastAPI):
         await telegram.restore(accounts)
     except Exception as exc:
         await events.publish("telegram.startup_failed", {"error": str(exc)})
-    for server in servers:
+    mcp_startup_stops: dict[int, asyncio.Event] = {}
+
+    async def connect_mcp(server: McpServer) -> None:
+        stop = mcp_startup_stops[server.id]
         try:
-            await mcp.hot_reload(server.name, {
-                "transport": server.transport,
-                "command": server.command,
-                "args": server.args,
-                "url": server.url,
-                "env": json.loads(secrets.decrypt(server.env_ciphertext) or "{}"),
-            })
-        except Exception as exc:
-            await events.publish("mcp.connection_failed", {"server": server.name, "error": str(exc)})
+            async with asyncio.timeout(15):
+                await mcp.hot_reload(server.name, {
+                    "transport": server.transport,
+                    "command": server.command,
+                    "args": server.args,
+                    "url": server.url,
+                    "env": json.loads(secrets.decrypt(server.env_ciphertext) or "{}"),
+                })
+            # Keep ownership of AnyIO cancel scopes in this task until shutdown.
+            await stop.wait()
+        except BaseException as exc:
+            await events.publish(
+                "mcp.connection_failed",
+                {"server": server.name, "error": str(exc) or type(exc).__name__},
+            )
+        finally:
+            await mcp.disconnect(server.name)
+
+    # External MCP servers must never block API health/startup.
+    for server in servers:
+        mcp_startup_stops[server.id] = asyncio.Event()
+    mcp_startup_tasks = [
+        asyncio.create_task(connect_mcp(server), name=f"mcp-connect-{server.id}")
+        for server in servers
+    ]
 
     async def run_scheduled(agent_id: int, payload: dict[str, Any]) -> None:
         async with SessionLocal() as db:
@@ -119,6 +139,9 @@ async def lifespan(app: FastAPI):
     app.state.telegram_router = telegram_router
     app.state.scheduler = scheduler
     yield
+    for stop in mcp_startup_stops.values():
+        stop.set()
+    await asyncio.gather(*mcp_startup_tasks, return_exceptions=True)
     scheduler.shutdown()
     await task_bus.stop()
     await telegram.close()
