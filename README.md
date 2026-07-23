@@ -37,15 +37,31 @@ npm run dev
 
 ## Docker Compose
 
+Стек изолирован (`name: iceagent`, своя сеть `iceagent_net`, volume с префиксом
+`iceagent_*`). На multi-app сервере порты только на localhost и не пересекаются
+с PokerClub / UralTrade / IceSchool / AYS Tracker / SearXNG / RustDesk:
+
+| Сервис | Host bind | Зачем |
+|--------|-----------|--------|
+| UI | `127.0.0.1:3040` | панель (не 3000/3010/3090) |
+| API | `127.0.0.1:8040` | прямой доступ к API при отладке |
+| Postgres / Qdrant | нет publish | только внутренняя сеть |
+
 ```bash
-copy .env.example .env
-docker compose up --build
+cp .env.example .env
+# задайте ICE_SECRET_KEY и ICE_ADMIN_PASSWORD
+docker compose up -d --build
 ```
 
-Панель будет доступна на http://localhost:3000. В production замените
-`ICE_SECRET_KEY` и `ICE_ADMIN_PASSWORD`. Это единственные bootstrap-секреты:
-все рабочие ключи и подключения настраиваются через веб-панель и хранятся
-в базе данных в зашифрованном виде.
+Панель: http://127.0.0.1:3040  
+API: http://127.0.0.1:8040/docs  
+
+На сервере уже есть SearXNG (`:8080`). В Runtime панели укажите, например:
+`http://172.17.0.1:8080` (IP docker0 / host gateway), а Qdrant —
+`http://qdrant:6333` (имя сервиса внутри compose).
+
+В production замените `ICE_SECRET_KEY` и `ICE_ADMIN_PASSWORD`. Это единственные
+bootstrap-секреты: рабочие ключи настраиваются в веб-панели и шифруются в БД.
 
 ## Первоначальная настройка
 

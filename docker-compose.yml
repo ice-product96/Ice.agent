@@ -1,56 +1,90 @@
+# Ice.agent — изолированный стек для multi-app сервера.
+# Имена контейнеров/volume с префиксом iceagent-*, порты только на localhost.
+#
+# Занятые на ice-server (не использовать):
+#   2988 ays-tracker | 3010 uraltrade | 3090 pokerclub | 53173 iceschool
+#   8080 searxng     | 21115-21119 rustdesk
+#
+# Панель: http://127.0.0.1:3040
+# API (локально): http://127.0.0.1:8040
+# SearXNG уже есть на хосте — в Runtime панели укажите:
+#   http://172.17.0.1:8080  (или IP docker0 / host gateway)
+
+name: iceagent
+
 services:
   postgres:
     image: postgres:16-alpine
+    container_name: iceagent-postgres
     environment:
       POSTGRES_DB: ice_agent
       POSTGRES_USER: ice
       POSTGRES_PASSWORD: ice
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - iceagent_postgres_data:/var/lib/postgresql/data
+    # Порт на хост НЕ публикуем — только внутренняя сеть compose
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ice -d ice_agent"]
       interval: 5s
       timeout: 5s
       retries: 10
     restart: unless-stopped
+    networks:
+      - iceagent_net
 
   qdrant:
     image: qdrant/qdrant:latest
+    container_name: iceagent-qdrant
     volumes:
-      - qdrant_data:/qdrant/storage
-    ports:
-      - "6333:6333"
+      - iceagent_qdrant_data:/qdrant/storage
+    # 6333 наружу не открываем — пересечений нет, но публиковать незачем
     restart: unless-stopped
+    networks:
+      - iceagent_net
 
   api:
     build: ./backend
+    container_name: iceagent-api
     env_file: .env
     environment:
       ICE_DATABASE_URL: postgresql+asyncpg://ice:ice@postgres:5432/ice_agent
       ICE_SESSION_DIR: /app/data/sessions
+      ICE_BACKUP_DIR: /app/data/backups
     volumes:
-      - agent_data:/app/data
+      - iceagent_agent_data:/app/data
     ports:
-      - "8000:8000"
+      # свободный localhost-порт; 8000 внутри контейнера без конфликта с pokerclub (у них без host publish)
+      - "127.0.0.1:8040:8000"
     depends_on:
       postgres:
         condition: service_healthy
       qdrant:
         condition: service_started
     restart: unless-stopped
+    networks:
+      - iceagent_net
 
   ui:
     build:
       context: ./frontend
       args:
         VITE_API_URL: /api/v1
+    container_name: iceagent-ui
     ports:
-      - "3000:80"
+      # 3000/3010/3090 заняты паттерном других проектов — берём 3040
+      - "127.0.0.1:3040:80"
     depends_on:
       - api
     restart: unless-stopped
+    networks:
+      - iceagent_net
 
 volumes:
-  postgres_data:
-  qdrant_data:
-  agent_data:
+  iceagent_postgres_data:
+  iceagent_qdrant_data:
+  iceagent_agent_data:
+
+networks:
+  iceagent_net:
+    name: iceagent_net
+    driver: bridge
