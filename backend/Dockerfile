@@ -4,14 +4,17 @@ WORKDIR /app
 COPY pyproject.toml .
 COPY app ./app
 COPY entrypoint.sh /entrypoint.sh
-RUN pip install --no-cache-dir ".[mem0]" \
-  && useradd --create-home ice \
-  && mkdir -p /app/data/sessions /app/data/backups \
-  && chown -R ice:ice /app /entrypoint.sh \
-  && chmod +x /entrypoint.sh \
-  && apt-get update \
+RUN apt-get update \
   && apt-get install -y --no-install-recommends gosu \
-  && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/* \
+  && pip install --no-cache-dir ".[mem0]" \
+  && useradd --create-home --uid 10001 ice \
+  && mkdir -p /app/data/sessions /app/data/backups \
+  && chown -R ice:ice /app \
+  && sed -i 's/\r$//' /entrypoint.sh \
+  && chmod 755 /entrypoint.sh
+# Start as root so entrypoint can chown the mounted volume, then gosu -> ice
+USER root
 EXPOSE 8000
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/bin/sh", "/entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
