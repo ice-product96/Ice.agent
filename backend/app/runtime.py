@@ -368,13 +368,15 @@ class AgentRuntime:
                 name
                 for name in (self.mcp.sessions if self.mcp else {})
             }
-        client = LLMClient(
+        client_options: dict[str, Any] = dict(
             api_key=api_key,
             base_url=profile.base_url,
             model=agent.model_name or profile.default_model,
             max_rounds=runtime_settings.max_tool_rounds,
-            http_proxy=profile.http_proxy,
         )
+        if profile.http_proxy:
+            client_options["http_proxy"] = profile.http_proxy
+        client = LLMClient(**client_options)
         try:
             is_telegram = context.get("source") == "telegram" and account is not None
 
@@ -425,16 +427,16 @@ class AgentRuntime:
                 {
                     "role": "system",
                     "content": (
-                        "Never claim that an external action succeeded unless its tool call "
-                        "returned successfully. Report tool errors truthfully and explicitly."
+                        "Relevant long-term memories:\n" + memory_context
+                        if memory_context
+                        else "No relevant long-term memories were found."
                     ),
                 },
                 {
                     "role": "system",
                     "content": (
-                        "Relevant long-term memories:\n" + memory_context
-                        if memory_context
-                        else "No relevant long-term memories were found."
+                        "Never claim that an external action succeeded unless its tool call "
+                        "returned successfully. Report tool errors truthfully and explicitly."
                     ),
                 },
                 {"role": "system", "content": conversation_context},
@@ -510,7 +512,9 @@ class AgentRuntime:
             await self.events.publish("agent.completed", {"agent_id": agent.id, "text": result})
             return result
         finally:
-            await client.aclose()
+            close = getattr(client, "aclose", None)
+            if close:
+                await close()
 
     async def update_telegram_outbound(
         self,
