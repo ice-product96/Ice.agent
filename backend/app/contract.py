@@ -712,12 +712,19 @@ async def memory_delete(memory_id: str, request: Request) -> Response:
 
 
 def mcp_json(server: McpServer) -> dict[str, Any]:
-    result = row(server)
-    result.pop("env_ciphertext", None)
-    encrypted_env = decrypt_mcp_env(server)
-    result["env"] = {key: "********" for key in encrypted_env}
-    result["has_env"] = bool(encrypted_env)
-    return result
+    return {
+        "id": server.id,
+        "name": server.name,
+        "transport": server.transport,
+        "command": server.command,
+        "args": server.args or [],
+        "url": server.url,
+        "enabled": server.enabled,
+        "env": {key: "********" for key in decrypt_mcp_env(server)},
+        "has_env": bool(server.env_ciphertext or server.env),
+        "created_at": iso(server.created_at),
+        "updated_at": iso(server.updated_at),
+    }
 
 
 def decrypt_mcp_env(server: McpServer) -> dict[str, Any]:
@@ -725,18 +732,33 @@ def decrypt_mcp_env(server: McpServer) -> dict[str, Any]:
         return dict(server.env or {})
     import json
 
-    value = SecretStore.from_settings(get_settings()).decrypt(server.env_ciphertext)
-    return json.loads(value or "{}")
+    try:
+        value = SecretStore.from_settings(get_settings()).decrypt(server.env_ciphertext)
+        return json.loads(value or "{}")
+    except Exception:
+        return {}
 
 
 def encrypt_mcp_env(value: dict[str, Any]) -> str | None:
     import json
 
-    if not value:
+    cleaned = {str(key): str(val) for key, val in (value or {}).items() if str(key).strip()}
+    if not cleaned:
         return None
     return SecretStore.from_settings(get_settings()).encrypt(
-        json.dumps(value, ensure_ascii=False)
+        json.dumps(cleaned, ensure_ascii=False)
     )
+
+
+def _mcp_row_fields(payload: McpBody) -> dict[str, Any]:
+    return {
+        "name": payload.name.strip(),
+        "transport": payload.transport,
+        "command": payload.command or None,
+        "args": list(payload.args or []),
+        "url": payload.url or None,
+        "enabled": payload.enabled,
+    }
 
 
 @router.get("/mcp/servers", dependencies=auth)
@@ -755,18 +777,28 @@ async def mcp_servers(request: Request, db: AsyncSession = Depends(get_db)) -> l
 async def create_mcp(payload: McpBody, request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     if payload.transport not in {"stdio", "sse", "streamable-http"}:
         raise HTTPException(status_code=422, detail="Unsupported MCP transport")
-    values = payload.model_dump(exclude={"env", "clear_env"})
-    server = McpServer(**values, env={}, env_ciphertext=encrypt_mcp_env(payload.env))
+    if not payload.name.strip():
+        raise HTTPException(status_code=422, detail="name is required")
+    if payload.transport != "stdio" and not (payload.url or "").strip():
+        raise HTTPException(status_code=422, detail="url is required for remote MCP")
+    if payload.transport == "stdio" and not (payload.command or "").strip():
+        raise HTTPException(status_code=422, detail="command is required for stdio MCP")
+    fields = _mcp_row_fields(payload)
+    server = McpServer(**fields, env={}, env_ciphertext=encrypt_mcp_env(payload.env))
     db.add(server)
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=f"Unable to save MCP server: {exc}") from exc
     await db.refresh(server)
     result = mcp_json(server)
     result["connection_status"] = "disconnected"
     if server.enabled:
         try:
             await request.app.state.mcp.hot_reload(server.name, {
-                **values,
-                "env": payload.env,
+                **fields,
+                "env": decrypt_mcp_env(server),
             })
             result["connection_status"] = "connected"
         except Exception as exc:
@@ -781,11 +813,21 @@ async def update_mcp(server_id: str, request: Request, db: AsyncSession = Depend
     server = await one(db, McpServer, server_id)
     old_name = server.name
     raw = await request.json()
-    current = {**mcp_json(server), "env": {}}
+    current = {
+        "name": server.name,
+        "transport": server.transport,
+        "command": server.command,
+        "args": server.args or [],
+        "url": server.url,
+        "enabled": server.enabled,
+        "env": {},
+        "clear_env": False,
+    }
     payload = McpBody.model_validate({**current, **raw})
     if payload.transport not in {"stdio", "sse", "streamable-http"}:
         raise HTTPException(status_code=422, detail="Unsupported MCP transport")
-    for key, value in payload.model_dump(exclude={"env", "clear_env"}).items():
+    fields = _mcp_row_fields(payload)
+    for key, value in fields.items():
         setattr(server, key, value)
     if payload.clear_env:
         server.env_ciphertext = None
@@ -793,7 +835,11 @@ async def update_mcp(server_id: str, request: Request, db: AsyncSession = Depend
     elif "env" in raw and payload.env:
         server.env_ciphertext = encrypt_mcp_env(payload.env)
         server.env = {}
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=f"Unable to update MCP server: {exc}") from exc
     await db.refresh(server)
     await request.app.state.mcp.disconnect(old_name)
     result = mcp_json(server)
@@ -801,7 +847,7 @@ async def update_mcp(server_id: str, request: Request, db: AsyncSession = Depend
     if server.enabled:
         try:
             await request.app.state.mcp.hot_reload(server.name, {
-                **payload.model_dump(exclude={"env", "clear_env"}),
+                **fields,
                 "env": decrypt_mcp_env(server),
             })
             result["connection_status"] = "connected"

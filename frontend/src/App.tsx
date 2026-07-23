@@ -607,7 +607,19 @@ function McpScreen() {
     {loaded.error && <Alert message={loaded.error}/>}<SectionHead title={`${data.length} серверов инструментов`} text="Подключения Model Context Protocol" action={<button className="primary" onClick={() => setEditing(emptyMcp)}><Plus size={17}/>Добавить сервер</button>}/>
     {data.length === 0 ? <Empty icon={ServerCog} title="Нет MCP-серверов" text="Подключите удалённый SSE/HTTP-сервер или локальный stdio-процесс."/> :
     <div className="list-panel">{data.map(server => <div className="server-row" key={server.id}><span className="entity-avatar"><ServerCog/></span><div className="grow"><strong>{server.name}</strong><small>{server.transport === 'stdio' ? server.command : server.url}</small></div><span className="chip">{server.transport}</span><StatusDot status={server.status || (server.enabled ? 'online' : 'paused')}/><button className="secondary compact" onClick={() => setEditing(server)}>Изменить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(server)}><Trash2 size={17}/></button></div>)}</div>}
-    {editing && <McpForm value={editing} onClose={() => setEditing(null)} onSave={async v => { const saved = v.id ? await api.mcp.update(v.id, v) : await api.mcp.create(v as Omit<McpServer, 'id'>); loaded.setData(v.id ? data.map(s => s.id === saved.id ? saved : s) : [...data, saved]); setEditing(null) }}/>}
+    {editing && <McpForm value={editing} onClose={() => setEditing(null)} onSave={async v => {
+      const payload = {
+        name: v.name || '',
+        transport: v.transport || 'sse',
+        command: v.command || '',
+        args: v.args || [],
+        url: v.url || '',
+        enabled: v.enabled ?? true,
+        ...(v.env && Object.keys(v.env).length ? { env: v.env } : {}),
+      }
+      const saved = v.id ? await api.mcp.update(v.id, payload) : await api.mcp.create(payload as Omit<McpServer, 'id'>)
+      loaded.setData(v.id ? data.map(s => s.id === saved.id ? saved : s) : [...data, saved]); setEditing(null)
+    }}/>}
     {deleting && <ConfirmDelete name={deleting.name} onClose={() => setDeleting(null)} onDelete={async () => { await api.mcp.remove(deleting.id); loaded.setData(data.filter(s => s.id !== deleting.id)) }}/>}
   </>
 }

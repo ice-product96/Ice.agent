@@ -99,7 +99,7 @@ class McpServer(TimestampMixin, Base):
     __tablename__ = "mcp_servers"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120), unique=True)
-    transport: Mapped[str] = mapped_column(String(16), default="stdio")
+    transport: Mapped[str] = mapped_column(String(32), default="stdio")
     command: Mapped[str | None] = mapped_column(String(512))
     args: Mapped[list[str]] = mapped_column(JSON, default=list)
     url: Mapped[str | None] = mapped_column(String(1024))
@@ -252,5 +252,12 @@ async def create_schema() -> None:
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS mtproto_host VARCHAR(255)",
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS mtproto_port INTEGER",
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS mtproto_dc_id INTEGER",
+            "ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS env_ciphertext TEXT",
+            "ALTER TABLE mcp_servers ALTER COLUMN transport TYPE VARCHAR(32)",
         ):
-            await connection.execute(text(statement))
+            try:
+                async with connection.begin_nested():
+                    await connection.execute(text(statement))
+            except Exception:
+                # SQLite / already-migrated dialects may reject some ALTERs
+                pass
