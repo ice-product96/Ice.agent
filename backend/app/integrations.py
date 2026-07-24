@@ -147,8 +147,8 @@ class MemoryStore:
                         raise RuntimeError(
                             "Local memory requires an enabled LLM profile for fact extraction and embeddings"
                         )
-                    if not settings.qdrant_url:
-                        raise RuntimeError("Qdrant URL is required for local Mem0 memory")
+                    qdrant_url = (settings.qdrant_url or "").strip() or "http://qdrant:6333"
+                    settings.qdrant_url = qdrant_url
                     config = self._local_mem0_config(settings, llm)
                     self._client = Memory.from_config(config)
             except Exception as exc:

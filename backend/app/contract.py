@@ -1153,10 +1153,18 @@ async def update_runtime_configuration(
         LlmProfile, payload.memory_llm_profile_id
     ) is None:
         raise HTTPException(status_code=422, detail="Memory LLM profile not found")
+    if (
+        payload.memory_enabled
+        and payload.memory_backend == "local"
+        and not (payload.qdrant_url or "").strip()
+    ):
+        payload.qdrant_url = "http://qdrant:6333"
     for key, value in payload.model_dump(
         exclude={"mem0_api_key", "clear_mem0_api_key"}
     ).items():
         setattr(settings, key, value)
+    if isinstance(settings.qdrant_url, str):
+        settings.qdrant_url = settings.qdrant_url.strip() or None
     secrets = SecretStore.from_settings(get_settings())
     if payload.clear_mem0_api_key:
         settings.mem0_api_key_ciphertext = None
