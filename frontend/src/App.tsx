@@ -289,9 +289,13 @@ function AgentForm({ value, agents, profiles, telegram, onClose, onSave }: { val
   const [error, setError] = useState('')
   const toolOptions = ['web_search', 'memory', 'code_execution', 'telegram', 'filesystem', 'mcp']
   const permissionOptions = [
+    ['telegram_send_message', 'Отправлять сообщения в Telegram'],
+    ['telegram_send_file', 'Отправлять файлы в Telegram'],
+    ['telegram_edit_message', 'Редактировать сообщения Telegram'],
     ['telegram_delete_dialog', 'Удалять диалоги Telegram'],
     ['telegram_delete_messages', 'Удалять сообщения Telegram'],
     ['telegram_leave_channel', 'Покидать каналы и группы'],
+    ['telegram_join_channel', 'Вступать в каналы и группы'],
     ['schedule_self', 'Создавать отложенные задачи'],
   ] as const
   const linkTarget = (link: Agent['links'][number]) =>
