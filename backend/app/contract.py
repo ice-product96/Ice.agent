@@ -227,6 +227,15 @@ async def dashboard(
                 if request.app.state.memory.last_error
                 else None
             ),
+            "detail": (
+                request.app.state.memory.last_error
+                if request.app.state.memory.last_error
+                else (
+                    "Отключена"
+                    if not runtime_settings or not runtime_settings.memory_enabled
+                    else "Mem0 + Qdrant"
+                )
+            ),
         },
         "telegram": {
             "status": (
@@ -735,6 +744,19 @@ async def memory_search(
     return normalized
 
 
+@router.post("/memory/migrate", dependencies=auth)
+async def memory_migrate(request: Request) -> dict[str, Any]:
+    memory = request.app.state.memory
+    if memory.last_error or memory._client is None:
+        raise HTTPException(
+            status_code=409,
+            detail=memory.last_error or "Memory backend is not connected",
+        )
+    pending = memory.fallback_count()
+    result = await memory.migrate_fallback()
+    return {"ok": True, "pending_before": pending, **result}
+
+
 @router.delete("/memory/{memory_id}", dependencies=auth, status_code=204)
 async def memory_delete(memory_id: str, request: Request) -> Response:
     await request.app.state.memory.delete(memory_id)
@@ -1065,7 +1087,7 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
     return settings
 
 
-def runtime_json(settings: RuntimeSettings) -> dict[str, Any]:
+def runtime_json(settings: RuntimeSettings, *, memory_error: str | None = None) -> dict[str, Any]:
     return {
         "search_provider": settings.search_provider,
         "searxng_url": settings.searxng_url,
@@ -1073,6 +1095,8 @@ def runtime_json(settings: RuntimeSettings) -> dict[str, Any]:
         "memory_backend": settings.memory_backend,
         "has_mem0_api_key": bool(settings.mem0_api_key_ciphertext),
         "mem0_api_key_masked": masked_secret(settings.mem0_api_key_ciphertext),
+        "memory_status": "error" if memory_error else ("enabled" if settings.memory_enabled else "disabled"),
+        "memory_error": memory_error,
         "qdrant_url": settings.qdrant_url,
         "memory_llm_profile_id": settings.memory_llm_profile_id,
         "typing_min_seconds": settings.typing_min_seconds,
@@ -1094,9 +1118,13 @@ def runtime_json(settings: RuntimeSettings) -> dict[str, Any]:
 
 @router.get("/settings/runtime", dependencies=auth)
 async def read_runtime_settings(
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    return runtime_json(await get_runtime_settings(db))
+    return runtime_json(
+        await get_runtime_settings(db),
+        memory_error=request.app.state.memory.last_error,
+    )
 
 
 @router.put("/settings/runtime", dependencies=auth)
@@ -1106,7 +1134,10 @@ async def update_runtime_configuration(
 ) -> dict[str, Any]:
     settings = await get_runtime_settings(db)
     payload = RuntimeSettingsBody.model_validate(
-        {**runtime_json(settings), **await request.json()}
+        {
+            **runtime_json(settings, memory_error=request.app.state.memory.last_error),
+            **await request.json(),
+        }
     )
     if payload.typing_min_seconds > payload.typing_max_seconds:
         raise HTTPException(
@@ -1152,7 +1183,7 @@ async def update_runtime_configuration(
         await request.app.state.task_bus.stop()
         if settings.task_workers:
             await request.app.state.task_bus.start(settings.task_workers)
-    return runtime_json(settings)
+    return runtime_json(settings, memory_error=request.app.state.memory.last_error)
 
 
 def conversation_json(state: ConversationState) -> dict[str, Any]:

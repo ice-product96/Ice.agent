@@ -81,6 +81,49 @@ class MemoryStore:
         self._client: Any = None
         self.last_error: str | None = None
  
+    @staticmethod
+    def _qdrant_config(url: str | None, embedding_dims: int) -> dict[str, Any]:
+        vector: dict[str, Any] = {
+            "collection_name": "ice_agent_memory",
+            "embedding_model_dims": embedding_dims,
+        }
+        if not url:
+            return {"provider": "qdrant", "config": vector}
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url if "://" in url else f"http://{url}")
+        host = parsed.hostname or "qdrant"
+        port = parsed.port or (443 if parsed.scheme == "https" else 6333)
+        vector.update(host=host, port=port, url=f"{parsed.scheme or 'http'}://{host}:{port}")
+        return {"provider": "qdrant", "config": vector}
+
+    @staticmethod
+    def _openai_compatible(llm: dict[str, Any], *, model: str) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "api_key": llm["api_key"],
+            "model": model,
+        }
+        if llm.get("base_url"):
+            config["openai_base_url"] = llm["base_url"]
+        return {"provider": "openai", "config": config}
+
+    @classmethod
+    def _local_mem0_config(cls, settings: Any, llm: dict[str, Any] | None) -> dict[str, Any]:
+        base = str((llm or {}).get("base_url") or "").lower()
+        # DeepSeek chat models cannot embed; use their embedding model when possible.
+        if "deepseek" in base:
+            embed_model, dims = "deepseek-embedding", 1024
+        else:
+            embed_model, dims = "text-embedding-3-small", 1536
+        config: dict[str, Any] = {
+            "vector_store": cls._qdrant_config(settings.qdrant_url, dims),
+        }
+        if llm:
+            config["llm"] = cls._openai_compatible(llm, model=str(llm["model"]))
+            # Mem0 defaults to OpenAI embeddings; without this local mode stays degraded.
+            config["embedder"] = cls._openai_compatible(llm, model=embed_model)
+        return config
+
     async def reconfigure(
         self,
         settings: Any,
@@ -100,29 +143,48 @@ class MemoryStore:
                 else:
                     from mem0 import Memory
 
-                    config: dict[str, Any] = {}
-                    if settings.qdrant_url:
-                        config.update({
-                            "vector_store": {
-                                "provider": "qdrant",
-                                "config": {"url": settings.qdrant_url},
-                            }
-                        })
-                    if llm:
-                        config["llm"] = {
-                            "provider": "openai",
-                            "config": {
-                                "api_key": llm["api_key"],
-                                "model": llm["model"],
-                                "openai_base_url": llm.get("base_url"),
-                            },
-                        }
-                    self._client = (
-                        Memory.from_config(config) if config else Memory()
-                    )
+                    if not llm:
+                        raise RuntimeError(
+                            "Local memory requires an enabled LLM profile for fact extraction and embeddings"
+                        )
+                    if not settings.qdrant_url:
+                        raise RuntimeError("Qdrant URL is required for local Mem0 memory")
+                    config = self._local_mem0_config(settings, llm)
+                    self._client = Memory.from_config(config)
             except Exception as exc:
-                self.last_error = str(exc)
+                self.last_error = exception_text(exc)
                 self._client = None
+            else:
+                if self._client is not None and self._fallback:
+                    await self.migrate_fallback()
+
+    async def migrate_fallback(self) -> dict[str, int]:
+        """Move in-process fallback memories into the configured Mem0/Qdrant backend."""
+        if self._client is None:
+            raise RuntimeError("Memory backend is not connected")
+        migrated = 0
+        failed = 0
+        for memory_id, item in list(self._fallback.items()):
+            text = str(item.get("memory") or item.get("text") or "").strip()
+            if not text:
+                self._fallback.pop(memory_id, None)
+                continue
+            metadata = dict(item.get("metadata") or {})
+            user_id = str(item.get("user_id") or metadata.get("user_id") or "global")
+            agent_id = item.get("agent_id") or metadata.get("agent_id")
+            scope = self._scope(user_id, str(agent_id) if agent_id is not None else None)
+            enriched = {**metadata, **scope, "migrated_from": "fallback", "legacy_id": memory_id}
+            try:
+                await asyncio.to_thread(self._client.add, text, metadata=enriched, **scope)
+                self._fallback.pop(memory_id, None)
+                self._history.pop(memory_id, None)
+                migrated += 1
+            except Exception:
+                failed += 1
+        return {"migrated": migrated, "failed": failed, "remaining": len(self._fallback)}
+
+    def fallback_count(self) -> int:
+        return len(self._fallback)
 
     @staticmethod
     def _items(result: Any) -> list[dict[str, Any]]:
@@ -173,6 +235,8 @@ class MemoryStore:
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         scope = self._scope(user_id, agent_id)
+        limit = max(1, min(int(limit or 10), 50))
+        items: list[dict[str, Any]] = []
         if self._client:
             result = await asyncio.to_thread(
                 self._client.search,
@@ -180,13 +244,14 @@ class MemoryStore:
                 filters={**scope, **(filters or {})},
                 limit=limit,
             )
-            return self._items(result)
+            items.extend(self._items(result))
         words = query.lower().split()
-        return [
+        items.extend(
             item for item in self._fallback.values()
             if self._matches(item, scope, filters)
             and (not words or any(word in item["memory"].lower() for word in words))
-        ][:limit]
+        )
+        return items[:limit]
 
     async def get(self, memory_id: str) -> dict[str, Any] | None:
         if self._client:
@@ -200,12 +265,16 @@ class MemoryStore:
         filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         scope = self._scope(user_id, agent_id)
+        items: list[dict[str, Any]] = []
         if self._client:
-            return self._items(await asyncio.to_thread(
+            items.extend(self._items(await asyncio.to_thread(
                 self._client.get_all,
                 filters={**scope, **(filters or {})},
-            ))
-        return [item for item in self._fallback.values() if self._matches(item, scope, filters)]
+            )))
+        items.extend(
+            item for item in self._fallback.values() if self._matches(item, scope, filters)
+        )
+        return items
 
     async def list(self, user_id: str, agent_id: str | None = None) -> list[dict[str, Any]]:
         return await self.get_all(user_id, agent_id)

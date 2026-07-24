@@ -222,8 +222,13 @@ function DashboardScreen({ go }: { go: (p: Page) => void }) {
       <SectionHead title="Готовность конфигурации" text="Проверки провайдеров и подключений от API" action={<button className="secondary compact" onClick={() => go('connections')}>Управление</button>}/>
       <div className="health-grid">{configuration.map((item, index) => {
         const ready = item.ready ?? ['ready', 'online', 'active', 'ok', 'connected', 'configured'].includes(String(item.status).toLowerCase())
+        const detail = item.detail || (
+          String(item.status).toLowerCase() === 'degraded' ? 'Ограниченный режим' :
+          String(item.status).toLowerCase() === 'disabled' ? 'Отключено' :
+          item.status || (ready ? 'Готов' : 'Требует настройки')
+        )
         return <div className={`health-item ${ready ? 'ready' : 'attention'}`} key={`${item.name}-${index}`}>
-          {ready ? <CheckCircle2 size={18}/> : <CircleAlert size={18}/>}<div><strong>{serviceDisplayName(String(item.name))}</strong><small>{item.detail || item.status || (ready ? 'Готов' : 'Требует настройки')}</small></div>
+          {ready ? <CheckCircle2 size={18}/> : <CircleAlert size={18}/>}<div><strong>{serviceDisplayName(String(item.name))}</strong><small>{detail}</small></div>
         </div>
       })}</div>
     </section>}
@@ -599,8 +604,23 @@ function MemoryScreen() {
   const loaded = useLoad(() => api.memory.list(query), [query])
   const items = Array.isArray(loaded.data) ? loaded.data : loaded.data?.items || []
   const [deleting, setDeleting] = useState<MemoryItem | null>(null)
+  const [migrateMsg, setMigrateMsg] = useState('')
+  const [migrating, setMigrating] = useState(false)
+  async function migrate() {
+    setMigrating(true); setMigrateMsg('')
+    try {
+      const result = await api.memory.migrate()
+      setMigrateMsg(`Перенесено: ${result.migrated}, ошибок: ${result.failed}, осталось в RAM: ${result.remaining}`)
+      await loaded.refresh()
+    } catch (err) {
+      setMigrateMsg(err instanceof Error ? err.message : 'Не удалось перенести память')
+    } finally {
+      setMigrating(false)
+    }
+  }
   return <>
-    <SectionHead title="Сохранённый контекст" text="Поиск семантической и структурированной памяти агентов"/>
+    <SectionHead title="Сохранённый контекст" text="Поиск семантической и структурированной памяти агентов" action={<button className="secondary" disabled={migrating} onClick={() => void migrate()}>{migrating ? <LoaderCircle className="spin" size={16}/> : null}Перенести RAM → Qdrant</button>}/>
+    {migrateMsg && <Alert message={migrateMsg}/>}
     <form className="filter-bar" onSubmit={e => { e.preventDefault(); setQuery(search) }}><div className="search-box"><Search size={17}/><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Поиск по содержимому, ключам или области…"/></div><button className="secondary">Поиск</button></form>
     {loaded.error && <Alert message={loaded.error}/>}
     {loaded.loading ? <Loading/> : items.length === 0 ? <Empty icon={BrainCircuit} title="Подходящих записей нет" text="Записи памяти агентов появятся по мере создания."/> :
@@ -762,11 +782,12 @@ function RuntimeScreen() {
     <section className="panel"><SectionHead title="Бэкенд памяти" text="Долговременная семантическая память и хранилище эмбеддингов"/>
       <div className="form-grid">
         <Field label="Бэкенд памяти"><select value={form.memory_backend} onChange={e => patch({ memory_backend: e.target.value })}><option value="local">Local Mem0 + Qdrant</option><option value="platform">Mem0 Platform</option></select></Field>
-        <Field label="Профиль LLM для памяти"><select value={form.memory_llm_profile_id || ''} onChange={e => patch({ memory_llm_profile_id: e.target.value || null })}><option value="">Без отдельного профиля</option>{profiles.data?.map(p => <option key={p.id} value={p.id}>{p.name} · {p.default_model}</option>)}</select></Field>
-        <Field label="API-ключ Mem0" hint={form.has_mem0_api_key ? 'Настроен · ••••••••. Оставьте пустым для сохранения.' : 'Не настроен. Секрет только для записи.'}><input autoComplete="new-password" type="password" value={form.mem0_api_key || ''} onChange={e => patch({ mem0_api_key: e.target.value })} placeholder={form.has_mem0_api_key ? 'Оставьте пустым для сохранения' : 'Введите API-ключ'}/></Field>
-        <Field label="URL Qdrant"><input type="url" value={form.qdrant_url || ''} onChange={e => patch({ qdrant_url: e.target.value || null })} placeholder="http://qdrant:6333"/></Field>
+        <Field label="Профиль LLM для памяти" hint="Нужен и для извлечения фактов, и для эмбеддингов (OpenAI-compatible)"><select value={form.memory_llm_profile_id || ''} onChange={e => patch({ memory_llm_profile_id: e.target.value || null })}><option value="">Без отдельного профиля</option>{profiles.data?.map(p => <option key={p.id} value={p.id}>{p.name} · {p.default_model}</option>)}</select></Field>
+        <Field label="API-ключ Mem0" hint={form.memory_backend === 'local' ? 'Для Local Mem0 + Qdrant не нужен — только для Mem0 Platform.' : (form.has_mem0_api_key ? 'Настроен · ••••••••. Оставьте пустым для сохранения.' : 'Не настроен. Секрет только для записи.')}><input autoComplete="new-password" type="password" value={form.mem0_api_key || ''} onChange={e => patch({ mem0_api_key: e.target.value })} placeholder={form.memory_backend === 'local' ? 'Не требуется для локального режима' : (form.has_mem0_api_key ? 'Оставьте пустым для сохранения' : 'Введите API-ключ')} disabled={form.memory_backend === 'local'}/></Field>
+        <Field label="URL Qdrant" hint="В Docker Compose: http://qdrant:6333"><input type="url" value={form.qdrant_url || ''} onChange={e => patch({ qdrant_url: e.target.value || null })} placeholder="http://qdrant:6333"/></Field>
         <div className="toggle-box wide"><Toggle label="Память включена" checked={form.memory_enabled} onChange={v => patch({ memory_enabled: v })}/></div>
       </div>
+      {form.memory_error && <Alert message={`Память degraded: ${form.memory_error}`}/>}
     </section>
     <section className="panel"><SectionHead title="Имитация человеческого общения" text="Присутствие «набирает» и темп исходящих сообщений"/>
       <div className="form-grid"><Field label="Мин. набор (сек)"><input min="0" step=".1" type="number" value={form.typing_min_seconds} onChange={e => number('typing_min_seconds', e.target.value)}/></Field><Field label="Макс. набор (сек)"><input min="0" step=".1" type="number" value={form.typing_max_seconds} onChange={e => number('typing_max_seconds', e.target.value)}/></Field><Field label="Джиттер набора (сек)"><input min="0" step=".1" type="number" value={form.typing_jitter_seconds} onChange={e => number('typing_jitter_seconds', e.target.value)}/></Field><Field label="Размер фрагмента сообщения"><input min="256" max="4096" type="number" value={form.typing_chunk_size} onChange={e => number('typing_chunk_size', e.target.value)}/></Field><div className="toggle-box wide"><Toggle label="Отправлять статус «онлайн» и «набирает»" checked={form.typing_presence} onChange={v => patch({ typing_presence: v })}/></div></div>

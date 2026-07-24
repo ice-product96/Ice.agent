@@ -105,6 +105,7 @@ export const api = {
   memory: {
     list: (search?: string, agentId?: string) =>
       request<Paginated<MemoryItem> | MemoryItem[]>(`/memory${qs({ search, agent_id: agentId })}`),
+    migrate: () => request<{ ok: boolean; migrated: number; failed: number; remaining: number; pending_before: number }>('/memory/migrate', { method: 'POST' }),
     remove: (id: string) => request<void>(`/memory/${id}`, { method: 'DELETE' }),
   },
   conversations: {

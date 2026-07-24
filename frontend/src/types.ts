@@ -145,6 +145,8 @@ export interface RuntimeSettings {
   memory_backend: string
   mem0_api_key?: string
   has_mem0_api_key: boolean
+  memory_status?: string
+  memory_error?: string | null
   qdrant_url: string | null
   memory_llm_profile_id?: ID | null
   typing_min_seconds: number
