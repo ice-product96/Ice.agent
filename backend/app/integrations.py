@@ -87,14 +87,14 @@ class MemoryStore:
             "collection_name": "ice_agent_memory",
             "embedding_model_dims": embedding_dims,
         }
-        if not url:
-            return {"provider": "qdrant", "config": vector}
+        raw = (url or "").strip() or "http://qdrant:6333"
         from urllib.parse import urlparse
 
-        parsed = urlparse(url if "://" in url else f"http://{url}")
+        parsed = urlparse(raw if "://" in raw else f"http://{raw}")
         host = parsed.hostname or "qdrant"
         port = parsed.port or (443 if parsed.scheme == "https" else 6333)
-        vector.update(host=host, port=port, url=f"{parsed.scheme or 'http'}://{host}:{port}")
+        # Mem0/Qdrant client accepts only one of: url, host, path, location.
+        vector.update(host=host, port=port)
         return {"provider": "qdrant", "config": vector}
 
     @staticmethod
