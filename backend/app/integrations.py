@@ -256,19 +256,76 @@ class WebSearch:
         self.provider = provider
         self.searxng_url = searxng_url
 
+    @staticmethod
+    def _normalize(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for item in items[: max(1, min(int(limit or 5), 20))]:
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or item.get("href") or item.get("link") or "").strip()
+            content = str(
+                item.get("content")
+                or item.get("body")
+                or item.get("snippet")
+                or item.get("description")
+                or ""
+            ).strip()
+            if not (title or url or content):
+                continue
+            normalized.append({"title": title, "url": url, "content": content})
+        return normalized
+
     async def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Search the public web and return title/url/content hits."""
+        query = str(query or "").strip()
+        if not query:
+            raise ValueError("Search query must not be empty")
         if self.provider == "searxng":
             if not self.searxng_url:
                 raise RuntimeError("SearXNG URL is not configured")
-            async with httpx.AsyncClient(timeout=20) as client:
-                response = await client.get(f"{self.searxng_url.rstrip('/')}/search", params={"q": query, "format": "json"})
-                response.raise_for_status()
-                return response.json().get("results", [])[:limit]
+            url = f"{self.searxng_url.rstrip('/')}/search"
+            try:
+                async with httpx.AsyncClient(
+                    timeout=30.0,
+                    follow_redirects=True,
+                    headers={"Accept": "application/json"},
+                ) as client:
+                    response = await client.get(
+                        url,
+                        params={"q": query, "format": "json", "language": "ru-RU"},
+                    )
+                    response.raise_for_status()
+                    try:
+                        payload = response.json()
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            "SearXNG returned non-JSON. Enable the JSON format in SearXNG settings."
+                        ) from exc
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"SearXNG request failed: {exc}") from exc
+            results = payload.get("results") if isinstance(payload, dict) else None
+            if not isinstance(results, list):
+                raise RuntimeError("SearXNG response has no results list")
+            return self._normalize(results, limit)
         try:
             from duckduckgo_search import DDGS
-            return await asyncio.to_thread(lambda: list(DDGS().text(query, max_results=limit)))
-        except Exception:
-            return []
+
+            rows = await asyncio.to_thread(
+                lambda: list(DDGS().text(query, max_results=max(1, min(int(limit or 5), 20))))
+            )
+            return self._normalize(
+                [
+                    {
+                        "title": row.get("title"),
+                        "url": row.get("href"),
+                        "content": row.get("body"),
+                    }
+                    for row in rows
+                    if isinstance(row, dict)
+                ],
+                limit,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"DuckDuckGo search failed: {exc}") from exc
 
 
 def exception_text(exc: BaseException) -> str:

@@ -1268,15 +1268,39 @@ async def clear_conversation(
 
 @router.post("/settings/runtime/test-search", dependencies=auth)
 async def test_search(request: Request) -> dict[str, Any]:
+    search = request.app.state.search
     try:
-        results = await request.app.state.search.search("ice agent connectivity test", 1)
+        results = await search.search("частная школа Екатеринбург", 3)
     except Exception as exc:
-        return {"ok": False, "status": "error", "detail": str(exc)}
+        return {
+            "ok": False,
+            "status": "error",
+            "detail": str(exc),
+            "provider": search.provider,
+            "searxng_url": search.searxng_url,
+        }
+    sample = results[0]["title"] if results else None
+    if not results:
+        return {
+            "ok": False,
+            "status": "empty",
+            "detail": (
+                "Провайдер ответил, но вернул 0 результатов. "
+                "Проверьте, что у SearXNG включён JSON format и поисковые движки."
+            ),
+            "provider": search.provider,
+            "searxng_url": search.searxng_url,
+            "result_count": 0,
+        }
     return {
         "ok": True,
         "status": "connected",
-        "detail": "Search provider responded",
+        "detail": f"Поиск работает · {len(results)} результат(ов)"
+        + (f" · пример: {sample}" if sample else ""),
+        "provider": search.provider,
+        "searxng_url": search.searxng_url,
         "result_count": len(results),
+        "sample": sample,
     }
 
 

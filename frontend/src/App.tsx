@@ -746,7 +746,7 @@ function RuntimeScreen() {
   return <form className="settings-layout runtime-layout" onSubmit={save}>
     {(loaded.error || profiles.error || error) && <Alert message={loaded.error || profiles.error || error}/>}
     <section className="panel"><SectionHead title="Веб-поиск" text="Сервис поиска для агентов с инструментами" action={<button type="button" className="secondary compact" onClick={() => void testSearch()}><Wifi size={14}/>Тест поиска</button>}/>
-      <div className="form-grid"><Field label="Провайдер поиска"><select required value={form.search_provider} onChange={e => patch({ search_provider: e.target.value })}><option value="ddg">DuckDuckGo</option><option value="searxng">SearXNG</option></select></Field><Field label="URL SearXNG"><input type="url" value={form.searxng_url || ''} onChange={e => patch({ searxng_url: e.target.value || null })} placeholder="https://search.example.com"/></Field></div>
+      <div className="form-grid"><Field label="Провайдер поиска"><select required value={form.search_provider} onChange={e => patch({ search_provider: e.target.value })}><option value="ddg">DuckDuckGo</option><option value="searxng">SearXNG</option></select></Field><Field label="URL SearXNG" hint="Из Docker API: http://172.17.0.1:8080 (не localhost)"><input type="url" value={form.searxng_url || ''} onChange={e => patch({ searxng_url: e.target.value || null })} placeholder="http://172.17.0.1:8080"/></Field></div>
       {searchResult && <div className="inline-result standalone">{searchResult}</div>}
     </section>
     <section className="panel"><SectionHead title="Контекст диалога" text="Управляет недавним транскриптом Telegram и контекстом для агентов"/>
