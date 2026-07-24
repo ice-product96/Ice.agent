@@ -718,14 +718,46 @@ async def memory_search(
     request: Request,
     search: str = "",
     agent_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    items = (
-        await request.app.state.memory.search(search, agent_id=agent_id)
-        if search
-        else await request.app.state.memory.get_all(agent_id=agent_id)
+    memory = request.app.state.memory
+    agent_ids = (
+        [agent_id]
+        if agent_id
+        else [
+            str(value)
+            for value in (
+                await db.scalars(select(Agent.id).order_by(Agent.id))
+            ).all()
+        ]
     )
-    normalized = []
+    items: list[dict[str, Any]] = []
+    try:
+        for current_agent_id in agent_ids:
+            scoped = (
+                await memory.search(search, agent_id=current_agent_id)
+                if search
+                else await memory.get_all(agent_id=current_agent_id)
+            )
+            items.extend(scoped)
+        # Fallback may contain old global entries which have no agent scope.
+        items.extend(memory.fallback_items(agent_id=agent_id, query=search))
+    except Exception as exc:
+        detail = exception_text(exc)
+        memory.last_error = detail
+        raise HTTPException(
+            status_code=502,
+            detail=f"Memory backend request failed: {detail}",
+        ) from exc
+    unique_items: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for item in items:
+        identity = str(item.get("id") or id(item))
+        if identity not in seen:
+            seen.add(identity)
+            unique_items.append(item)
+    normalized = []
+    for item in unique_items:
         metadata = item.get("metadata") or {}
         normalized.append({
             "id": str(item.get("id", "")),

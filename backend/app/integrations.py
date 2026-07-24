@@ -186,6 +186,23 @@ class MemoryStore:
     def fallback_count(self) -> int:
         return len(self._fallback)
 
+    def fallback_items(
+        self,
+        agent_id: str | None = None,
+        query: str = "",
+    ) -> list[dict[str, Any]]:
+        scope = self._scope(None, agent_id)
+        words = query.lower().split()
+        return [
+            item
+            for item in self._fallback.values()
+            if self._matches(item, scope)
+            and (
+                not words
+                or any(word in str(item.get("memory", "")).lower() for word in words)
+            )
+        ]
+
     @staticmethod
     def _items(result: Any) -> list[dict[str, Any]]:
         if isinstance(result, dict) and "results" in result:
