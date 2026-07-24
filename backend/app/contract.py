@@ -1,6 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete, func, or_, select
@@ -110,6 +112,7 @@ class CronBody(BaseModel):
     name: str
     agent_id: int | str
     schedule: str
+    run_once_at: str | None = None
     prompt: str = ""
     timezone: str = "UTC"
     enabled: bool = True
@@ -902,12 +905,57 @@ def cron_json(job: CronJob) -> dict[str, Any]:
         "name": job.name,
         "agent_id": job.agent_id,
         "schedule": job.cron,
+        "run_once_at": payload.get("run_once_at"),
         "prompt": payload.get("prompt", payload.get("message", "")),
         "timezone": payload.get("timezone", "UTC"),
         "enabled": job.enabled,
         "last_run_at": iso(job.last_run_at),
         "created_at": iso(job.created_at),
         "updated_at": iso(job.updated_at),
+    }
+
+
+def cron_values(payload: CronBody) -> tuple[str, dict[str, Any]]:
+    try:
+        zone = ZoneInfo(payload.timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise HTTPException(status_code=422, detail="Unknown IANA timezone") from exc
+    run_once_at = (payload.run_once_at or "").strip()
+    if run_once_at:
+        try:
+            run_at = datetime.fromisoformat(run_once_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="run_once_at must be a valid date and time",
+            ) from exc
+        if run_at.tzinfo is None:
+            run_at = run_at.replace(tzinfo=zone)
+        run_at = run_at.astimezone(timezone.utc)
+        if payload.enabled and run_at <= datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=422,
+                detail="One-time launch must be in the future",
+            )
+        schedule = "@once"
+        normalized_run_at: str | None = run_at.isoformat()
+    else:
+        schedule = payload.schedule.strip()
+        if schedule == "@once":
+            raise HTTPException(
+                status_code=422,
+                detail="Specify the date and time for a one-time launch",
+            )
+        try:
+            CronTrigger.from_crontab(schedule, timezone=zone)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid cron expression: {exc}") from exc
+        normalized_run_at = None
+    return schedule, {
+        "prompt": payload.prompt,
+        "message": payload.prompt,
+        "timezone": payload.timezone,
+        **({"run_once_at": normalized_run_at} if normalized_run_at else {}),
     }
 
 
@@ -918,11 +966,12 @@ async def cron_jobs(db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
 
 @router.post("/cron", dependencies=auth, status_code=201)
 async def create_cron(payload: CronBody, request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    schedule, job_payload = cron_values(payload)
     job = CronJob(
         name=payload.name,
         agent_id=as_int(payload.agent_id, "agent_id"),
-        cron=payload.schedule,
-        payload={"prompt": payload.prompt, "message": payload.prompt, "timezone": payload.timezone},
+        cron=schedule,
+        payload=job_payload,
         enabled=payload.enabled,
     )
     db.add(job)
@@ -938,10 +987,11 @@ async def create_cron(payload: CronBody, request: Request, db: AsyncSession = De
 async def update_cron(job_id: str, request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     job = await one(db, CronJob, job_id)
     payload = CronBody.model_validate({**cron_json(job), **await request.json()})
+    schedule, job_payload = cron_values(payload)
     job.name = payload.name
     job.agent_id = as_int(payload.agent_id, "agent_id")
-    job.cron = payload.schedule
-    job.payload = {"prompt": payload.prompt, "message": payload.prompt, "timezone": payload.timezone}
+    job.cron = schedule
+    job.payload = job_payload
     job.enabled = payload.enabled
     await db.commit()
     await db.refresh(job)

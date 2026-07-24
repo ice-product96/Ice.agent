@@ -667,6 +667,26 @@ function McpForm({ value, onClose, onSave }: { value: Partial<McpServer>; onClos
 }
 
 const emptyCron: Omit<CronJob, 'id'> = { name: '', agent_id: '', schedule: '0 9 * * *', prompt: '', timezone: 'UTC', enabled: true }
+function cronDateTimeLocal(value?: string, timezone = 'UTC') {
+  if (!value) return ''
+  if (!/[zZ]|[+-]\d{2}:\d{2}$/.test(value)) return value.slice(0, 16)
+  try {
+    return new Intl.DateTimeFormat('sv-SE', {
+      timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }).format(new Date(value)).replace(' ', 'T')
+  } catch {
+    return value.slice(0, 16)
+  }
+}
+function cronScheduleLabel(job: CronJob) {
+  if (!job.run_once_at) return `${job.schedule} · ${job.timezone}`
+  try {
+    return `Однократно: ${new Date(job.run_once_at).toLocaleString('ru-RU', { timeZone: job.timezone })} · ${job.timezone}`
+  } catch {
+    return `Однократно: ${job.run_once_at} · ${job.timezone}`
+  }
+}
 function CronScreen() {
   const jobs = useLoad(api.cron.list, []); const agents = useLoad(api.agents.list, []); const data = jobs.data || []
   const [editing, setEditing] = useState<Partial<CronJob> | null>(null); const [deleting, setDeleting] = useState<CronJob | null>(null)
@@ -674,16 +694,19 @@ function CronScreen() {
   return <>
     {(jobs.error || agents.error) && <Alert message={jobs.error || agents.error}/>}<SectionHead title={`${data.length} расписаний`} text="Автономные задачи по cron" action={<button className="primary" onClick={() => setEditing({ ...emptyCron, agent_id: agents.data?.[0]?.id || '' })}><Plus size={17}/>Новое расписание</button>}/>
     {data.length === 0 ? <Empty icon={CalendarClock} title="Нет запланированных задач" text="Запланируйте повторяющиеся промпты для любого настроенного агента."/> :
-    <div className="list-panel">{data.map(job => <div className="server-row" key={job.id}><span className="entity-avatar amber"><CalendarClock/></span><div className="grow"><strong>{job.name}</strong><small>{job.schedule} · {job.timezone}</small></div><span className="chip">{agents.data?.find(a => a.id === job.agent_id)?.name || job.agent_id}</span><StatusDot status={job.enabled ? (job.status || 'active') : 'paused'}/><button className="secondary compact" onClick={() => setEditing(job)}>Изменить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(job)}><Trash2 size={17}/></button></div>)}</div>}
+    <div className="list-panel">{data.map(job => <div className="server-row" key={job.id}><span className="entity-avatar amber"><CalendarClock/></span><div className="grow"><strong>{job.name}</strong><small>{cronScheduleLabel(job)}</small></div><span className="chip">{agents.data?.find(a => a.id === job.agent_id)?.name || job.agent_id}</span><StatusDot status={job.enabled ? (job.status || 'active') : 'paused'}/><button className="secondary compact" onClick={() => setEditing(job)}>Изменить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(job)}><Trash2 size={17}/></button></div>)}</div>}
     {editing && <CronForm value={editing} agents={agents.data || []} onClose={() => setEditing(null)} onSave={async v => { const saved = v.id ? await api.cron.update(v.id, v) : await api.cron.create(v as Omit<CronJob, 'id'>); jobs.setData(v.id ? data.map(j => j.id === saved.id ? saved : j) : [...data, saved]); setEditing(null) }}/>}
     {deleting && <ConfirmDelete name={deleting.name} onClose={() => setDeleting(null)} onDelete={async () => { await api.cron.remove(deleting.id); jobs.setData(data.filter(j => j.id !== deleting.id)) }}/>}
   </>
 }
 function CronForm({ value, agents, onClose, onSave }: { value: Partial<CronJob>; agents: Agent[]; onClose: () => void; onSave: (v: Partial<CronJob>) => Promise<void> }) {
-  const [form, setForm] = useState(value); const [error, setError] = useState(''); const [busy, setBusy] = useState(false)
+  const [form, setForm] = useState<Partial<CronJob>>(() => ({
+    ...value,
+    run_once_at: cronDateTimeLocal(value.run_once_at, value.timezone),
+  })); const [error, setError] = useState(''); const [busy, setBusy] = useState(false)
   const patch = (p: Partial<CronJob>) => setForm(f => ({ ...f, ...p }))
   return <Modal title={form.id ? 'Изменение расписания' : 'Новое расписание'} onClose={onClose}><form onSubmit={async e => { e.preventDefault(); setBusy(true); try { await onSave(form) } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить'); setBusy(false) } }}>
-    {error && <Alert message={error}/>}<div className="form-grid"><Field label="Имя"><input required value={form.name || ''} onChange={e => patch({ name: e.target.value })} placeholder="Ежедневная сводка"/></Field><Field label="Агент"><select required value={form.agent_id} onChange={e => patch({ agent_id: e.target.value })}><option value="">Выберите агента</option>{agents.map(a => <option value={a.id} key={a.id}>{a.name}</option>)}</select></Field><Field label="Cron-выражение" hint="минута час день месяц день_недели"><input required value={form.schedule || ''} onChange={e => patch({ schedule: e.target.value })} placeholder="0 9 * * *"/></Field><Field label="Часовой пояс"><input required value={form.timezone || 'UTC'} onChange={e => patch({ timezone: e.target.value })} placeholder="Europe/London"/></Field><Field label="Промпт" wide><textarea required rows={6} value={form.prompt || ''} onChange={e => patch({ prompt: e.target.value })} placeholder="Сформируйте и отправьте ежедневную сводку…"/></Field><div className="toggle-box wide"><Toggle label="Расписание включено" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div></div>
+    {error && <Alert message={error}/>}<div className="form-grid"><Field label="Имя"><input required value={form.name || ''} onChange={e => patch({ name: e.target.value })} placeholder="Ежедневная сводка"/></Field><Field label="Агент"><select required value={form.agent_id} onChange={e => patch({ agent_id: e.target.value })}><option value="">Выберите агента</option>{agents.map(a => <option value={a.id} key={a.id}>{a.name}</option>)}</select></Field><Field label="Cron-выражение" hint={form.run_once_at ? 'Не используется для одноразового запуска' : 'минута час день месяц день_недели'}><input required={!form.run_once_at} disabled={Boolean(form.run_once_at)} value={form.run_once_at ? '@once' : form.schedule || ''} onChange={e => patch({ schedule: e.target.value })} placeholder="0 9 * * *"/></Field><Field label="Дата и время одноразового запуска" hint="Оставьте пустым для обычного cron-расписания"><input type="datetime-local" value={form.run_once_at || ''} onChange={e => patch({ run_once_at: e.target.value || undefined })}/></Field><Field label="Часовой пояс"><input required value={form.timezone || 'UTC'} onChange={e => patch({ timezone: e.target.value })} placeholder="Asia/Yekaterinburg"/></Field><Field label="Промпт" wide><textarea required rows={6} value={form.prompt || ''} onChange={e => patch({ prompt: e.target.value })} placeholder="Сформируйте и отправьте ежедневную сводку…"/></Field><div className="toggle-box wide"><Toggle label="Расписание включено" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div></div>
     <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Отмена</button><button className="primary" disabled={busy}>Сохранить расписание</button></div></form></Modal>
 }
 

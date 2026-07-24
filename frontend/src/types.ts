@@ -79,6 +79,7 @@ export interface CronJob {
   name: string
   agent_id: ID
   schedule: string
+  run_once_at?: string
   prompt: string
   timezone: string
   enabled: boolean
