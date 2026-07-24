@@ -84,7 +84,7 @@ class MemoryStore:
     @staticmethod
     def _qdrant_config(url: str | None, embedding_dims: int) -> dict[str, Any]:
         vector: dict[str, Any] = {
-            "collection_name": "ice_agent_memory",
+            "collection_name": f"ice_agent_memory_v2_{embedding_dims}",
             "embedding_model_dims": embedding_dims,
         }
         raw = (url or "").strip() or "http://qdrant:6333"
@@ -109,19 +109,20 @@ class MemoryStore:
 
     @classmethod
     def _local_mem0_config(cls, settings: Any, llm: dict[str, Any] | None) -> dict[str, Any]:
-        base = str((llm or {}).get("base_url") or "").lower()
-        # DeepSeek chat models cannot embed; use their embedding model when possible.
-        if "deepseek" in base:
-            embed_model, dims = "deepseek-embedding", 1024
-        else:
-            embed_model, dims = "text-embedding-3-small", 1536
+        embed_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        dims = 384
         config: dict[str, Any] = {
             "vector_store": cls._qdrant_config(settings.qdrant_url, dims),
+            "embedder": {
+                "provider": "fastembed",
+                "config": {
+                    "model": embed_model,
+                    "embedding_dims": dims,
+                },
+            },
         }
         if llm:
             config["llm"] = cls._openai_compatible(llm, model=str(llm["model"]))
-            # Mem0 defaults to OpenAI embeddings; without this local mode stays degraded.
-            config["embedder"] = cls._openai_compatible(llm, model=embed_model)
         return config
 
     async def reconfigure(

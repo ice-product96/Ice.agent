@@ -1,4 +1,5 @@
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 
@@ -61,6 +62,23 @@ async def test_memory_fallback_namespace_and_lifecycle() -> None:
     assert len(await memory.get_all()) == 2
     await memory.reset()
     assert await memory.get_all() == []
+
+
+def test_local_memory_uses_multilingual_fastembed() -> None:
+    config = MemoryStore._local_mem0_config(
+        SimpleNamespace(qdrant_url="http://qdrant:6333"),
+        {
+            "api_key": "secret",
+            "base_url": "https://api.deepseek.com",
+            "model": "deepseek-v4-flash",
+        },
+    )
+
+    assert config["embedder"]["provider"] == "fastembed"
+    assert config["embedder"]["config"]["embedding_dims"] == 384
+    assert config["vector_store"]["config"]["host"] == "qdrant"
+    assert config["vector_store"]["config"]["embedding_model_dims"] == 384
+    assert config["llm"]["config"]["model"] == "deepseek-v4-flash"
 
 
 class FakeDB:
