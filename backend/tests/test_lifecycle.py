@@ -94,6 +94,7 @@ async def test_task_bus_processes_success_and_failure(tmp_path: Path) -> None:
 class RoutingRuntime:
     def __init__(self) -> None:
         self.calls: list[tuple[int, str, dict[str, Any]]] = []
+        self.suppress_reply = False
 
     async def run(
         self,
@@ -103,6 +104,9 @@ class RoutingRuntime:
         context: dict[str, Any],
     ) -> str:
         self.calls.append((agent.id, message, context))
+        if self.suppress_reply:
+            context["_suppress_telegram_reply"] = True
+            context["_suppress_telegram_reason"] = "test"
         return "routed reply"
 
 
@@ -169,6 +173,19 @@ async def test_telegram_router_routes_and_prevents_loops(tmp_path: Path) -> None
 
     await router.new_message({**payload, "message_id": 33, "outgoing": True})
     assert len(runtime.calls) == 2
+    await router.new_message({
+        **payload,
+        "message_id": 34,
+        "sender_is_bot": True,
+    })
+    assert len(runtime.calls) == 2
+    assert len(telegram.sent) == 2
+
+    runtime.suppress_reply = True
+    await router.new_message({**payload, "message_id": 35})
+    assert len(runtime.calls) == 3
+    assert len(telegram.sent) == 2
+    assert "telegram.reply_suppressed" in [name for name, _ in events.items]
     await engine.dispose()
 
 

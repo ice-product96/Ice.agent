@@ -29,6 +29,9 @@ from .telegram import TelegramGateway
 from .secrets import SecretStore
 
 
+NO_TELEGRAM_REPLY = "[[NO_TELEGRAM_REPLY]]"
+
+
 class PermissionDenied(PermissionError):
     pass
 
@@ -246,6 +249,23 @@ class AgentRuntime:
         if phone and self.telegram:
             telegram_tools = self.telegram.tool_registry(phone)
             registry.tools.update(telegram_tools.tools)
+            if context is not None and context.get("source") == "telegram":
+                async def telegram_suppress_reply(reason: str = "") -> dict[str, Any]:
+                    """Suppress the automatic Telegram reply for the current incoming message."""
+                    context["_suppress_telegram_reply"] = True
+                    context["_suppress_telegram_reason"] = (
+                        reason.strip() or "Agent chose not to reply"
+                    )
+                    return {"ok": True, "reply_suppressed": True}
+
+                registry.register(
+                    telegram_suppress_reply,
+                    "telegram_suppress_reply",
+                    (
+                        "Do not send any Telegram response to the current incoming message. "
+                        "Use this instead of writing 'silence', an emoji, or an explanation."
+                    ),
+                )
         if self.mcp and mcp_server_names:
             await self.mcp.register_tools(registry, mcp_server_names)
         if self.task_bus:
@@ -439,6 +459,18 @@ class AgentRuntime:
                         "returned successfully. Report tool errors truthfully and explicitly."
                     ),
                 },
+                *(
+                    [{
+                        "role": "system",
+                        "content": (
+                            "When no Telegram reply should be sent, call "
+                            "telegram_suppress_reply. Never describe silence in a message. "
+                            f"If that tool is unavailable, return exactly {NO_TELEGRAM_REPLY}."
+                        ),
+                    }]
+                    if is_telegram
+                    else []
+                ),
                 {"role": "system", "content": conversation_context},
                 {"role": "user", "content": message},
             ]
@@ -477,10 +509,23 @@ class AgentRuntime:
             if registry.audit:
                 await db.commit()
             outbound_at = as_utc(None)
+            suppressed = bool(context.get("_suppress_telegram_reply")) or (
+                result.strip() == NO_TELEGRAM_REPLY
+            )
+            if suppressed:
+                context["_suppress_telegram_reply"] = True
+                context.setdefault(
+                    "_suppress_telegram_reason",
+                    "Agent returned the no-reply marker",
+                )
             if runtime_settings.memory_enabled:
                 try:
                     await self.memory.add(
-                        f"User: {message}\nAssistant: {result}",
+                        (
+                            f"User: {message}\nAssistant: [no reply sent]"
+                            if suppressed
+                            else f"User: {message}\nAssistant: {result}"
+                        ),
                         user_id=user_id,
                         agent_id=str(agent.id),
                         metadata={
@@ -494,7 +539,22 @@ class AgentRuntime:
                     )
                 except Exception:
                     pass
-            if state is not None:
+            if suppressed:
+                db.add(
+                    MessageLog(
+                        agent_id=agent.id,
+                        account_id=account.id if account else None,
+                        direction="suppressed",
+                        chat_id=str(context.get("chat_id") or "") or None,
+                        user_id=str(context.get("sender_id") or "") or None,
+                        message_id=str(context.get("message_id") or "") or None,
+                        message_at=outbound_at,
+                        text=str(context.get("_suppress_telegram_reason") or ""),
+                        metadata_json={"source": "telegram", "suppressed": True},
+                    )
+                )
+                await db.commit()
+            elif state is not None:
                 await self.conversations.record_outbound(
                     db, state, result, context, at=outbound_at
                 )

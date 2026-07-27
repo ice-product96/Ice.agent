@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from .conversation import as_utc
 from .db import Agent, MessageLog, RuntimeSettings, TelegramAccount
 from .events import EventHub
-from .runtime import AgentRuntime
+from .runtime import AgentRuntime, NO_TELEGRAM_REPLY
 from .telegram import TelegramGateway
 
 
@@ -68,6 +68,17 @@ class TelegramEventRouter:
             or not text
             or self._seen(payload)
         ):
+            return
+        if payload.get("sender_is_bot"):
+            await self.events.publish(
+                "telegram.bot_message_ignored",
+                {
+                    "phone": payload.get("phone"),
+                    "chat_id": payload.get("chat_id"),
+                    "sender_id": payload.get("sender_id"),
+                    "message_id": payload.get("message_id"),
+                },
+            )
             return
         phone = str(payload.get("phone") or "")
         async with self.sessions() as db:
@@ -130,6 +141,8 @@ class TelegramEventRouter:
                 "source": "telegram",
                 "phone": phone,
                 "sender_id": payload.get("sender_id"),
+                "sender_username": payload.get("sender_username"),
+                "sender_is_bot": payload.get("sender_is_bot", False),
                 "chat_id": payload.get("chat_id"),
                 "message_id": payload.get("message_id"),
                 "message_at": payload.get("date"),
@@ -139,7 +152,20 @@ class TelegramEventRouter:
             }
             try:
                 reply = await self.runtime.run(db, agent, text, context)
-                if entity is not None and reply:
+                suppressed = bool(context.get("_suppress_telegram_reply")) or (
+                    reply.strip() == NO_TELEGRAM_REPLY
+                )
+                if suppressed:
+                    await self.events.publish(
+                        "telegram.reply_suppressed",
+                        {
+                            "agent_id": agent.id,
+                            "chat_id": chat_id,
+                            "message_id": message_id,
+                            "reason": context.get("_suppress_telegram_reason"),
+                        },
+                    )
+                elif entity is not None and reply:
                     sent = await self.telegram.send_message(
                         phone,
                         entity,

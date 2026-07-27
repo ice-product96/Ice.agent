@@ -246,10 +246,18 @@ class TelegramGateway:
     async def _dispatch(self, event_name: str, event: Any, phone: str) -> None:
         message = getattr(event, "message", None)
         sender_id = getattr(event, "sender_id", None) or getattr(message, "sender_id", None)
+        sender = getattr(event, "sender", None)
+        if sender is None:
+            try:
+                sender = await event.get_sender()
+            except Exception:
+                sender = None
         payload = {
             "event": event_name,
             "phone": phone,
             "sender_id": sender_id,
+            "sender_is_bot": bool(getattr(sender, "bot", False)),
+            "sender_username": getattr(sender, "username", None),
             "is_admin": sender_id in self.admin_ids,
             "chat_id": getattr(event, "chat_id", None) or getattr(message, "chat_id", None),
             "message_id": getattr(event, "id", None) or getattr(message, "id", None),
