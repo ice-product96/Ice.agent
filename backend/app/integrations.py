@@ -375,24 +375,44 @@ class WebSearch:
                     timeout=30.0,
                     follow_redirects=True,
                     headers={"Accept": "application/json"},
+                    trust_env=False,
                 ) as client:
-                    response = await client.get(
-                        url,
-                        params={"q": query, "format": "json", "language": "ru-RU"},
-                    )
-                    response.raise_for_status()
-                    try:
-                        payload = response.json()
-                    except ValueError as exc:
-                        raise RuntimeError(
-                            "SearXNG returned non-JSON. Enable the JSON format in SearXNG settings."
-                        ) from exc
+                    failures: list[Any] = []
+                    for engines in (None, "bing"):
+                        params = {
+                            "q": query,
+                            "format": "json",
+                            "language": "ru-RU",
+                        }
+                        if engines:
+                            params["engines"] = engines
+                        response = await client.get(url, params=params)
+                        response.raise_for_status()
+                        try:
+                            payload = response.json()
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                "SearXNG returned non-JSON. Enable the JSON format in SearXNG settings."
+                            ) from exc
+                        results = payload.get("results") if isinstance(payload, dict) else None
+                        if not isinstance(results, list):
+                            raise RuntimeError("SearXNG response has no results list")
+                        normalized = self._normalize(results, limit)
+                        if normalized:
+                            return normalized
+                        failures.extend(payload.get("unresponsive_engines") or [])
             except httpx.HTTPError as exc:
                 raise RuntimeError(f"SearXNG request failed: {exc}") from exc
-            results = payload.get("results") if isinstance(payload, dict) else None
-            if not isinstance(results, list):
-                raise RuntimeError("SearXNG response has no results list")
-            return self._normalize(results, limit)
+            if failures:
+                detail = ", ".join(
+                    f"{item[0]}: {item[1]}"
+                    for item in failures
+                    if isinstance(item, list) and len(item) >= 2
+                )
+                raise RuntimeError(
+                    f"SearXNG returned no results; engine failures: {detail}"
+                )
+            return []
         try:
             from duckduckgo_search import DDGS
 
