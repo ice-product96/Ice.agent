@@ -22,6 +22,7 @@ from .db import (
     TelegramAccount,
     agent_mcp_servers,
 )
+from .action_reports import format_admin_action_report
 from .events import EventHub
 from .integrations import LLMClient, McpManager, MemoryStore, WebSearch
 from .tools import ToolRegistry, common_registry, resolve_tool_permissions
@@ -242,7 +243,14 @@ class AgentRuntime:
         context: dict[str, Any] | None = None,
     ) -> ToolRegistry:
         registry = common_registry()
-        registry.register(self.search.search, "web_search", "Search the public web")
+        registry.register(
+            self.search.search,
+            "web_search",
+            (
+                "Search the public web for titles, URLs and snippets. "
+                "To open or read a specific page, use an MCP browser tool when available."
+            ),
+        )
         if memory_enabled:
             registry.register(self.memory.search, "memory_search", "Search long-term memory")
             registry.register(self.memory.add, "memory_add", "Store long-term memory")
@@ -455,22 +463,28 @@ class AgentRuntime:
                 {
                     "role": "system",
                     "content": (
-                        "Never claim that an external action succeeded unless its tool call "
-                        "returned successfully. Report tool errors truthfully and explicitly."
+                        (
+                            "Your final assistant message is delivered ONLY to the Telegram interlocutor. "
+                            "Write a natural conversational reply for them. "
+                            "Do not narrate internal tool calls, MCP/tracker operations, schedules, "
+                            "channel joins, deletions, or other system actions to the interlocutor. "
+                            "Never say things like 'я передвинул карточку', 'я выполнил действие', "
+                            "or dump tool JSON into the chat. "
+                            "The platform automatically reports mutating tool outcomes to administrators. "
+                            "If a tool failure affects the answer, say briefly that you could not complete "
+                            "the request — without technical internals. "
+                            "Never claim an external action succeeded unless its tool call returned successfully. "
+                            "When no Telegram reply should be sent, call telegram_suppress_reply. "
+                            "Never describe silence in a message. "
+                            f"If that tool is unavailable, return exactly {NO_TELEGRAM_REPLY}."
+                        )
+                        if is_telegram
+                        else (
+                            "Never claim that an external action succeeded unless its tool call "
+                            "returned successfully. Report tool errors truthfully and explicitly."
+                        )
                     ),
                 },
-                *(
-                    [{
-                        "role": "system",
-                        "content": (
-                            "When no Telegram reply should be sent, call "
-                            "telegram_suppress_reply. Never describe silence in a message. "
-                            f"If that tool is unavailable, return exactly {NO_TELEGRAM_REPLY}."
-                        ),
-                    }]
-                    if is_telegram
-                    else []
-                ),
                 {"role": "system", "content": conversation_context},
                 {"role": "user", "content": message},
             ]
@@ -508,6 +522,65 @@ class AgentRuntime:
                 )
             if registry.audit:
                 await db.commit()
+            admin_report = format_admin_action_report(
+                agent_name=agent.name,
+                audit=registry.audit,
+                user_message=message,
+                chat_id=context.get("chat_id"),
+                sender_id=context.get("sender_id"),
+                sender_username=(
+                    str(context["sender_username"])
+                    if context.get("sender_username")
+                    else None
+                ),
+            )
+            if admin_report:
+                context["_admin_action_report"] = admin_report
+                phone = (
+                    (account.phone if account else None)
+                    or context.get("reply_phone")
+                    or context.get("phone")
+                )
+                if phone and self.telegram and self.telegram.admin_ids:
+                    try:
+                        exclude: set[int] = set()
+                        sender = context.get("sender_id")
+                        if sender is not None and str(sender).lstrip("-").isdigit():
+                            exclude.add(int(sender))
+                        sent_reports = await self.telegram.notify_admins(
+                            str(phone),
+                            admin_report,
+                            exclude_ids=exclude,
+                        )
+                        context["_admin_action_report_sent"] = len(sent_reports)
+                        db.add(
+                            MessageLog(
+                                agent_id=agent.id,
+                                account_id=account.id if account else None,
+                                direction="admin_report",
+                                chat_id=str(context.get("chat_id") or "") or None,
+                                user_id=str(context.get("sender_id") or "") or None,
+                                message_at=as_utc(None),
+                                text=admin_report,
+                                metadata_json={
+                                    "recipients": len(sent_reports),
+                                    "excluded_sender": bool(exclude),
+                                },
+                            )
+                        )
+                        await db.commit()
+                        await self.events.publish(
+                            "telegram.admin_action_report",
+                            {
+                                "agent_id": agent.id,
+                                "recipients": len(sent_reports),
+                            },
+                        )
+                    except Exception as exc:
+                        await self.events.publish(
+                            "telegram.admin_action_report_failed",
+                            {"agent_id": agent.id, "error": str(exc)},
+                        )
             outbound_at = as_utc(None)
             suppressed = bool(context.get("_suppress_telegram_reply")) or (
                 result.strip() == NO_TELEGRAM_REPLY

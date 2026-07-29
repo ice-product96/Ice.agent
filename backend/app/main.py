@@ -66,7 +66,11 @@ async def lifespan(app: FastAPI):
     if admin_settings:
         telegram.set_admin_ids(admin_settings.telegram_ids)
     telegram.configure_runtime(runtime_settings)
-    search.configure(runtime_settings.search_provider, runtime_settings.searxng_url)
+    search.configure(
+        runtime_settings.search_provider,
+        runtime_settings.searxng_url,
+        secrets.decrypt(runtime_settings.tavily_api_key_ciphertext),
+    )
     try:
         memory_llm = None
         if memory_profile and memory_profile.enabled:

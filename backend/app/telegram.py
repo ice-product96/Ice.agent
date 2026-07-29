@@ -464,9 +464,25 @@ class TelegramGateway:
         return telegram_json(await self._get(phone).get_drafts())
 
     async def escalate(self, phone: str, text: str) -> Any:
+        return await self.notify_admins(phone, text)
+
+    async def notify_admins(
+        self,
+        phone: str,
+        text: str,
+        *,
+        exclude_ids: Iterable[int | str] | None = None,
+    ) -> list[Any]:
         if not self.admin_ids:
             raise RuntimeError("No administrator Telegram IDs configured")
-        return await self.send_message(phone, sorted(self.admin_ids)[0], text)
+        excluded = {int(value) for value in (exclude_ids or []) if str(value).lstrip("-").isdigit()}
+        targets = sorted(admin_id for admin_id in self.admin_ids if admin_id not in excluded)
+        if not targets:
+            return []
+        sent: list[Any] = []
+        for admin_id in targets:
+            sent.append(await self.send_message(phone, admin_id, text))
+        return sent
 
     def set_admin_ids(self, values: Iterable[int | str]) -> None:
         self.admin_ids = {int(value) for value in values}

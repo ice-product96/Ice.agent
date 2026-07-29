@@ -164,6 +164,49 @@ def test_runtime_settings_and_telegram_credentials_are_masked(
         "max_tool_rounds"
     ] == 4
 
+    tavily = client.put(
+        "/api/v1/settings/runtime",
+        headers=headers,
+        json={
+            "search_provider": "tavily",
+            "tavily_api_key": "tvly-secret-key",
+            "memory_enabled": False,
+            "memory_backend": "platform",
+            "typing_min_seconds": 0.2,
+            "typing_max_seconds": 0.8,
+            "typing_jitter_seconds": 0.1,
+            "typing_chunk_size": 1000,
+            "typing_presence": True,
+            "task_workers": 0,
+            "max_tool_rounds": 4,
+        },
+    )
+    assert tavily.status_code == 200
+    assert tavily.json()["search_provider"] == "tavily"
+    assert tavily.json()["has_tavily_api_key"] is True
+    assert "tvly-secret-key" not in str(tavily.json())
+    assert client.app.state.search.provider == "tavily"
+    assert client.app.state.search.tavily_api_key == "tvly-secret-key"
+
+    missing = client.put(
+        "/api/v1/settings/runtime",
+        headers=headers,
+        json={
+            "search_provider": "tavily",
+            "clear_tavily_api_key": True,
+            "memory_enabled": False,
+            "memory_backend": "platform",
+            "typing_min_seconds": 0.2,
+            "typing_max_seconds": 0.8,
+            "typing_jitter_seconds": 0.1,
+            "typing_chunk_size": 1000,
+            "typing_presence": True,
+            "task_workers": 0,
+            "max_tool_rounds": 4,
+        },
+    )
+    assert missing.status_code == 422
+
     seen: dict[str, Any] = {}
     original = client.app.state.telegram
 

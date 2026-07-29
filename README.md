@@ -13,8 +13,8 @@
   пользователю; точные даты сообщений, время последнего контакта и rolling
   summary для длинных диалогов.
 - **Администратор системы** — Telegram user_id админа задаётся в настройках; агенты умеют эскалировать и принимать команды только от него.
-- **Веб-поиск** — SearXNG (primary) + DuckDuckGo fallback.
-- **Браузер Playwright MCP** — локальный headless Chromium для открытия сайтов, кликов и извлечения данных (официальный Microsoft Playwright MCP).
+- **Веб-поиск** — Tavily / SearXNG / DuckDuckGo (выбирается в Runtime).
+- **Браузер Playwright MCP** — локальный headless Chromium для открытия найденных ссылок, кликов и извлечения данных.
 - **Cron** — периодические задачи агентов (APScheduler).
 - **MCP** — подключение внешних MCP-серверов (stdio / SSE / streamable-http) как инструментов агента.
 
@@ -65,9 +65,15 @@ sudo ufw allow 3040/tcp
 sudo ufw reload
 ```
 
-На сервере уже есть SearXNG (`:8080`). В Runtime панели укажите, например:
-`http://172.17.0.1:8080` (IP docker0 / host gateway), а Qdrant —
-`http://qdrant:6333` (имя сервиса внутри compose).
+На сервере уже есть SearXNG (`:8080`). В Runtime → Веб-поиск можно выбрать:
+
+- **Tavily** — основной рекомендуемый поиск (API-ключ с https://tavily.com, шифруется в БД);
+- **SearXNG** — URL, например `http://172.17.0.1:8080` (docker0 / host gateway);
+- **DuckDuckGo** — без внешней настройки.
+
+Qdrant в compose: `http://qdrant:6333` (имя сервиса внутри сети).
+
+Для чтения страниц по ссылкам из результатов поиска используйте Playwright MCP (ниже), а не веб-поиск.
 
 Playwright MCP поднимается вместе со стеком. В панели **MCP** добавьте сервер:
 

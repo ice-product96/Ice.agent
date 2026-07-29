@@ -176,8 +176,10 @@ class LlmProfileBody(BaseModel):
 
 
 class RuntimeSettingsBody(BaseModel):
-    search_provider: Literal["searxng", "ddg"] = "ddg"
+    search_provider: Literal["searxng", "ddg", "tavily"] = "ddg"
     searxng_url: str | None = None
+    tavily_api_key: str = ""
+    clear_tavily_api_key: bool = False
     memory_enabled: bool = False
     memory_backend: Literal["local", "platform"] = "local"
     mem0_api_key: str = ""

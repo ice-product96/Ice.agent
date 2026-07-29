@@ -135,6 +135,8 @@ export type LlmProfileWrite = Omit<LlmProfile, 'id' | 'has_api_key'> & { api_key
 export interface RuntimeSettings {
   search_provider: string
   searxng_url: string | null
+  tavily_api_key?: string
+  has_tavily_api_key?: boolean
   timezone: string
   telegram_history_limit: number
   recent_context_messages: number

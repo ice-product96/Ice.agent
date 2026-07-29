@@ -132,6 +132,7 @@ class RuntimeSettings(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
     search_provider: Mapped[str] = mapped_column(String(16), default="ddg")
     searxng_url: Mapped[str | None] = mapped_column(String(1024))
+    tavily_api_key_ciphertext: Mapped[str | None] = mapped_column(Text)
     memory_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     memory_backend: Mapped[str] = mapped_column(String(16), default="local")
     mem0_api_key_ciphertext: Mapped[str | None] = mapped_column(Text)
@@ -254,6 +255,7 @@ async def create_schema() -> None:
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS mtproto_dc_id INTEGER",
             "ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS env_ciphertext TEXT",
             "ALTER TABLE mcp_servers ALTER COLUMN transport TYPE VARCHAR(32)",
+            "ALTER TABLE runtime_settings ADD COLUMN IF NOT EXISTS tavily_api_key_ciphertext TEXT",
         ):
             try:
                 async with connection.begin_nested():

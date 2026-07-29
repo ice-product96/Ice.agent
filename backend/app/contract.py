@@ -209,8 +209,16 @@ async def dashboard(
             "status": (
                 "missing"
                 if runtime_settings
-                and runtime_settings.search_provider == "searxng"
-                and not runtime_settings.searxng_url
+                and (
+                    (
+                        runtime_settings.search_provider == "searxng"
+                        and not runtime_settings.searxng_url
+                    )
+                    or (
+                        runtime_settings.search_provider == "tavily"
+                        and not runtime_settings.tavily_api_key_ciphertext
+                    )
+                )
                 else "configured"
             )
         },
@@ -1123,6 +1131,8 @@ def runtime_json(settings: RuntimeSettings, *, memory_error: str | None = None) 
     return {
         "search_provider": settings.search_provider,
         "searxng_url": settings.searxng_url,
+        "has_tavily_api_key": bool(settings.tavily_api_key_ciphertext),
+        "tavily_api_key_masked": masked_secret(settings.tavily_api_key_ciphertext),
         "memory_enabled": settings.memory_enabled,
         "memory_backend": settings.memory_backend,
         "has_mem0_api_key": bool(settings.mem0_api_key_ciphertext),
@@ -1181,6 +1191,16 @@ async def update_runtime_configuration(
             status_code=422,
             detail="searxng_url is required for the searxng provider",
         )
+    secrets = SecretStore.from_settings(get_settings())
+    tavily_key_present = bool(
+        payload.tavily_api_key
+        or (settings.tavily_api_key_ciphertext and not payload.clear_tavily_api_key)
+    )
+    if payload.search_provider == "tavily" and not tavily_key_present:
+        raise HTTPException(
+            status_code=422,
+            detail="tavily_api_key is required for the tavily provider",
+        )
     if payload.memory_llm_profile_id is not None and await db.get(
         LlmProfile, payload.memory_llm_profile_id
     ) is None:
@@ -1192,12 +1212,20 @@ async def update_runtime_configuration(
     ):
         payload.qdrant_url = "http://qdrant:6333"
     for key, value in payload.model_dump(
-        exclude={"mem0_api_key", "clear_mem0_api_key"}
+        exclude={
+            "mem0_api_key",
+            "clear_mem0_api_key",
+            "tavily_api_key",
+            "clear_tavily_api_key",
+        }
     ).items():
         setattr(settings, key, value)
     if isinstance(settings.qdrant_url, str):
         settings.qdrant_url = settings.qdrant_url.strip() or None
-    secrets = SecretStore.from_settings(get_settings())
+    if payload.clear_tavily_api_key:
+        settings.tavily_api_key_ciphertext = None
+    elif payload.tavily_api_key:
+        settings.tavily_api_key_ciphertext = secrets.encrypt(payload.tavily_api_key)
     if payload.clear_mem0_api_key:
         settings.mem0_api_key_ciphertext = None
     elif payload.mem0_api_key:
@@ -1216,7 +1244,11 @@ async def update_runtime_configuration(
                     "base_url": profile.base_url,
                     "model": profile.default_model,
                 }
-    request.app.state.search.configure(settings.search_provider, settings.searxng_url)
+    request.app.state.search.configure(
+        settings.search_provider,
+        settings.searxng_url,
+        secrets.decrypt(settings.tavily_api_key_ciphertext),
+    )
     request.app.state.telegram.configure_runtime(settings)
     await request.app.state.memory.reconfigure(settings, secret, memory_llm)
     if len(request.app.state.task_bus._workers) != settings.task_workers:
@@ -1349,6 +1381,7 @@ async def test_search(request: Request) -> dict[str, Any]:
             "detail": str(exc),
             "provider": search.provider,
             "searxng_url": search.searxng_url,
+            "has_tavily_api_key": bool(search.tavily_api_key),
         }
     sample = results[0]["title"] if results else None
     if not results:
@@ -1357,10 +1390,11 @@ async def test_search(request: Request) -> dict[str, Any]:
             "status": "empty",
             "detail": (
                 "Провайдер ответил, но вернул 0 результатов. "
-                "Проверьте, что у SearXNG включён JSON format и поисковые движки."
+                "Проверьте ключ Tavily / URL SearXNG и поисковые движки."
             ),
             "provider": search.provider,
             "searxng_url": search.searxng_url,
+            "has_tavily_api_key": bool(search.tavily_api_key),
             "result_count": 0,
         }
     return {
@@ -1370,6 +1404,7 @@ async def test_search(request: Request) -> dict[str, Any]:
         + (f" · пример: {sample}" if sample else ""),
         "provider": search.provider,
         "searxng_url": search.searxng_url,
+        "has_tavily_api_key": bool(search.tavily_api_key),
         "result_count": len(results),
         "sample": sample,
     }

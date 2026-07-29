@@ -338,10 +338,17 @@ class WebSearch:
     def __init__(self, _bootstrap: Any = None) -> None:
         self.provider = "ddg"
         self.searxng_url: str | None = None
+        self.tavily_api_key: str | None = None
 
-    def configure(self, provider: str, searxng_url: str | None) -> None:
+    def configure(
+        self,
+        provider: str,
+        searxng_url: str | None = None,
+        tavily_api_key: str | None = None,
+    ) -> None:
         self.provider = provider
         self.searxng_url = searxng_url
+        self.tavily_api_key = (tavily_api_key or "").strip() or None
 
     @staticmethod
     def _normalize(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -366,58 +373,96 @@ class WebSearch:
         query = str(query or "").strip()
         if not query:
             raise ValueError("Search query must not be empty")
+        limit = max(1, min(int(limit or 5), 20))
+        if self.provider == "tavily":
+            return await self._search_tavily(query, limit)
         if self.provider == "searxng":
-            if not self.searxng_url:
-                raise RuntimeError("SearXNG URL is not configured")
-            url = f"{self.searxng_url.rstrip('/')}/search"
-            try:
-                async with httpx.AsyncClient(
-                    timeout=30.0,
-                    follow_redirects=True,
-                    headers={"Accept": "application/json"},
-                    trust_env=False,
-                ) as client:
-                    failures: list[Any] = []
-                    for engines in (None, "bing"):
-                        params = {
-                            "q": query,
-                            "format": "json",
-                            "language": "ru-RU",
-                        }
-                        if engines:
-                            params["engines"] = engines
-                        response = await client.get(url, params=params)
-                        response.raise_for_status()
-                        try:
-                            payload = response.json()
-                        except ValueError as exc:
-                            raise RuntimeError(
-                                "SearXNG returned non-JSON. Enable the JSON format in SearXNG settings."
-                            ) from exc
-                        results = payload.get("results") if isinstance(payload, dict) else None
-                        if not isinstance(results, list):
-                            raise RuntimeError("SearXNG response has no results list")
-                        normalized = self._normalize(results, limit)
-                        if normalized:
-                            return normalized
-                        failures.extend(payload.get("unresponsive_engines") or [])
-            except httpx.HTTPError as exc:
-                raise RuntimeError(f"SearXNG request failed: {exc}") from exc
-            if failures:
-                detail = ", ".join(
-                    f"{item[0]}: {item[1]}"
-                    for item in failures
-                    if isinstance(item, list) and len(item) >= 2
+            return await self._search_searxng(query, limit)
+        return await self._search_ddg(query, limit)
+
+    async def _search_tavily(self, query: str, limit: int) -> list[dict[str, Any]]:
+        if not self.tavily_api_key:
+            raise RuntimeError("Tavily API key is not configured")
+        try:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+                response = await client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": self.tavily_api_key,
+                        "query": query,
+                        "max_results": limit,
+                        "search_depth": "basic",
+                        "include_answer": False,
+                    },
                 )
-                raise RuntimeError(
-                    f"SearXNG returned no results; engine failures: {detail}"
-                )
-            return []
+                if response.status_code == 401:
+                    raise RuntimeError("Tavily rejected the API key")
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Tavily request failed: {exc}") from exc
+        except ValueError as exc:
+            raise RuntimeError("Tavily returned non-JSON") from exc
+        results = payload.get("results") if isinstance(payload, dict) else None
+        if not isinstance(results, list):
+            raise RuntimeError("Tavily response has no results list")
+        return self._normalize(results, limit)
+
+    async def _search_searxng(self, query: str, limit: int) -> list[dict[str, Any]]:
+        if not self.searxng_url:
+            raise RuntimeError("SearXNG URL is not configured")
+        url = f"{self.searxng_url.rstrip('/')}/search"
+        try:
+            async with httpx.AsyncClient(
+                timeout=30.0,
+                follow_redirects=True,
+                headers={"Accept": "application/json"},
+                trust_env=False,
+            ) as client:
+                failures: list[Any] = []
+                # Prefer Bing first: public default engines are often rate-limited.
+                for engines in ("bing", None, "duckduckgo"):
+                    params: dict[str, Any] = {
+                        "q": query,
+                        "format": "json",
+                        "language": "ru-RU",
+                    }
+                    if engines:
+                        params["engines"] = engines
+                    response = await client.get(url, params=params)
+                    response.raise_for_status()
+                    try:
+                        payload = response.json()
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            "SearXNG returned non-JSON. Enable the JSON format in SearXNG settings."
+                        ) from exc
+                    results = payload.get("results") if isinstance(payload, dict) else None
+                    if not isinstance(results, list):
+                        raise RuntimeError("SearXNG response has no results list")
+                    normalized = self._normalize(results, limit)
+                    if normalized:
+                        return normalized
+                    failures.extend(payload.get("unresponsive_engines") or [])
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"SearXNG request failed: {exc}") from exc
+        if failures:
+            detail = ", ".join(
+                f"{item[0]}: {item[1]}"
+                for item in failures
+                if isinstance(item, list) and len(item) >= 2
+            )
+            raise RuntimeError(
+                f"SearXNG returned no results; engine failures: {detail}"
+            )
+        return []
+
+    async def _search_ddg(self, query: str, limit: int) -> list[dict[str, Any]]:
         try:
             from duckduckgo_search import DDGS
 
             rows = await asyncio.to_thread(
-                lambda: list(DDGS().text(query, max_results=max(1, min(int(limit or 5), 20))))
+                lambda: list(DDGS().text(query, max_results=limit))
             )
             return self._normalize(
                 [

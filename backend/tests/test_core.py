@@ -74,6 +74,99 @@ def test_resolve_tool_permissions_grants_telegram_ops() -> None:
     assert resolve_tool_permissions({"tools": ["memory"], "tool_permissions": []}) == set()
 
 
+def test_admin_action_report_only_for_side_effects() -> None:
+    from app.action_reports import format_admin_action_report, is_side_effect_tool
+
+    assert is_side_effect_tool("web_search") is False
+    assert is_side_effect_tool("telegram_get_history") is False
+    assert is_side_effect_tool("memory_add") is False
+    assert is_side_effect_tool("ice_tracker_move_card") is True
+    assert (
+        format_admin_action_report(
+            agent_name="Sales",
+            audit=[{"tool": "web_search", "status": "success", "result": []}],
+        )
+        is None
+    )
+    report = format_admin_action_report(
+        agent_name="Sales",
+        audit=[
+            {"tool": "web_search", "status": "success", "result": []},
+            {
+                "tool": "ice_tracker_move_card",
+                "status": "success",
+                "arguments": {"card_id": 1, "column": "done"},
+                "result": {"ok": True},
+            },
+        ],
+        user_message="передвинь карточку",
+        chat_id=42,
+        sender_id=7,
+        sender_username="client",
+    )
+    assert report is not None
+    assert "Sales" in report
+    assert "ice_tracker_move_card" in report
+    assert "web_search" not in report
+    assert "@client" in report
+
+
+@pytest.mark.asyncio
+async def test_web_search_tavily(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.integrations import WebSearch
+
+    search = WebSearch()
+    search.configure("tavily", tavily_api_key="tvly-test")
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "results": [
+                    {
+                        "title": "Ice School",
+                        "url": "https://example.com/school",
+                        "content": "Частная школа в Екатеринбурге",
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def post(self, url: str, json: dict) -> FakeResponse:
+            assert url == "https://api.tavily.com/search"
+            assert json["api_key"] == "tvly-test"
+            assert json["query"] == "школа екатеринбург"
+            return FakeResponse()
+
+    monkeypatch.setattr("app.integrations.httpx.AsyncClient", FakeClient)
+    results = await search.search("школа екатеринбург", limit=3)
+    assert results == [
+        {
+            "title": "Ice School",
+            "url": "https://example.com/school",
+            "content": "Частная школа в Екатеринбурге",
+        }
+    ]
+
+    bare = WebSearch()
+    bare.configure("tavily")
+    with pytest.raises(RuntimeError, match="Tavily API key"):
+        await bare.search("query")
+
+
 def test_reflective_tool_schema() -> None:
     def add(a: int, b: int = 1) -> int:
         """Add two integers."""

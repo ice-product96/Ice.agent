@@ -743,15 +743,18 @@ function RuntimeScreen() {
     summarization_enabled: loaded.data.summarization_enabled ?? true,
     summarize_after_messages: loaded.data.summarize_after_messages ?? 30,
     mem0_api_key: '',
+    tavily_api_key: '',
   }) }, [loaded.data])
   if (loaded.loading || profiles.loading || !form) return <Loading/>
   const patch = (p: Partial<RuntimeSettings>) => setForm(f => f ? ({ ...f, ...p }) : f)
   const number = (key: keyof RuntimeSettings, value: string) => patch({ [key]: Number(value) } as Partial<RuntimeSettings>)
   async function save(e: FormEvent) {
     e.preventDefault(); setBusy(true); setError(''); setSaved(false)
-    const payload: RuntimeSettings = { ...(form as RuntimeSettings) }; if (!payload.mem0_api_key) delete payload.mem0_api_key
-    try { const result = await api.settings.updateRuntime(payload); setForm({ ...result, mem0_api_key: '' }); setSaved(true); setTimeout(() => setSaved(false), 2500) }
-    catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить настройки runtime'); patch({ mem0_api_key: '' }) }
+    const payload: RuntimeSettings = { ...(form as RuntimeSettings) }
+    if (!payload.mem0_api_key) delete payload.mem0_api_key
+    if (!payload.tavily_api_key) delete payload.tavily_api_key
+    try { const result = await api.settings.updateRuntime(payload); setForm({ ...result, mem0_api_key: '', tavily_api_key: '' }); setSaved(true); setTimeout(() => setSaved(false), 2500) }
+    catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить настройки runtime'); patch({ mem0_api_key: '', tavily_api_key: '' }) }
     finally { setBusy(false) }
   }
   async function testSearch() {
@@ -761,8 +764,12 @@ function RuntimeScreen() {
   }
   return <form className="settings-layout runtime-layout" onSubmit={save}>
     {(loaded.error || profiles.error || error) && <Alert message={loaded.error || profiles.error || error}/>}
-    <section className="panel"><SectionHead title="Веб-поиск" text="Сервис поиска для агентов с инструментами" action={<button type="button" className="secondary compact" onClick={() => void testSearch()}><Wifi size={14}/>Тест поиска</button>}/>
-      <div className="form-grid"><Field label="Провайдер поиска"><select required value={form.search_provider} onChange={e => patch({ search_provider: e.target.value })}><option value="ddg">DuckDuckGo</option><option value="searxng">SearXNG</option></select></Field><Field label="URL SearXNG" hint="Из Docker API: http://172.17.0.1:8080 (не localhost)"><input type="url" value={form.searxng_url || ''} onChange={e => patch({ searxng_url: e.target.value || null })} placeholder="http://172.17.0.1:8080"/></Field></div>
+    <section className="panel"><SectionHead title="Веб-поиск" text="Основной поиск для агентов. Открытие страниц — через MCP (Playwright), если подключён." action={<button type="button" className="secondary compact" onClick={() => void testSearch()}><Wifi size={14}/>Тест поиска</button>}/>
+      <div className="form-grid">
+        <Field label="Провайдер поиска"><select required value={form.search_provider} onChange={e => patch({ search_provider: e.target.value })}><option value="tavily">Tavily</option><option value="searxng">SearXNG</option><option value="ddg">DuckDuckGo</option></select></Field>
+        {form.search_provider === 'searxng' && <Field label="URL SearXNG" hint="Из Docker API: http://172.17.0.1:8080 (не localhost)"><input type="url" value={form.searxng_url || ''} onChange={e => patch({ searxng_url: e.target.value || null })} placeholder="http://172.17.0.1:8080"/></Field>}
+        {form.search_provider === 'tavily' && <Field label="API-ключ Tavily" hint={form.has_tavily_api_key ? 'Настроен · ••••••••. Оставьте пустым для сохранения.' : 'Ключ с https://tavily.com. Шифруется в БД.'} wide><input autoComplete="new-password" type="password" value={form.tavily_api_key || ''} onChange={e => patch({ tavily_api_key: e.target.value })} placeholder={form.has_tavily_api_key ? 'Оставьте пустым для сохранения' : 'tvly-…'}/></Field>}
+      </div>
       {searchResult && <div className="inline-result standalone">{searchResult}</div>}
     </section>
     <section className="panel"><SectionHead title="Контекст диалога" text="Управляет недавним транскриптом Telegram и контекстом для агентов"/>
