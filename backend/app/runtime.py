@@ -24,7 +24,7 @@ from .db import (
 )
 from .events import EventHub
 from .integrations import LLMClient, McpManager, MemoryStore, WebSearch
-from .tools import ToolRegistry, common_registry
+from .tools import ToolRegistry, common_registry, resolve_tool_permissions
 from .telegram import TelegramGateway
 from .secrets import SecretStore
 
@@ -474,7 +474,7 @@ class AgentRuntime:
                 {"role": "system", "content": conversation_context},
                 {"role": "user", "content": message},
             ]
-            permissions = set((agent.config or {}).get("tool_permissions", []))
+            permissions = resolve_tool_permissions(agent.config)
             registry = await self.registry(
                 agent,
                 account.phone if account else None,

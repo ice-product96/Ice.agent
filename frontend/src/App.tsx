@@ -294,13 +294,9 @@ function AgentForm({ value, agents, profiles, telegram, onClose, onSave }: { val
   const [error, setError] = useState('')
   const toolOptions = ['web_search', 'memory', 'code_execution', 'telegram', 'filesystem', 'mcp']
   const permissionOptions = [
-    ['telegram_send_message', 'Отправлять сообщения в Telegram'],
-    ['telegram_send_file', 'Отправлять файлы в Telegram'],
-    ['telegram_edit_message', 'Редактировать сообщения Telegram'],
     ['telegram_delete_dialog', 'Удалять диалоги Telegram'],
     ['telegram_delete_messages', 'Удалять сообщения Telegram'],
     ['telegram_leave_channel', 'Покидать каналы и группы'],
-    ['telegram_join_channel', 'Вступать в каналы и группы'],
     ['schedule_self', 'Создавать отложенные задачи'],
   ] as const
   const linkTarget = (link: Agent['links'][number]) =>
@@ -322,7 +318,7 @@ function AgentForm({ value, agents, profiles, telegram, onClose, onSave }: { val
         <Field label="Аккаунт Telegram" hint="Необязательная мессенджер-идентичность"><select value={form.telegram_account_id || ''} onChange={e => patch({ telegram_account_id: e.target.value || undefined })}><option value="">Без аккаунта Telegram</option>{telegram.map(a => <option value={a.id} key={a.id}>{a.name} · {a.phone}{a.readiness && a.readiness !== 'ready' ? ` (${a.readiness})` : ''}</option>)}</select></Field>
         <Field label="Системный промпт" wide><textarea required rows={7} value={form.prompt || ''} onChange={e => patch({ prompt: e.target.value })} placeholder="Вы полезный агент…"/></Field>
         <Field label="Инструменты" wide><div className="check-grid">{toolOptions.map(tool => <label className="check" key={tool}><input type="checkbox" checked={(form.tools || []).includes(tool)} onChange={() => patch({ tools: (form.tools || []).includes(tool) ? form.tools!.filter(t => t !== tool) : [...(form.tools || []), tool] })}/><span>{toolDisplayName(tool)}</span></label>)}</div></Field>
-        <Field label="Опасные действия" hint="Явные разрешения на необратимые операции" wide><div className="check-grid">{permissionOptions.map(([permission, label]) => <label className="check" key={permission}><input type="checkbox" checked={(form.tool_permissions || []).includes(permission)} onChange={() => patch({ tool_permissions: (form.tool_permissions || []).includes(permission) ? form.tool_permissions!.filter(item => item !== permission) : [...(form.tool_permissions || []), permission] })}/><span>{label}</span></label>)}</div></Field>
+        <Field label="Опасные действия" hint="Отправка сообщений и вступление в каналы уже входят в инструмент Telegram. Здесь — только необратимые операции." wide><div className="check-grid">{permissionOptions.map(([permission, label]) => <label className="check" key={permission}><input type="checkbox" checked={(form.tool_permissions || []).includes(permission)} onChange={() => patch({ tool_permissions: (form.tool_permissions || []).includes(permission) ? form.tool_permissions!.filter(item => item !== permission) : [...(form.tool_permissions || []), permission] })}/><span>{label}</span></label>)}</div></Field>
         <Field label="Связи с агентами" hint="Разрешить делегирование работы" wide><div className="check-grid">{agents.filter(a => String(a.id) !== String(form.id)).map(a => <label className="check" key={a.id}><input type="checkbox" checked={linked(a.id)} onChange={() => patch({ links: linked(a.id) ? (form.links || []).filter(link => linkTarget(link) !== String(a.id)) : [...(form.links || []), a.id] })}/><span>{a.name}</span></label>)}</div></Field>
         <div className="toggle-box"><Toggle label="Показывать индикатор набора" checked={form.typing_enabled ?? true} onChange={v => patch({ typing_enabled: v })}/></div>
         <div className="toggle-box"><Toggle label="Агент включён" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div>

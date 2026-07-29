@@ -10,6 +10,29 @@ class DangerousActionError(PermissionError):
     pass
 
 
+# Granted automatically when the agent has the `telegram` tool enabled.
+TELEGRAM_OPERATIONAL_PERMISSIONS = {
+    "telegram_send_message",
+    "telegram_send_file",
+    "telegram_edit_message",
+    "telegram_forward_messages",
+    "telegram_join_channel",
+    "telegram_send_reaction",
+    "telegram_acknowledge_read",
+    "telegram_save_draft",
+    "telegram_escalate",
+}
+
+
+def resolve_tool_permissions(agent_config: dict[str, Any] | None) -> set[str]:
+    config = agent_config or {}
+    permissions = {str(item) for item in (config.get("tool_permissions") or [])}
+    tools = {str(item) for item in (config.get("tools") or [])}
+    if "telegram" in tools:
+        permissions |= TELEGRAM_OPERATIONAL_PERMISSIONS
+    return permissions
+
+
 class ToolPolicy:
     dangerous_names = {
         "delete", "remove", "shell", "exec", "payment", "purchase", "transfer",
