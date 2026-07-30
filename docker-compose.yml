@@ -52,6 +52,9 @@ services:
     stdin_open: true
     # Image ENTRYPOINT is node; pass /app/cli.js explicitly (cwd may not include it).
     entrypoint: ["node", "/app/cli.js"]
+    # DNS-rebinding protection rejects Host: playwright:8931 unless allowlisted.
+    environment:
+      PLAYWRIGHT_MCP_ALLOWED_HOSTS: "*"
     command:
       - "--headless"
       - "--browser"
@@ -61,6 +64,8 @@ services:
       - "8931"
       - "--host"
       - "0.0.0.0"
+      - "--allowed-hosts"
+      - "*"
     ports:
       # Только localhost: агент ходит по docker-сети http://playwright:8931/mcp
       - "127.0.0.1:8931:8931"

@@ -86,6 +86,9 @@ Qdrant в compose: `http://qdrant:6333` (имя сервиса внутри се
 Playwright MCP поднимается вместе со стеком. Если контейнер в `Restarting`, проверьте:
 `docker logs iceagent-playwright --tail 50` — entrypoint должен быть `node /app/cli.js`.
 
+Если в панели ошибка `MCPError: Server returned an error response` — это отказ по `Host`
+(DNS rebinding). В compose уже стоит `--allowed-hosts *`.
+
 В панели **MCP** добавьте сервер:
 
 - имя: `playwright`
