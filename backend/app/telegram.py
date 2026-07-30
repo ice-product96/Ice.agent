@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import logging
 import random
 import shutil
 from collections import defaultdict
@@ -16,6 +17,7 @@ from .secrets import SecretStore
 from .tools import DangerousActionError, ToolRegistry
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+logger = logging.getLogger(__name__)
 
 
 def telegram_json(value: Any) -> Any:
@@ -306,7 +308,7 @@ class TelegramGateway:
             "sender_id": sender_id,
             "sender_is_bot": bool(getattr(sender, "bot", False)),
             "sender_username": getattr(sender, "username", None),
-            "is_admin": sender_id in self.admin_ids,
+            "is_admin": self.is_admin_sender(sender_id),
             "chat_id": getattr(event, "chat_id", None) or getattr(message, "chat_id", None),
             "message_id": getattr(event, "id", None) or getattr(message, "id", None),
             "date": telegram_datetime(
@@ -322,10 +324,29 @@ class TelegramGateway:
             "callback_data": telegram_json(getattr(event, "data", None)),
             "data": telegram_json(event),
         }
-        await asyncio.gather(
+        logger.info(
+            "telegram.%s phone=%s chat=%s sender=%s admin=%s out=%s text=%r",
+            event_name,
+            phone,
+            payload.get("chat_id"),
+            sender_id,
+            payload.get("is_admin"),
+            payload.get("outgoing"),
+            str(payload.get("text") or "")[:120],
+        )
+        results = await asyncio.gather(
             *(callback(payload) for callback in self.callbacks[event_name]),
             return_exceptions=True,
         )
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.exception(
+                    "Telegram %s callback failed phone=%s chat=%s",
+                    event_name,
+                    phone,
+                    payload.get("chat_id"),
+                    exc_info=result,
+                )
 
     def _register_handlers(self, phone: str, client: Any) -> None:
         from telethon import events
@@ -700,7 +721,20 @@ class TelegramGateway:
         return sent
 
     def set_admin_ids(self, values: Iterable[int | str]) -> None:
-        self.admin_ids = {int(value) for value in values}
+        parsed: set[int] = set()
+        for value in values:
+            try:
+                parsed.add(int(str(value).strip()))
+            except (TypeError, ValueError):
+                continue
+        self.admin_ids = parsed
+        logger.info("Telegram admin_ids configured: %s", sorted(self.admin_ids))
+
+    def is_admin_sender(self, sender_id: Any) -> bool:
+        try:
+            return int(sender_id) in self.admin_ids
+        except (TypeError, ValueError):
+            return False
 
     def configure_runtime(self, settings: Any) -> None:
         self.typing_min_seconds = settings.typing_min_seconds

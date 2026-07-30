@@ -109,6 +109,9 @@ class RoutingRuntime:
             context["_suppress_telegram_reason"] = "test"
         return "routed reply"
 
+    async def update_telegram_outbound(self, db: Any, context: dict[str, Any], sent: Any) -> None:
+        return None
+
 
 class RoutingTelegram:
     def __init__(self) -> None:

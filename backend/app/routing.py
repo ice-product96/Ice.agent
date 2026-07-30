@@ -1,4 +1,5 @@
 from collections import deque
+import logging
 from typing import Any
 
 from sqlalchemy import select
@@ -11,6 +12,7 @@ from .runtime import AgentRuntime, NO_TELEGRAM_REPLY
 from .telegram import TelegramGateway
 
 ADMIN_ACK_TEXT = "Принято, обрабатываю…"
+logger = logging.getLogger(__name__)
 
 
 class TelegramEventRouter:
@@ -86,6 +88,11 @@ class TelegramEventRouter:
         async with self.sessions() as db:
             account, agent = await self._target(db, phone)
             if account is None or agent is None:
+                logger.warning(
+                    "telegram.unrouted phone=%s message_id=%s (no enabled agent/account)",
+                    phone,
+                    payload.get("message_id"),
+                )
                 await self.events.publish(
                     "telegram.unrouted",
                     {"phone": phone, "message_id": payload.get("message_id")},
@@ -101,6 +108,12 @@ class TelegramEventRouter:
                     MessageLog.message_id == message_id,
                 )
             ):
+                logger.info(
+                    "telegram.duplicate ignored agent=%s chat=%s message_id=%s",
+                    agent.id,
+                    chat_id,
+                    message_id,
+                )
                 return
             is_admin = bool(payload.get("is_admin"))
             is_admin_command = text.lower().startswith(("/admin", "/system"))
@@ -152,6 +165,14 @@ class TelegramEventRouter:
                 "admin_command": is_admin_command,
                 "telegram_history": history,
             }
+            logger.info(
+                "telegram.routing agent=%s phone=%s chat=%s admin=%s text=%r",
+                agent.id,
+                phone,
+                chat_id,
+                is_admin,
+                text[:120],
+            )
             if is_admin and entity is not None:
                 try:
                     await self.telegram.send_message(
@@ -171,6 +192,11 @@ class TelegramEventRouter:
                         },
                     )
                 except Exception as exc:
+                    logger.exception(
+                        "telegram.admin_ack_failed agent=%s chat=%s",
+                        agent.id,
+                        chat_id,
+                    )
                     await self.events.publish(
                         "telegram.admin_ack_failed",
                         {
@@ -185,6 +211,11 @@ class TelegramEventRouter:
                     reply.strip() == NO_TELEGRAM_REPLY
                 )
                 if suppressed:
+                    logger.info(
+                        "telegram.reply_suppressed agent=%s reason=%s",
+                        agent.id,
+                        context.get("_suppress_telegram_reason"),
+                    )
                     await self.events.publish(
                         "telegram.reply_suppressed",
                         {
@@ -202,11 +233,51 @@ class TelegramEventRouter:
                         reply_to=payload.get("message_id"),
                     )
                     await self.runtime.update_telegram_outbound(db, context, sent)
+                    logger.info(
+                        "telegram.reply_sent agent=%s chat=%s chars=%s",
+                        agent.id,
+                        chat_id,
+                        len(reply),
+                    )
+                elif entity is not None and not reply:
+                    logger.warning(
+                        "telegram.empty_reply agent=%s chat=%s",
+                        agent.id,
+                        chat_id,
+                    )
+                    if is_admin:
+                        await self.telegram.send_message(
+                            phone,
+                            entity,
+                            "Готово, но текстовый ответ пустой.",
+                            reply_to=payload.get("message_id"),
+                            humanize=False,
+                        )
             except Exception as exc:
+                logger.exception(
+                    "telegram.routing_failed agent=%s chat=%s",
+                    agent.id,
+                    chat_id,
+                )
                 await self.events.publish(
                     "telegram.routing_failed",
                     {"agent_id": agent.id, "error": str(exc)},
                 )
+                if entity is not None:
+                    try:
+                        await self.telegram.send_message(
+                            phone,
+                            entity,
+                            f"Ошибка обработки: {exc}",
+                            reply_to=payload.get("message_id"),
+                            humanize=False,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "telegram.error_reply_failed agent=%s chat=%s",
+                            agent.id,
+                            chat_id,
+                        )
 
     async def _record_event(self, event_name: str, payload: dict[str, Any]) -> None:
         phone = str(payload.get("phone") or "")
