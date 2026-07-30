@@ -10,6 +10,8 @@ from .events import EventHub
 from .runtime import AgentRuntime, NO_TELEGRAM_REPLY
 from .telegram import TelegramGateway
 
+ADMIN_ACK_TEXT = "Принято, обрабатываю…"
+
 
 class TelegramEventRouter:
     def __init__(
@@ -150,6 +152,33 @@ class TelegramEventRouter:
                 "admin_command": is_admin_command,
                 "telegram_history": history,
             }
+            if is_admin and entity is not None:
+                try:
+                    await self.telegram.send_message(
+                        phone,
+                        entity,
+                        ADMIN_ACK_TEXT,
+                        reply_to=payload.get("message_id"),
+                        humanize=False,
+                    )
+                    await self.events.publish(
+                        "telegram.admin_ack",
+                        {
+                            "agent_id": agent.id,
+                            "chat_id": chat_id,
+                            "message_id": message_id,
+                            "sender_id": payload.get("sender_id"),
+                        },
+                    )
+                except Exception as exc:
+                    await self.events.publish(
+                        "telegram.admin_ack_failed",
+                        {
+                            "agent_id": agent.id,
+                            "chat_id": chat_id,
+                            "error": str(exc),
+                        },
+                    )
             try:
                 reply = await self.runtime.run(db, agent, text, context)
                 suppressed = bool(context.get("_suppress_telegram_reply")) or (

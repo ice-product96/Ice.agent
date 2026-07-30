@@ -437,12 +437,21 @@ class TelegramGateway:
     async def get_messages(self, phone: str, entity: str | int, ids: int | list[int]) -> Any:
         return telegram_json(await self._get(phone).get_messages(entity, ids=ids))
 
-    async def send_message(self, phone: str, entity: str | int, text: str, reply_to: int | None = None) -> Any:
+    async def send_message(
+        self,
+        phone: str,
+        entity: str | int,
+        text: str,
+        reply_to: int | None = None,
+        *,
+        humanize: bool = True,
+    ) -> Any:
         await self.limiters.setdefault(phone, AsyncLimiter(20, 60)).acquire()
         client = self._get(phone)
         sent = []
         for index, chunk in enumerate(self._split(text)):
-            await self._humanize(client, entity, chunk)
+            if humanize:
+                await self._humanize(client, entity, chunk)
             sent.append(await client.send_message(entity, chunk, reply_to=reply_to if index == 0 else None))
         normalized = [normalized_message(message) for message in sent]
         return normalized[0] if len(normalized) == 1 else normalized

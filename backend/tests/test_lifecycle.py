@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import Agent, AgentLink, AgentTask, Base, TelegramAccount
 from app.integrations import McpManager
-from app.routing import TelegramEventRouter
+from app.routing import ADMIN_ACK_TEXT, TelegramEventRouter
 from app.runtime import TaskBus
 from app.tools import ToolRegistry
 
@@ -120,8 +120,10 @@ class RoutingTelegram:
         entity: str | int,
         text: str,
         reply_to: int | None = None,
+        *,
+        humanize: bool = True,
     ) -> None:
-        self.sent.append((phone, entity, text, reply_to))
+        self.sent.append((phone, entity, text, reply_to, humanize))
 
 
 @pytest.mark.asyncio
@@ -158,7 +160,7 @@ async def test_telegram_router_routes_and_prevents_loops(tmp_path: Path) -> None
     await router.new_message(payload)
     assert len(runtime.calls) == 1
     assert runtime.calls[0][2]["sender_id"] == 10
-    assert telegram.sent == [("+100000", 20, "routed reply", 30)]
+    assert telegram.sent == [("+100000", 20, "routed reply", 30, True)]
 
     await router.new_message({**payload, "message_id": 31, "text": "/system reboot"})
     assert len(runtime.calls) == 1
@@ -170,6 +172,8 @@ async def test_telegram_router_routes_and_prevents_loops(tmp_path: Path) -> None
     })
     assert len(runtime.calls) == 2
     assert runtime.calls[-1][2]["admin_command"] is True
+    assert telegram.sent[-2] == ("+100000", 20, ADMIN_ACK_TEXT, 32, False)
+    assert telegram.sent[-1] == ("+100000", 20, "routed reply", 32, True)
 
     await router.new_message({**payload, "message_id": 33, "outgoing": True})
     assert len(runtime.calls) == 2
@@ -179,12 +183,12 @@ async def test_telegram_router_routes_and_prevents_loops(tmp_path: Path) -> None
         "sender_is_bot": True,
     })
     assert len(runtime.calls) == 2
-    assert len(telegram.sent) == 2
+    assert len(telegram.sent) == 3
 
     runtime.suppress_reply = True
     await router.new_message({**payload, "message_id": 35})
     assert len(runtime.calls) == 3
-    assert len(telegram.sent) == 2
+    assert len(telegram.sent) == 3
     assert "telegram.reply_suppressed" in [name for name, _ in events.items]
     await engine.dispose()
 
