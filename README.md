@@ -55,6 +55,14 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+Если `npm ci` / `pip` в Docker падают с `ETIMEDOUT`, в `.env` можно задать прокси или зеркало:
+
+```bash
+# HTTP_PROXY=http://user:pass@host:8080
+# HTTPS_PROXY=http://user:pass@host:8080
+# NPM_REGISTRY=https://registry.npmmirror.com   # уже по умолчанию для UI
+```
+
 Панель: http://SERVER_IP:3040 (например http://192.168.10.64:3040)  
 API: http://SERVER_IP:8040/docs  
 

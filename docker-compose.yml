@@ -67,7 +67,12 @@ services:
       - iceagent_net
 
   api:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
     container_name: iceagent-api
     env_file: .env
     environment:
@@ -101,6 +106,11 @@ services:
       context: ./frontend
       args:
         VITE_API_URL: /api/v1
+        # If npm still times out, set in .env: HTTP_PROXY / HTTPS_PROXY / NPM_REGISTRY
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
     container_name: iceagent-ui
     ports:
       # 3000/3010/3090 заняты другими проектами — 3040 на всех интерфейсах (LAN + localhost)
