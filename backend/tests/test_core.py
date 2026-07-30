@@ -116,7 +116,11 @@ async def test_web_search_tavily(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.integrations import WebSearch
 
     search = WebSearch()
-    search.configure("tavily", tavily_api_key="tvly-test")
+    search.configure(
+        "tavily",
+        tavily_api_key="tvly-test",
+        tavily_http_proxy="http://proxy.example:8080",
+    )
 
     class FakeResponse:
         status_code = 200
@@ -136,8 +140,10 @@ async def test_web_search_tavily(monkeypatch: pytest.MonkeyPatch) -> None:
             }
 
     class FakeClient:
+        last_kwargs: dict = {}
+
         def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
+            FakeClient.last_kwargs = kwargs
 
         async def __aenter__(self) -> "FakeClient":
             return self
@@ -153,6 +159,7 @@ async def test_web_search_tavily(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("app.integrations.httpx.AsyncClient", FakeClient)
     results = await search.search("школа екатеринбург", limit=3)
+    assert FakeClient.last_kwargs.get("proxy") == "http://proxy.example:8080"
     assert results == [
         {
             "title": "Ice School",

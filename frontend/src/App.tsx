@@ -768,7 +768,10 @@ function RuntimeScreen() {
       <div className="form-grid">
         <Field label="Провайдер поиска"><select required value={form.search_provider} onChange={e => patch({ search_provider: e.target.value })}><option value="tavily">Tavily</option><option value="searxng">SearXNG</option><option value="ddg">DuckDuckGo</option></select></Field>
         {form.search_provider === 'searxng' && <Field label="URL SearXNG" hint="Из Docker API: http://172.17.0.1:8080 (не localhost)"><input type="url" value={form.searxng_url || ''} onChange={e => patch({ searxng_url: e.target.value || null })} placeholder="http://172.17.0.1:8080"/></Field>}
-        {form.search_provider === 'tavily' && <Field label="API-ключ Tavily" hint={form.has_tavily_api_key ? 'Настроен · ••••••••. Оставьте пустым для сохранения.' : 'Ключ с https://tavily.com. Шифруется в БД.'} wide><input autoComplete="new-password" type="password" value={form.tavily_api_key || ''} onChange={e => patch({ tavily_api_key: e.target.value })} placeholder={form.has_tavily_api_key ? 'Оставьте пустым для сохранения' : 'tvly-…'}/></Field>}
+        {form.search_provider === 'tavily' && <>
+          <Field label="API-ключ Tavily" hint={form.has_tavily_api_key ? 'Настроен · ••••••••. Оставьте пустым для сохранения.' : 'Ключ с https://tavily.com. Шифруется в БД.'} wide><input autoComplete="new-password" type="password" value={form.tavily_api_key || ''} onChange={e => patch({ tavily_api_key: e.target.value })} placeholder={form.has_tavily_api_key ? 'Оставьте пустым для сохранения' : 'tvly-…'}/></Field>
+          <Field label="HTTP-прокси Tavily" hint="Если API отвечает 403 — укажите исходящий прокси. Пример: http://user:pass@host:8080" wide><input value={form.tavily_http_proxy || ''} onChange={e => patch({ tavily_http_proxy: e.target.value || null })} placeholder="http://127.0.0.1:8080" autoComplete="off"/></Field>
+        </>}
       </div>
       {searchResult && <div className="inline-result standalone">{searchResult}</div>}
     </section>

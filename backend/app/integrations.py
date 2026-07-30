@@ -339,16 +339,25 @@ class WebSearch:
         self.provider = "ddg"
         self.searxng_url: str | None = None
         self.tavily_api_key: str | None = None
+        self.tavily_http_proxy: str | None = None
 
     def configure(
         self,
         provider: str,
         searxng_url: str | None = None,
         tavily_api_key: str | None = None,
+        tavily_http_proxy: str | None = None,
     ) -> None:
         self.provider = provider
         self.searxng_url = searxng_url
         self.tavily_api_key = (tavily_api_key or "").strip() or None
+        self.tavily_http_proxy = (tavily_http_proxy or "").strip() or None
+
+    def _httpx_client_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"timeout": 30.0, "trust_env": False}
+        if self.provider == "tavily" and self.tavily_http_proxy:
+            kwargs["proxy"] = self.tavily_http_proxy
+        return kwargs
 
     @staticmethod
     def _normalize(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -384,7 +393,7 @@ class WebSearch:
         if not self.tavily_api_key:
             raise RuntimeError("Tavily API key is not configured")
         try:
-            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+            async with httpx.AsyncClient(**self._httpx_client_kwargs()) as client:
                 response = await client.post(
                     "https://api.tavily.com/search",
                     json={
@@ -397,6 +406,13 @@ class WebSearch:
                 )
                 if response.status_code == 401:
                     raise RuntimeError("Tavily rejected the API key")
+                if response.status_code == 403:
+                    hint = (
+                        " (часто блокировка по IP/региону — укажите HTTP-прокси Tavily в Runtime)"
+                        if not self.tavily_http_proxy
+                        else " (прокси задан, но Tavily всё ещё отвечает 403 — проверьте прокси/ключ)"
+                    )
+                    raise RuntimeError(f"Tavily returned 403 Forbidden{hint}")
                 response.raise_for_status()
                 payload = response.json()
         except httpx.HTTPError as exc:

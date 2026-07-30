@@ -67,7 +67,7 @@ sudo ufw reload
 
 На сервере уже есть SearXNG (`:8080`). В Runtime → Веб-поиск можно выбрать:
 
-- **Tavily** — основной рекомендуемый поиск (API-ключ с https://tavily.com, шифруется в БД);
+- **Tavily** — основной рекомендуемый поиск (API-ключ с https://tavily.com, шифруется в БД; при 403 укажите HTTP-прокси);
 - **SearXNG** — URL, например `http://172.17.0.1:8080` (docker0 / host gateway);
 - **DuckDuckGo** — без внешней настройки.
 

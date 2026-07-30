@@ -137,6 +137,7 @@ export interface RuntimeSettings {
   searxng_url: string | null
   tavily_api_key?: string
   has_tavily_api_key?: boolean
+  tavily_http_proxy?: string | null
   timezone: string
   telegram_history_limit: number
   recent_context_messages: number

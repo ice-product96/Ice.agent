@@ -70,6 +70,7 @@ async def lifespan(app: FastAPI):
         runtime_settings.search_provider,
         runtime_settings.searxng_url,
         secrets.decrypt(runtime_settings.tavily_api_key_ciphertext),
+        runtime_settings.tavily_http_proxy,
     )
     try:
         memory_llm = None

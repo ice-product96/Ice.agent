@@ -180,6 +180,7 @@ class RuntimeSettingsBody(BaseModel):
     searxng_url: str | None = None
     tavily_api_key: str = ""
     clear_tavily_api_key: bool = False
+    tavily_http_proxy: str | None = None
     memory_enabled: bool = False
     memory_backend: Literal["local", "platform"] = "local"
     mem0_api_key: str = ""

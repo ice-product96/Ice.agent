@@ -1133,6 +1133,7 @@ def runtime_json(settings: RuntimeSettings, *, memory_error: str | None = None) 
         "searxng_url": settings.searxng_url,
         "has_tavily_api_key": bool(settings.tavily_api_key_ciphertext),
         "tavily_api_key_masked": masked_secret(settings.tavily_api_key_ciphertext),
+        "tavily_http_proxy": settings.tavily_http_proxy,
         "memory_enabled": settings.memory_enabled,
         "memory_backend": settings.memory_backend,
         "has_mem0_api_key": bool(settings.mem0_api_key_ciphertext),
@@ -1222,6 +1223,8 @@ async def update_runtime_configuration(
         setattr(settings, key, value)
     if isinstance(settings.qdrant_url, str):
         settings.qdrant_url = settings.qdrant_url.strip() or None
+    if isinstance(settings.tavily_http_proxy, str):
+        settings.tavily_http_proxy = settings.tavily_http_proxy.strip() or None
     if payload.clear_tavily_api_key:
         settings.tavily_api_key_ciphertext = None
     elif payload.tavily_api_key:
@@ -1248,6 +1251,7 @@ async def update_runtime_configuration(
         settings.search_provider,
         settings.searxng_url,
         secrets.decrypt(settings.tavily_api_key_ciphertext),
+        settings.tavily_http_proxy,
     )
     request.app.state.telegram.configure_runtime(settings)
     await request.app.state.memory.reconfigure(settings, secret, memory_llm)
