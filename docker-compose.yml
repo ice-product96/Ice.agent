@@ -44,17 +44,19 @@ services:
       - iceagent_net
 
   playwright:
+    # Official long-lived HTTP MCP service (streamable-http at /mcp).
     image: mcr.microsoft.com/playwright/mcp
     container_name: iceagent-playwright
     init: true
     shm_size: "1gb"
-    entrypoint: ["node", "cli.js"]
+    stdin_open: true
+    # Image ENTRYPOINT is node; pass /app/cli.js explicitly (cwd may not include it).
+    entrypoint: ["node", "/app/cli.js"]
     command:
       - "--headless"
       - "--browser"
       - "chromium"
       - "--no-sandbox"
-      - "--isolated"
       - "--port"
       - "8931"
       - "--host"

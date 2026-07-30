@@ -83,7 +83,10 @@ Qdrant в compose: `http://qdrant:6333` (имя сервиса внутри се
 
 Для чтения страниц по ссылкам из результатов поиска используйте Playwright MCP (ниже), а не веб-поиск.
 
-Playwright MCP поднимается вместе со стеком. В панели **MCP** добавьте сервер:
+Playwright MCP поднимается вместе со стеком. Если контейнер в `Restarting`, проверьте:
+`docker logs iceagent-playwright --tail 50` — entrypoint должен быть `node /app/cli.js`.
+
+В панели **MCP** добавьте сервер:
 
 - имя: `playwright`
 - транспорт: `streamable-http`
