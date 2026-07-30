@@ -75,6 +75,9 @@ def _participant_role(participant: Any) -> str:
     if "Left" in name:
         return "left"
     return "member"
+
+
+def telegram_datetime(value: Any) -> str | None:
     if not isinstance(value, datetime):
         return None
     if value.tzinfo is None:
