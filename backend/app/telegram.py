@@ -32,7 +32,49 @@ def telegram_json(value: Any) -> Any:
     return str(value)
 
 
-def telegram_datetime(value: Any) -> str | None:
+def normalize_contact_phone(value: str) -> str:
+    """Normalize a phone number for Telegram contact import."""
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("Phone number must not be empty")
+    has_plus = raw.startswith("+")
+    digits = "".join(char for char in raw if char.isdigit())
+    if raw.startswith("00") and digits.startswith("00"):
+        digits = digits[2:]
+        has_plus = True
+    if not digits:
+        raise ValueError("Phone number must contain digits")
+    # Common RU local form 8XXXXXXXXXX -> +7XXXXXXXXXX
+    if not has_plus and len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    return f"+{digits}"
+
+
+def _user_summary(user: Any) -> dict[str, Any]:
+    return {
+        "id": getattr(user, "id", None),
+        "username": getattr(user, "username", None),
+        "first_name": getattr(user, "first_name", None),
+        "last_name": getattr(user, "last_name", None),
+        "phone": getattr(user, "phone", None),
+        "bot": bool(getattr(user, "bot", False)),
+        "scam": bool(getattr(user, "scam", False)),
+        "fake": bool(getattr(user, "fake", False)),
+        "premium": bool(getattr(user, "premium", False)),
+    }
+
+
+def _participant_role(participant: Any) -> str:
+    name = type(participant).__name__
+    if "Creator" in name:
+        return "creator"
+    if "Admin" in name:
+        return "admin"
+    if "Banned" in name:
+        return "banned"
+    if "Left" in name:
+        return "left"
+    return "member"
     if not isinstance(value, datetime):
         return None
     if value.tzinfo is None:
@@ -59,12 +101,15 @@ class TelegramToolAdapter:
 
     allowed_methods = {
         "get_dialogs", "get_messages", "get_entity", "get_participants", "get_drafts",
+        "get_chat_full", "resolve_phone",
         "download_media", "send_read_acknowledge", "send_message", "send_file",
         "edit_message", "delete_messages", "forward_messages",
     }
     allowed_requests = {
         "JoinChannelRequest", "LeaveChannelRequest", "SendReactionRequest",
         "SaveDraftRequest", "UpdateStatusRequest",
+        "GetFullChannelRequest", "GetFullChatRequest",
+        "ImportContactsRequest", "DeleteContactsRequest",
     }
     dangerous_methods = {
         "send_message", "send_file", "edit_message", "delete_messages",
@@ -460,6 +505,164 @@ class TelegramGateway:
     async def get_entity(self, phone: str, entity: str | int) -> Any:
         return telegram_json(await self._get(phone).get_entity(entity))
 
+    async def get_chat_full(self, phone: str, entity: str | int) -> dict[str, Any]:
+        """Return full Telegram group/channel info (about, counts, link, admins when available)."""
+        from telethon.tl.functions.channels import GetFullChannelRequest
+        from telethon.tl.functions.messages import GetFullChatRequest
+        from telethon.tl.types import Channel, ChannelParticipantsAdmins, Chat, User
+
+        client = self._get(phone)
+        target = await client.get_entity(entity)
+        if isinstance(target, User):
+            return {
+                "kind": "user",
+                "entity": telegram_json(target),
+                "user": _user_summary(target),
+            }
+
+        admins: list[dict[str, Any]] = []
+        about = None
+        participants_count = None
+        online_count = None
+        invite_link = None
+        linked_chat_id = None
+        slowmode_seconds = None
+        can_view_participants = None
+
+        if isinstance(target, Channel):
+            full = await client(GetFullChannelRequest(channel=target))
+            full_chat = getattr(full, "full_chat", None)
+            about = getattr(full_chat, "about", None)
+            participants_count = getattr(full_chat, "participants_count", None)
+            online_count = getattr(full_chat, "online_count", None)
+            invite_link = getattr(full_chat, "exported_invite", None)
+            if invite_link is not None:
+                invite_link = getattr(invite_link, "link", None) or telegram_json(invite_link)
+            linked_chat_id = getattr(full_chat, "linked_chat_id", None)
+            slowmode_seconds = getattr(full_chat, "slowmode_seconds", None)
+            can_view_participants = bool(getattr(full_chat, "can_view_participants", False))
+            kind = "channel" if bool(getattr(target, "broadcast", False)) else "supergroup"
+            try:
+                admin_users = await client.get_participants(
+                    target, filter=ChannelParticipantsAdmins()
+                )
+                for user in admin_users:
+                    participant = getattr(user, "participant", None)
+                    admins.append(
+                        {
+                            **_user_summary(user),
+                            "role": _participant_role(participant) if participant else "admin",
+                            "rank": getattr(participant, "rank", None) if participant else None,
+                        }
+                    )
+            except Exception as exc:
+                admins = [{"error": str(exc)}]
+            return {
+                "kind": kind,
+                "id": getattr(target, "id", None),
+                "title": getattr(target, "title", None),
+                "username": getattr(target, "username", None),
+                "about": about,
+                "participants_count": participants_count,
+                "online_count": online_count,
+                "invite_link": invite_link,
+                "linked_chat_id": linked_chat_id,
+                "slowmode_seconds": slowmode_seconds,
+                "can_view_participants": can_view_participants,
+                "megagroup": bool(getattr(target, "megagroup", False)),
+                "broadcast": bool(getattr(target, "broadcast", False)),
+                "verified": bool(getattr(target, "verified", False)),
+                "restricted": bool(getattr(target, "restricted", False)),
+                "admins": admins,
+                "entity": telegram_json(target),
+            }
+
+        if isinstance(target, Chat):
+            full = await client(GetFullChatRequest(chat_id=target.id))
+            full_chat = getattr(full, "full_chat", None)
+            about = getattr(full_chat, "about", None)
+            participants = getattr(full_chat, "participants", None)
+            participant_rows = list(getattr(participants, "participants", []) or [])
+            users_by_id = {
+                getattr(user, "id", None): user
+                for user in (getattr(full, "users", None) or [])
+            }
+            for row in participant_rows:
+                role = _participant_role(row)
+                if role not in {"creator", "admin"}:
+                    continue
+                user_id = getattr(row, "user_id", None)
+                user = users_by_id.get(user_id)
+                admins.append(
+                    {
+                        **(_user_summary(user) if user else {"id": user_id}),
+                        "role": role,
+                        "rank": getattr(row, "rank", None),
+                    }
+                )
+            return {
+                "kind": "group",
+                "id": getattr(target, "id", None),
+                "title": getattr(target, "title", None),
+                "about": about,
+                "participants_count": getattr(target, "participants_count", None)
+                or len(participant_rows)
+                or None,
+                "admins": admins,
+                "entity": telegram_json(target),
+            }
+
+        return {
+            "kind": type(target).__name__.lower(),
+            "entity": telegram_json(target),
+        }
+
+    async def resolve_phone(
+        self,
+        phone: str,
+        contact_phone: str,
+        first_name: str = "Contact",
+        keep_contact: bool = False,
+    ) -> dict[str, Any]:
+        """Find a Telegram user by phone number (privacy-limited). Optionally keep them in contacts."""
+        from telethon.tl.functions.contacts import DeleteContactsRequest, ImportContactsRequest
+        from telethon.tl.types import InputPhoneContact
+
+        client = self._get(phone)
+        normalized = normalize_contact_phone(contact_phone)
+        contact = InputPhoneContact(
+            client_id=0,
+            phone=normalized,
+            first_name=(first_name or "Contact").strip() or "Contact",
+            last_name="",
+        )
+        result = await client(ImportContactsRequest([contact]))
+        users = list(getattr(result, "users", None) or [])
+        imported = list(getattr(result, "imported", None) or [])
+        retry = list(getattr(result, "retry_contacts", None) or [])
+        found = [_user_summary(user) for user in users]
+        if users and not keep_contact:
+            try:
+                await client(DeleteContactsRequest(id=users))
+            except Exception:
+                pass
+        return {
+            "ok": bool(found),
+            "query_phone": normalized,
+            "keep_contact": bool(keep_contact),
+            "users": found,
+            "imported_count": len(imported),
+            "retry_contacts": telegram_json(retry),
+            "note": (
+                None
+                if found
+                else (
+                    "No Telegram user matched this phone. The number may be unused, "
+                    "or privacy settings hide the account from phone search."
+                )
+            ),
+        }
+
     async def get_drafts(self, phone: str) -> Any:
         return telegram_json(await self._get(phone).get_drafts())
 
@@ -499,6 +702,7 @@ class TelegramGateway:
         operations = (
             "get_dialogs", "get_history", "get_conversation_history", "get_messages", "send_message", "send_file",
             "edit_message", "delete_messages", "delete_dialog", "forward_messages", "get_participants",
+            "get_chat_full", "resolve_phone",
             "join_channel", "leave_channel", "send_reaction", "acknowledge_read",
             "save_draft", "get_drafts", "download_media", "get_entity", "escalate",
         )

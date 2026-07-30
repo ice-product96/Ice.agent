@@ -79,6 +79,8 @@ def test_admin_action_report_only_for_side_effects() -> None:
 
     assert is_side_effect_tool("web_search") is False
     assert is_side_effect_tool("telegram_get_history") is False
+    assert is_side_effect_tool("telegram_get_chat_full") is False
+    assert is_side_effect_tool("telegram_resolve_phone") is True
     assert is_side_effect_tool("memory_add") is False
     assert is_side_effect_tool("ice_tracker_move_card") is True
     assert (
@@ -109,6 +111,23 @@ def test_admin_action_report_only_for_side_effects() -> None:
     assert "ice_tracker_move_card" in report
     assert "web_search" not in report
     assert "@client" in report
+
+
+def test_normalize_contact_phone_and_tool_registration() -> None:
+    from app.config import Settings
+    from app.telegram import TelegramGateway, normalize_contact_phone
+
+    assert normalize_contact_phone("+7 (900) 111-22-33") == "+79001112233"
+    assert normalize_contact_phone("89001112233") == "+79001112233"
+    assert normalize_contact_phone("0079001112233") == "+79001112233"
+    with pytest.raises(ValueError):
+        normalize_contact_phone("abc")
+
+    gateway = TelegramGateway(Settings())
+    names = set(gateway.tool_registry("+100").tools)
+    assert "telegram_get_chat_full" in names
+    assert "telegram_resolve_phone" in names
+
 
 
 @pytest.mark.asyncio
