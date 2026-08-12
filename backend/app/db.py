@@ -72,7 +72,7 @@ class Agent(TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     prompt: Mapped[str] = mapped_column(Text, default="")
     model_provider: Mapped[str] = mapped_column(String(32), default="openai")
-    model_name: Mapped[str] = mapped_column(String(120), default="gpt-5.5")
+    model_name: Mapped[str] = mapped_column(String(120), default="gpt-5.6-terra")
     llm_profile_id: Mapped[int | None] = mapped_column(
         ForeignKey("llm_profiles.id", ondelete="SET NULL")
     )

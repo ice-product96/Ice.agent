@@ -6,6 +6,7 @@ import {
   Sparkles, Trash2, Users, Wifi, WifiOff, X, Zap,
 } from 'lucide-react'
 import { api, openLiveSocket } from './api'
+import { agentModelPresets, profileModelPresets } from './llmModels'
 import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, RuntimeSettings,
@@ -254,7 +255,7 @@ function DashboardScreen({ go }: { go: (p: Page) => void }) {
 }
 
 const emptyAgent: Omit<Agent, 'id'> = {
-  name: '', description: '', prompt: '', model: '',
+  name: '', description: '', prompt: '', model: 'gpt-5.6-terra', provider: 'openai',
   tools: [], tool_permissions: [], links: [], typing_enabled: true, enabled: true,
 }
 function AgentsScreen() {
@@ -274,7 +275,7 @@ function AgentsScreen() {
         <div className="entity-top"><span className="entity-avatar"><Bot/></span><StatusDot status={agent.status || (agent.enabled && agent.llm_profile_id ? 'online' : agent.enabled ? 'pending' : 'paused')}/></div>
         <h3>{agent.name}</h3><p>{agent.description || 'Описание не указано.'}</p>
         <div className="binding-list"><span><KeyRound size={13}/>{profileName(agent.llm_profile_id)}</span><span><MessageCircle size={13}/>{telegramName(agent.telegram_account_id)}</span></div>
-        <div className="chip-row"><span className="chip">{agent.model || 'Без модели'}</span>{agent.tools.slice(0, 2).map(t => <span className="chip" key={t}>{toolDisplayName(t)}</span>)}</div>
+        <div className="chip-row"><span className="chip">{agent.provider || 'openai'}</span><span className="chip">{agent.model || 'Без модели'}</span>{agent.tools.slice(0, 2).map(t => <span className="chip" key={t}>{toolDisplayName(t)}</span>)}</div>
         <div className="entity-meta"><span><Link2 size={14}/>{agent.links.length} связей</span><span>{agent.typing_enabled ? 'Индикатор набора вкл.' : 'Индикатор набора выкл.'}</span></div>
         <div className="card-actions"><button className="secondary" onClick={() => setEditing(agent)}>Настроить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(agent)}><Trash2 size={17}/></button></div>
       </article>)}</div>}
@@ -303,6 +304,10 @@ function AgentForm({ value, agents, profiles, telegram, onClose, onSave }: { val
     typeof link === 'string' ? link : String(link.target_agent_id ?? link.agent_id ?? link.id)
   const linked = (id: string) => (form.links || []).some(link => linkTarget(link) === String(id))
   const patch = (v: Partial<Agent>) => setForm(f => ({ ...f, ...v }))
+  const provider = form.provider || 'openai'
+  const modelPresets = agentModelPresets(provider)
+  const modelPresetIds = modelPresets.map(item => item.id)
+  const modelSelectValue = modelPresetIds.includes(form.model || '') ? form.model! : '__custom__'
   async function submit(e: FormEvent) {
     e.preventDefault(); setBusy(true); setError('')
     try { await onSave(form) } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить агента'); setBusy(false) }
@@ -313,8 +318,33 @@ function AgentForm({ value, agents, profiles, telegram, onClose, onSave }: { val
       <div className="form-grid">
         <Field label="Имя"><input required value={form.name || ''} onChange={e => patch({ name: e.target.value })} placeholder="Исследовательский ассистент"/></Field>
         <Field label="Описание"><input value={form.description || ''} onChange={e => patch({ description: e.target.value })} placeholder="Чем занимается агент"/></Field>
-        <Field label="Профиль LLM" hint="Только включённые профили могут выполнять работу"><select value={form.llm_profile_id || ''} onChange={e => { const profile = profiles.find(p => String(p.id) === e.target.value); patch({ llm_profile_id: e.target.value || undefined, model: profile?.default_model || form.model || '' }) }}><option value="">Выберите профиль LLM</option>{profiles.map(p => <option value={p.id} key={p.id}>{p.name} · {p.provider}{p.enabled ? '' : ' (отключён)'}</option>)}</select></Field>
-        <Field label="Модель" hint="Редактируемое переопределение; выбор профиля подставит модель по умолчанию"><input required value={form.model || ''} onChange={e => patch({ model: e.target.value })} placeholder="Модель профиля по умолчанию"/></Field>
+        <Field label="Профиль LLM" hint="Только включённые профили могут выполнять работу"><select value={form.llm_profile_id || ''} onChange={e => {
+          const profile = profiles.find(p => String(p.id) === e.target.value)
+          const nextProvider = profile?.provider === 'deepseek' ? 'deepseek' : profile ? 'openai' : provider
+          const presets = agentModelPresets(nextProvider)
+          const nextModel = profile?.default_model || form.model || presets[0]?.id || ''
+          patch({
+            llm_profile_id: e.target.value || undefined,
+            provider: nextProvider,
+            model: presets.some(item => item.id === nextModel) ? nextModel : nextModel,
+          })
+        }}><option value="">Выберите профиль LLM</option>{profiles.map(p => <option value={p.id} key={p.id}>{p.name} · {p.provider}{p.enabled ? '' : ' (отключён)'}</option>)}</select></Field>
+        <Field label="Провайдер LLM" hint="Определяет эндпоинт и список моделей"><select value={provider} onChange={e => {
+          const nextProvider = e.target.value
+          const presets = agentModelPresets(nextProvider)
+          const nextModel = presets.some(item => item.id === form.model) ? form.model : presets[0]?.id || ''
+          patch({ provider: nextProvider, model: nextModel })
+        }}><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option></select></Field>
+        <Field label="Модель" hint="Переопределение модели агента; профиль LLM задаёт ключ и base URL">
+          <select value={modelSelectValue} onChange={e => {
+            const value = e.target.value
+            patch({ model: value === '__custom__' ? '' : value })
+          }}>
+            {modelPresets.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}
+            <option value="__custom__">Другая модель…</option>
+          </select>
+          {modelSelectValue === '__custom__' && <input required value={form.model || ''} onChange={e => patch({ model: e.target.value })} placeholder="gpt-5.6-terra" style={{ marginTop: '0.5rem' }}/>}
+        </Field>
         <Field label="Аккаунт Telegram" hint="Необязательная мессенджер-идентичность"><select value={form.telegram_account_id || ''} onChange={e => patch({ telegram_account_id: e.target.value || undefined })}><option value="">Без аккаунта Telegram</option>{telegram.map(a => <option value={a.id} key={a.id}>{a.name} · {a.phone}{a.readiness && a.readiness !== 'ready' ? ` (${a.readiness})` : ''}</option>)}</select></Field>
         <Field label="Системный промпт" wide><textarea required rows={7} value={form.prompt || ''} onChange={e => patch({ prompt: e.target.value })} placeholder="Вы полезный агент…"/></Field>
         <Field label="Инструменты" wide><div className="check-grid">{toolOptions.map(tool => <label className="check" key={tool}><input type="checkbox" checked={(form.tools || []).includes(tool)} onChange={() => patch({ tools: (form.tools || []).includes(tool) ? form.tools!.filter(t => t !== tool) : [...(form.tools || []), tool] })}/><span>{toolDisplayName(tool)}</span></label>)}</div></Field>
@@ -328,7 +358,7 @@ function AgentForm({ value, agents, profiles, telegram, onClose, onSave }: { val
   </Modal>
 }
 
-const emptyProfile: LlmProfileWrite = { name: '', provider: 'openai', base_url: 'https://api.openai.com/v1', default_model: '', enabled: true, api_key: '', http_proxy: '' }
+const emptyProfile: LlmProfileWrite = { name: '', provider: 'openai', base_url: 'https://api.openai.com/v1', default_model: 'gpt-5.6-terra', enabled: true, api_key: '', http_proxy: '' }
 function ConnectionsScreen() {
   const loaded = useLoad(api.llmProfiles.list, []); const profiles = loaded.data || []
   const [editing, setEditing] = useState<Partial<LlmProfile> | LlmProfileWrite | null>(null)
@@ -367,6 +397,9 @@ function LlmProfileForm({ value, onClose, onSave }: { value: Partial<LlmProfile>
   const [form, setForm] = useState<Partial<LlmProfileWrite>>({ name: value.name, provider: value.provider, base_url: value.base_url, default_model: value.default_model, enabled: value.enabled, http_proxy: value.http_proxy || '', api_key: '' })
   const [busy, setBusy] = useState(false); const [error, setError] = useState('')
   const patch = (p: Partial<LlmProfileWrite>) => setForm(f => ({ ...f, ...p }))
+  const profilePresets = profileModelPresets(form.provider)
+  const profilePresetIds = profilePresets.map(item => item.id)
+  const profileModelSelect = profilePresetIds.includes(form.default_model || '') ? form.default_model! : '__custom__'
   return <Modal title={id ? 'Изменение профиля LLM' : 'Новый профиль LLM'} subtitle="Ключи только для записи и не загружаются обратно в форму." onClose={onClose}><form onSubmit={async e => {
     e.preventDefault(); setBusy(true); setError('')
     const payload = { ...form, http_proxy: (form.http_proxy || '').trim() || null }; if (!payload.api_key) delete payload.api_key
@@ -374,9 +407,26 @@ function LlmProfileForm({ value, onClose, onSave }: { value: Partial<LlmProfile>
   }}>
     {error && <Alert message={error}/>}<div className="form-grid">
       <Field label="Имя профиля"><input required value={form.name || ''} onChange={e => patch({ name: e.target.value })} placeholder="Production OpenAI"/></Field>
-      <Field label="Провайдер"><select value={form.provider} onChange={e => patch({ provider: e.target.value as LlmProfileWrite['provider'] })}><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="custom-openai-compatible">Пользовательский / совместимый</option></select></Field>
+      <Field label="Провайдер"><select value={form.provider} onChange={e => {
+        const nextProvider = e.target.value as LlmProfileWrite['provider']
+        const presets = profileModelPresets(nextProvider)
+        const nextModel = presets.some(item => item.id === form.default_model) ? form.default_model : presets[0]?.id || form.default_model
+        const baseUrl = nextProvider === 'deepseek' ? 'https://api.deepseek.com' : nextProvider === 'openai' ? 'https://api.openai.com/v1' : form.base_url
+        patch({ provider: nextProvider, default_model: nextModel, base_url: baseUrl })
+      }}><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="custom-openai-compatible">Пользовательский / совместимый</option></select></Field>
       <Field label="Базовый URL" wide><input required type="url" value={form.base_url || ''} onChange={e => patch({ base_url: e.target.value })} placeholder="https://api.example.com/v1"/></Field>
-      <Field label="Модель по умолчанию"><input required value={form.default_model || ''} onChange={e => patch({ default_model: e.target.value })} placeholder="gpt-4o"/></Field>
+      <Field label="Модель по умолчанию">
+        {profilePresets.length > 0 ? <>
+          <select value={profileModelSelect} onChange={e => {
+            const value = e.target.value
+            patch({ default_model: value === '__custom__' ? '' : value })
+          }}>
+            {profilePresets.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}
+            <option value="__custom__">Другая модель…</option>
+          </select>
+          {profileModelSelect === '__custom__' && <input required value={form.default_model || ''} onChange={e => patch({ default_model: e.target.value })} placeholder="gpt-5.6-terra" style={{ marginTop: '0.5rem' }}/>}
+        </> : <input required value={form.default_model || ''} onChange={e => patch({ default_model: e.target.value })} placeholder="gpt-5.6-terra"/>}
+      </Field>
       <Field label={id ? 'Заменить API-ключ' : 'API-ключ'} hint={id ? 'Оставьте пустым, чтобы сохранить текущий ключ' : 'Хранится безопасно на сервере'}><input required={!id} autoComplete="new-password" type="password" value={form.api_key || ''} onChange={e => patch({ api_key: e.target.value })} placeholder={id ? 'Оставьте пустым для сохранения' : 'sk-…'}/></Field>
       <Field label="HTTP-прокси" hint="Необязательно. Пример: http://user:pass@host:8080 или http://host:3128" wide><input value={form.http_proxy || ''} onChange={e => patch({ http_proxy: e.target.value })} placeholder="http://127.0.0.1:8080" autoComplete="off"/></Field>
       <div className="toggle-box wide"><Toggle label="Профиль включён" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div>

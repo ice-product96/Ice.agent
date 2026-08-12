@@ -36,7 +36,7 @@ class AgentIn(BaseModel):
     name: str
     prompt: str = ""
     model_provider: Literal["openai", "deepseek"] = "openai"
-    model_name: str = "gpt-5.5"
+    model_name: str = "gpt-5.6-terra"
     llm_profile_id: int | None = None
     enabled: bool = True
     telegram_account_id: int | None = None
