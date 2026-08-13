@@ -58,6 +58,14 @@ def _host_port(value: str, default_port: int = 5060) -> tuple[str, int]:
     return value, default_port
 
 
+def _is_ipv4(host: str) -> bool:
+    try:
+        socket.inet_pton(socket.AF_INET, host)
+        return True
+    except OSError:
+        return False
+
+
 @dataclass
 class SipEndpointConfig:
     account_id: int
@@ -152,7 +160,10 @@ class RtpProtocol(asyncio.DatagramProtocol):
         header[11] = self.call.ssrc & 0xFF
         self.call.seq = (self.call.seq + 1) & 0xFFFF
         self.call.timestamp = (self.call.timestamp + SIP_FRAME_SAMPLES) & 0xFFFFFFFF
-        self.transport.sendto(bytes(header) + payload, (self.call.remote_rtp_host, self.call.remote_rtp_port))
+        dest = self.call.remote_rtp_host
+        if not _is_ipv4(dest):
+            return
+        self.transport.sendto(bytes(header) + payload, (dest, self.call.remote_rtp_port))
 
 
 class SipProtocol(asyncio.DatagramProtocol):
@@ -190,6 +201,9 @@ class SipUserAgent:
         self._proxy_host, self._proxy_port = (
             _host_port(config.sip_proxy, 5060) if config.sip_proxy else (self._server_host, self._server_port)
         )
+        # asyncio UDP sendto() needs a resolved IPv4 address, not a hostname
+        self._proxy_ip = self._proxy_host
+        self._resolved: dict[str, str] = {}
         self._cseq = 1
         self._call_id_reg = f"{random.randint(10**10, 10**12)}@{self.local_ip}"
         self._from_tag = f"{random.randint(10**6, 10**9)}"
@@ -203,13 +217,50 @@ class SipUserAgent:
     def auth_user(self) -> str:
         return self.config.auth_username or self.config.login
 
+    async def _resolve_ipv4(self, host: str) -> str:
+        if _is_ipv4(host):
+            return host
+        cached = self._resolved.get(host)
+        if cached:
+            return cached
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await loop.getaddrinfo(
+                host,
+                None,
+                family=socket.AF_INET,
+                type=socket.SOCK_DGRAM,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"DNS lookup failed for {host}: {exc}") from exc
+        if not infos:
+            raise RuntimeError(f"DNS lookup failed for {host}: no IPv4 address")
+        ip = str(infos[0][4][0])
+        self._resolved[host] = ip
+        logger.info("SIP DNS %s -> %s", host, ip)
+        return ip
+
+    def _udp_addr(self, addr: tuple[str, int] | None = None) -> tuple[str, int]:
+        host, port = addr if addr is not None else (self._proxy_ip, self._proxy_port)
+        if _is_ipv4(host):
+            return host, port
+        resolved = self._resolved.get(host)
+        if resolved:
+            return resolved, port
+        if host in {self._proxy_host, self._server_host}:
+            return self._proxy_ip, port
+        raise RuntimeError(
+            f"SIP UDP target {host!r} is not a resolved IPv4 address"
+        )
+
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
+        self._proxy_ip = await self._resolve_ipv4(self._proxy_host)
         # Discover outbound IP toward SIP server
         if not self.config.public_ip:
             try:
                 probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                probe.connect((self._proxy_host, self._proxy_port))
+                probe.connect((self._proxy_ip, self._proxy_port))
                 self.local_ip = probe.getsockname()[0]
                 probe.close()
             except Exception:
@@ -251,8 +302,7 @@ class SipUserAgent:
     def _send(self, message: str, addr: tuple[str, int] | None = None) -> None:
         if not self._transport:
             raise RuntimeError("SIP transport not started")
-        target = addr or (self._proxy_host, self._proxy_port)
-        self._transport.sendto(message.encode("utf-8"), target)
+        self._transport.sendto(message.encode("utf-8"), self._udp_addr(addr))
 
     def _allocate_rtp_port(self) -> int:
         if not self._rtp_ports:
@@ -567,6 +617,8 @@ class SipUserAgent:
         remote_number = number_match.group(1) if number_match else "unknown"
         rtp_port = self._allocate_rtp_port()
         remote_rtp_host, remote_rtp_port, codec = self._parse_sdp_media(body)
+        if remote_rtp_host and not _is_ipv4(remote_rtp_host):
+            remote_rtp_host = await self._resolve_ipv4(remote_rtp_host)
         local_tag = f"{random.randint(10**6, 10**9)}"
         to_header = headers.get("To", "")
         if ";tag=" not in to_header:
@@ -642,6 +694,8 @@ class SipUserAgent:
             call.to_header = headers.get("To", call.to_header)
             remote_rtp_host, remote_rtp_port, codec = self._parse_sdp_media(body)
             if remote_rtp_host:
+                if not _is_ipv4(remote_rtp_host):
+                    remote_rtp_host = await self._resolve_ipv4(remote_rtp_host)
                 call.remote_rtp_host = remote_rtp_host
                 call.remote_rtp_port = remote_rtp_port
                 call.codec = codec
@@ -696,7 +750,7 @@ class SipUserAgent:
             direction="outbound",
             remote_number=number,
             local_tag=local_tag,
-            remote_host=self._proxy_host,
+            remote_host=self._proxy_ip,
             remote_port=self._proxy_port,
             local_rtp_port=rtp_port,
             state="dialing",
@@ -723,7 +777,7 @@ class SipUserAgent:
             headers,
             body=sdp,
         )
-        await self._handle_outbound_response(call, status, resp_headers, resp_body, (self._proxy_host, self._proxy_port))
+        await self._handle_outbound_response(call, status, resp_headers, resp_body, (self._proxy_ip, self._proxy_port))
         if call.state == "failed":
             raise RuntimeError(f"Outbound call failed ({call.state})")
         return call
