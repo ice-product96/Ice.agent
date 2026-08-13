@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import ssl
 from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlparse
@@ -34,6 +35,22 @@ def _realtime_ws_url(base_url: str | None) -> str:
     parsed = urlparse(http_base)
     scheme = "wss" if parsed.scheme != "http" else "ws"
     return f"{scheme}://{parsed.netloc}{parsed.path}/realtime"
+
+
+async def _open_proxied_socket(ws_url: str, http_proxy: str):
+    """Open a TCP socket to the Realtime host via HTTP(S)/SOCKS proxy (python-socks).
+
+    SSL for wss:// is applied by websockets.connect(ssl=...).
+    """
+    from python_socks.async_.asyncio import Proxy
+
+    parsed = urlparse(ws_url)
+    host = parsed.hostname
+    if not host:
+        raise RuntimeError(f"Invalid Realtime WebSocket URL: {ws_url}")
+    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+    proxy = Proxy.from_url(http_proxy.strip())
+    return await proxy.connect(dest_host=host, dest_port=port)
 
 
 def build_session_config(
@@ -85,7 +102,7 @@ async def create_client_secret(
     }
     client_kwargs: dict[str, Any] = {"timeout": 30.0}
     if http_proxy:
-        client_kwargs["proxy"] = http_proxy
+        client_kwargs["proxy"] = http_proxy.strip()
     async with httpx.AsyncClient(**client_kwargs) as client:
         response = await client.post(url, headers=headers, json={"session": session})
         response.raise_for_status()
@@ -121,7 +138,7 @@ class RealtimeSession:
         self.instructions = instructions
         self.voice = voice
         self.model = model
-        self.http_proxy = http_proxy
+        self.http_proxy = (http_proxy or "").strip() or None
         self.on_transcript = on_transcript
         self.on_event = on_event
         self.playback = PlaybackBuffer()
@@ -149,12 +166,18 @@ class RealtimeSession:
         )
         ws_url = _realtime_ws_url(self.base_url)
         extra_headers = {"Authorization": f"Bearer {secret}"}
-        self._ws = await websockets.connect(
-            ws_url,
-            additional_headers=extra_headers,
-            max_size=8 * 1024 * 1024,
-            ping_interval=20,
-        )
+        connect_kwargs: dict[str, Any] = {
+            "additional_headers": extra_headers,
+            "max_size": 8 * 1024 * 1024,
+            "ping_interval": 20,
+        }
+        if self.http_proxy:
+            parsed_ws = urlparse(ws_url)
+            connect_kwargs["sock"] = await _open_proxied_socket(ws_url, self.http_proxy)
+            if parsed_ws.scheme == "wss":
+                connect_kwargs["ssl"] = ssl.create_default_context()
+                connect_kwargs["server_hostname"] = parsed_ws.hostname
+        self._ws = await websockets.connect(ws_url, **connect_kwargs)
         self._reader = asyncio.create_task(self._read_loop(), name="realtime-reader")
 
     async def close(self) -> None:
