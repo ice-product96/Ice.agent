@@ -35,11 +35,64 @@ def _quote(value: str) -> str:
     return f'"{value}"'
 
 
+_SIP_COMPACT = {
+    "i": "Call-ID",
+    "m": "Contact",
+    "e": "Content-Encoding",
+    "l": "Content-Length",
+    "c": "Content-Type",
+    "f": "From",
+    "s": "Subject",
+    "k": "Supported",
+    "t": "To",
+    "v": "Via",
+}
+_SIP_CANON = {
+    "via": "Via",
+    "from": "From",
+    "to": "To",
+    "call-id": "Call-ID",
+    "cseq": "CSeq",
+    "contact": "Contact",
+    "www-authenticate": "WWW-Authenticate",
+    "authorization": "Authorization",
+    "proxy-authenticate": "Proxy-Authenticate",
+    "proxy-authorization": "Proxy-Authorization",
+    "content-type": "Content-Type",
+    "content-length": "Content-Length",
+    "record-route": "Record-Route",
+    "route": "Route",
+    "allow": "Allow",
+    "expires": "Expires",
+    "user-agent": "User-Agent",
+    "max-forwards": "Max-Forwards",
+    "warning": "Warning",
+}
+
+
+def _sip_header_name(raw: str) -> str:
+    key = raw.strip()
+    compact = _SIP_COMPACT.get(key.lower())
+    if compact:
+        return compact
+    return _SIP_CANON.get(key.lower(), key)
+
+
+def _via_branch(via: str) -> str:
+    match = re.search(r'branch\s*=\s*"?([^;\s"]+)"?', via, re.I)
+    return match.group(1) if match else ""
+
+
 def _parse_www_authenticate(header: str) -> dict[str, str]:
     result: dict[str, str] = {}
     for match in re.finditer(r'(\w+)=(?:"([^"]*)"|([^,\s]+))', header):
-        result[match.group(1)] = match.group(2) if match.group(2) is not None else match.group(3)
+        result[match.group(1).lower()] = match.group(2) if match.group(2) is not None else match.group(3)
     return result
+
+
+def _exc_text(exc: BaseException) -> str:
+    message = str(exc).strip()
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
 def _sip_uri(user: str, host: str, port: int | None = None) -> str:
@@ -180,6 +233,8 @@ class SipProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         text = data.decode("utf-8", errors="ignore")
+        if not text.strip():
+            return
         asyncio.create_task(self.ua.handle_message(text, addr))
 
 
@@ -273,7 +328,6 @@ class SipUserAgent:
             self._transport, self._protocol = await loop.create_datagram_endpoint(
                 lambda: SipProtocol(self),
                 local_addr=("0.0.0.0", self.config.local_sip_port),
-                reuse_port=False,
             )
         except OSError:
             # port busy — ephemeral
@@ -306,7 +360,11 @@ class SipUserAgent:
     def _send(self, message: str, addr: tuple[str, int] | None = None) -> None:
         if not self._transport:
             raise RuntimeError("SIP transport not started")
-        self._transport.sendto(message.encode("utf-8"), self._udp_addr(addr))
+        dest = self._udp_addr(addr)
+        try:
+            self._transport.sendto(message.encode("utf-8"), dest)
+        except OSError as exc:
+            raise RuntimeError(f"SIP UDP send to {dest[0]}:{dest[1]} failed: {_exc_text(exc)}") from exc
 
     def _allocate_rtp_port(self) -> int:
         if not self._rtp_ports:
@@ -323,7 +381,8 @@ class SipUserAgent:
                 self._rtp_ports.add(port + 1)
 
     def _contact(self) -> str:
-        return f"<sip:{self.config.login}@{self.local_ip}:{self.config.local_sip_port}>"
+        transport = (self.config.transport or "udp").lower()
+        return f"<sip:{self.config.login}@{self.local_ip}:{self.config.local_sip_port};transport={transport}>"
 
     def _from(self) -> str:
         display = self.config.display_name or self.config.login
@@ -335,7 +394,7 @@ class SipUserAgent:
         nonce = challenge.get("nonce", "")
         qop = challenge.get("qop", "")
         opaque = challenge.get("opaque")
-        algorithm = challenge.get("algorithm", "MD5")
+        algorithm = challenge.get("algorithm") or "MD5"
         username = self.auth_user
         ha1 = _md5(username, realm, self.config.password)
         ha2 = _md5(method, uri)
@@ -387,22 +446,43 @@ class SipUserAgent:
         for key, value in headers.items():
             lines.append(f"{key}: {value}")
         message = "\r\n".join(lines) + "\r\n\r\n" + body
-        fut: asyncio.Future[tuple[int, dict[str, str], str]] = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[tuple[int, dict[str, str], str]] = loop.create_future()
         self._pending[branch] = fut
+        dest = self._udp_addr(addr)
+        logger.info("SIP TX %s %s -> %s:%s branch=%s", method, request_uri, dest[0], dest[1], branch)
         self._send(message, addr)
+        interval = 0.5
+        t2 = 4.0
+        started = loop.time()
+        timeout_total = 32.0
         try:
-            deadline = asyncio.get_running_loop().time() + 30
             while True:
-                remaining = deadline - asyncio.get_running_loop().time()
+                remaining = timeout_total - (loop.time() - started)
                 if remaining <= 0:
-                    raise TimeoutError(f"SIP {method} timed out")
-                status, resp_headers, resp_body = await asyncio.wait_for(fut, timeout=remaining)
+                    raise TimeoutError(
+                        f"SIP {method} timed out waiting for {dest[0]}:{dest[1]} "
+                        f"(no matching response in {int(timeout_total)}s)"
+                    )
+                try:
+                    status, resp_headers, resp_body = await asyncio.wait_for(
+                        asyncio.shield(fut),
+                        timeout=min(interval, remaining),
+                    )
+                except TimeoutError:
+                    logger.info("SIP %s retransmit -> %s:%s", method, dest[0], dest[1])
+                    self._send(message, addr)
+                    interval = min(interval * 2, t2)
+                    continue
                 if status < 200:
-                    # provisional — keep waiting for final on same branch
-                    fut = asyncio.get_running_loop().create_future()
+                    fut = loop.create_future()
                     self._pending[branch] = fut
                     continue
                 break
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"SIP {method} to {dest[0]}:{dest[1]} failed: {_exc_text(exc)}") from exc
         finally:
             self._pending.pop(branch, None)
         if auth_retry and status in {401, 407}:
@@ -410,9 +490,15 @@ class SipUserAgent:
             auth_hdr = "Authorization" if status == 401 else "Proxy-Authorization"
             challenge_raw = resp_headers.get(auth_key, "")
             challenge = _parse_www_authenticate(challenge_raw)
+            if not challenge.get("nonce"):
+                raise RuntimeError(
+                    f"SIP {method} got {status} without digest nonce from {dest[0]}:{dest[1]} "
+                    f"(header={challenge_raw[:180]!r})"
+                )
             headers[auth_hdr] = self._auth_header(method, request_uri, challenge)
             self._cseq += 1
             headers["CSeq"] = f"{self._cseq} {method}"
+            headers.pop("Via", None)
             return await self._request(method, request_uri, headers, body, addr, auth_retry=False)
         return status, resp_headers, resp_body
 
@@ -429,7 +515,15 @@ class SipUserAgent:
             "Expires": str(expires),
             "Allow": "INVITE, ACK, CANCEL, BYE, OPTIONS, INFO",
         }
-        status, _, _ = await self._request("REGISTER", request_uri, headers)
+        try:
+            status, resp_headers, resp_body = await self._request("REGISTER", request_uri, headers)
+        except Exception as exc:
+            self.registered = False
+            detail = str(exc).strip() or _exc_text(exc)
+            self.registration_status = f"error:{detail}"
+            if self.on_reg_state:
+                await self.on_reg_state(False, self.registration_status)
+            raise RuntimeError(detail) from exc
         if status in {200, 202}:
             self.registered = True
             self.registration_status = "registered"
@@ -439,10 +533,16 @@ class SipUserAgent:
                 self._reg_task = asyncio.create_task(self._reregister_loop(expires), name=f"sip-reg-{self.config.account_id}")
             return
         self.registered = False
+        reason = (resp_headers.get("Reason-Phrase") or "").strip()
+        warning = (resp_headers.get("Warning") or "").strip()
+        extra = warning or (resp_body.strip().replace("\n", " ")[:180] if resp_body.strip() else "")
+        detail = f"SIP REGISTER rejected ({status}{(' ' + reason) if reason else ''}) by {self._proxy_ip}:{self._proxy_port}"
+        if extra:
+            detail = f"{detail}: {extra}"
         self.registration_status = f"failed:{status}"
         if self.on_reg_state:
-            await self.on_reg_state(False, self.registration_status)
-        raise RuntimeError(f"SIP REGISTER failed with status {status}")
+            await self.on_reg_state(False, detail)
+        raise RuntimeError(detail)
 
     async def unregister(self) -> None:
         request_uri = f"sip:{self.config.domain}"
@@ -470,36 +570,62 @@ class SipUserAgent:
                 self.registration_status = f"error:{exc}"
 
     def _parse_message(self, text: str) -> tuple[str, dict[str, str], str]:
-        head, _, body = text.partition("\r\n\r\n")
-        lines = head.split("\r\n")
-        start = lines[0]
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        head, _, body = text.partition("\n\n")
+        raw_lines = head.split("\n")
+        lines: list[str] = []
+        for line in raw_lines:
+            if lines and (line.startswith(" ") or line.startswith("\t")):
+                lines[-1] += " " + line.strip()
+            elif line:
+                lines.append(line)
+        start = lines[0] if lines else ""
         headers: dict[str, str] = {}
         for line in lines[1:]:
             if ":" not in line:
                 continue
             key, value = line.split(":", 1)
-            headers[key.strip()] = value.strip()
+            name = _sip_header_name(key)
+            if name not in headers:
+                headers[name] = value.strip()
         return start, headers, body
+
+    def _complete_pending(self, branch: str, result: tuple[int, dict[str, str], str]) -> None:
+        fut = self._pending.get(branch)
+        if fut is None or fut.done():
+            pending = [item for item in self._pending.values() if not item.done()]
+            if len(pending) == 1:
+                fut = pending[0]
+            else:
+                if branch:
+                    logger.debug("SIP unmatched response branch=%s pending=%s", branch, list(self._pending))
+                return
+        if not fut.done():
+            fut.set_result(result)
 
     async def handle_message(self, text: str, addr: tuple[str, int]) -> None:
         start, headers, body = self._parse_message(text)
         via = headers.get("Via", "")
-        branch_match = re.search(r"branch=([^;]+)", via)
-        branch = branch_match.group(1) if branch_match else ""
+        branch = _via_branch(via)
+        logger.info("SIP RX %s from %s:%s branch=%s", start[:80], addr[0], addr[1], branch or "-")
 
-        if start.startswith("SIP/2.0"):
-            status = int(start.split()[1])
-            fut = self._pending.get(branch)
-            if fut and not fut.done():
-                fut.set_result((status, headers, body))
-            # provisional / final for outbound calls
+        if start.upper().startswith("SIP/2.0"):
+            parts = start.split(None, 2)
+            try:
+                status = int(parts[1])
+            except (IndexError, ValueError):
+                logger.warning("SIP bad status line from %s: %r", addr, start)
+                return
+            if len(parts) > 2:
+                headers["Reason-Phrase"] = parts[2]
+            self._complete_pending(branch, (status, headers, body))
             call_id = headers.get("Call-ID", "")
             call = self.calls.get(call_id)
             if call and call.direction == "outbound":
                 await self._handle_outbound_response(call, status, headers, body, addr)
             return
 
-        method = start.split()[0].upper()
+        method = start.split()[0].upper() if start else ""
         if method == "INVITE":
             await self._handle_invite(start, headers, body, addr)
         elif method == "ACK":

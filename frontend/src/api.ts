@@ -27,12 +27,15 @@ async function readBody(response: Response): Promise<unknown> {
 }
 
 function errorMessage(status: number, details: unknown): string {
-  if (typeof details === 'string' && details.trim()) return details.trim().slice(0, 300)
+  if (typeof details === 'string' && details.trim()) return details.trim().slice(0, 400)
   if (typeof details === 'object' && details && 'detail' in details) {
     const detail = (details as { detail: unknown }).detail
-    if (typeof detail === 'string') return detail
+    if (typeof detail === 'string') {
+      const text = detail.replace(/:\s*$/, '').trim()
+      if (text) return text.slice(0, 400)
+    }
     if (Array.isArray(detail)) return detail.map(item => typeof item === 'object' && item && 'msg' in item ? String((item as { msg: unknown }).msg) : String(item)).join('; ')
-    return String(detail)
+    if (detail != null) return String(detail)
   }
   return `Ошибка запроса (${status})`
 }

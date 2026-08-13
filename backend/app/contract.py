@@ -991,7 +991,8 @@ async def register_sip_account(
     try:
         await sip.register_account(account)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"SIP register failed: {exc}") from exc
+        detail = str(exc).strip() or exception_text(exc)
+        raise HTTPException(status_code=503, detail=f"SIP register failed: {detail}") from exc
     return sip_json(account, request)
 
 

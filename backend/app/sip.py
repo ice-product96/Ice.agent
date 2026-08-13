@@ -11,6 +11,7 @@ from sqlalchemy import select
 from .config import Settings
 from .db import Agent, LlmProfile, SessionLocal, SipAccount, SipCall, utcnow
 from .events import EventHub
+from .integrations import exception_text
 from .realtime_bridge import RealtimeSession
 from .secrets import SecretStore
 from .sip_ua import ActiveCall, SipEndpointConfig, SipUserAgent
@@ -80,14 +81,16 @@ class SipGateway:
                 results[account.id] = "registered"
             except Exception as exc:
                 logger.exception("SIP restore failed for %s", account.login)
-                results[account.id] = f"error:{exc}"
+                detail = exception_text(exc)
+                results[account.id] = f"error:{detail}"
                 self._reg_status[account.id] = {
                     "registered": False,
-                    "status": f"error:{exc}",
+                    "status": f"error:{detail}",
+                    "error": detail,
                 }
                 await self.events.publish(
                     "sip.register_failed",
-                    {"account_id": account.id, "error": str(exc)},
+                    {"account_id": account.id, "error": detail},
                 )
         return results
 
@@ -142,14 +145,15 @@ class SipGateway:
                     await ua.close()
                 except Exception:
                     pass
+                detail = str(exc).strip() or exception_text(exc)
                 self._reg_status[account.id] = {
                     "registered": False,
-                    "status": f"error:{exc}",
-                    "error": str(exc),
+                    "status": f"error:{detail}",
+                    "error": detail,
                 }
                 await self.events.publish(
                     "sip.register_failed",
-                    {"account_id": account.id, "error": str(exc)},
+                    {"account_id": account.id, "error": detail},
                 )
                 raise
             self._agents[account.id] = ua
@@ -185,7 +189,11 @@ class SipGateway:
         self._realtime.clear()
 
     async def _on_reg(self, account_id: int, ok: bool, status: str) -> None:
-        self._reg_status[account_id] = {"registered": ok, "status": status}
+        self._reg_status[account_id] = {
+            "registered": ok,
+            "status": status,
+            "error": None if ok else status,
+        }
         await self.events.publish(
             "sip.registration",
             {"account_id": account_id, "registered": ok, "status": status},
