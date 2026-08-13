@@ -361,6 +361,7 @@ function AgentForm({ value, agents, profiles, telegram, sip, onClose, onSave }: 
         <Field label="SIP-аккаунт" hint="Для входящих/исходящих голосовых звонков через OpenAI Realtime"><select value={form.sip_account_id || ''} onChange={e => patch({ sip_account_id: e.target.value || undefined })}><option value="">Без SIP</option>{sip.map(a => <option value={a.id} key={a.id}>{a.name} · {a.login}{a.registered ? ' (reg)' : ''}</option>)}</select></Field>
         <Field label="Realtime voice" hint="Голос OpenAI Realtime на звонках"><input value={form.realtime_voice || 'marin'} onChange={e => patch({ realtime_voice: e.target.value })} placeholder="marin"/></Field>
         <Field label="Realtime model" hint="Модель Realtime-сессии. HTTP-прокси берётся из профиля LLM агента (Подключения)."><input value={form.realtime_model || 'gpt-realtime'} onChange={e => patch({ realtime_model: e.target.value })} placeholder="gpt-realtime"/></Field>
+        <Field label="Приветствие на входящем" hint="На входящем звонке агент говорит первым. Пусто — короткое «поздоровайся и представься»." wide><textarea rows={3} value={form.inbound_greeting || ''} onChange={e => patch({ inbound_greeting: e.target.value })} placeholder="Здравствуйте, меня зовут … Чем могу помочь?"/></Field>
         <Field label="Системный промпт" wide><textarea required rows={7} value={form.prompt || ''} onChange={e => patch({ prompt: e.target.value })} placeholder="Вы полезный агент…"/></Field>
         <Field label="Инструменты" wide><div className="check-grid">{toolOptions.map(tool => <label className="check" key={tool}><input type="checkbox" checked={(form.tools || []).includes(tool)} onChange={() => patch({ tools: (form.tools || []).includes(tool) ? form.tools!.filter(t => t !== tool) : [...(form.tools || []), tool] })}/><span>{toolDisplayName(tool)}</span></label>)}</div></Field>
         <Field label="Опасные действия" hint="Отправка сообщений и вступление в каналы уже входят в инструмент Telegram. Здесь — только необратимые операции." wide><div className="check-grid">{permissionOptions.map(([permission, label]) => <label className="check" key={permission}><input type="checkbox" checked={(form.tool_permissions || []).includes(permission)} onChange={() => patch({ tool_permissions: (form.tool_permissions || []).includes(permission) ? form.tool_permissions!.filter(item => item !== permission) : [...(form.tool_permissions || []), permission] })}/><span>{label}</span></label>)}</div></Field>
@@ -452,7 +453,7 @@ function LlmProfileForm({ value, onClose, onSave }: { value: Partial<LlmProfile>
 const emptySip: Partial<SipAccount> & { password?: string } = {
   name: '', sip_server: 'voice.telphin.com:5068', domain: 'sip.telphin.com', login: '',
   auth_username: '', transport: 'udp', display_name: '', enabled: true, register_on_startup: true,
-  max_concurrent_calls: 1, password: '',
+  max_concurrent_calls: 1, ring_delay_seconds: 4, password: '',
 }
 
 function SipScreen() {
@@ -559,6 +560,7 @@ function SipAccountForm({ value, onClose, onSave }: {
         <Field label="Public IP" hint="IP в SDP за NAT"><input value={form.public_ip || ''} onChange={e => patch({ public_ip: e.target.value })} placeholder="192.168.10.64"/></Field>
         <Field label="STUN"><input value={form.stun_server || ''} onChange={e => patch({ stun_server: e.target.value })}/></Field>
         <Field label="Макс. параллельных звонков"><input type="number" min={1} max={32} value={form.max_concurrent_calls ?? 1} onChange={e => patch({ max_concurrent_calls: Number(e.target.value) || 1 })}/></Field>
+        <Field label="Гудок до ответа, сек" hint="Сколько секунд абонент слышит гудок (180 Ringing), прежде чем агент возьмёт трубку. 0 — сразу."><input type="number" min={0} max={30} step={0.5} value={form.ring_delay_seconds ?? 4} onChange={e => patch({ ring_delay_seconds: Number(e.target.value) })}/></Field>
         <div className="toggle-box"><Toggle label="Включён" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div>
         <div className="toggle-box"><Toggle label="REGISTER при старте" checked={form.register_on_startup ?? true} onChange={v => patch({ register_on_startup: v })}/></div>
       </div>

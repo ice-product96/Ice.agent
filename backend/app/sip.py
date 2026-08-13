@@ -17,6 +17,20 @@ from .sip_ua import ActiveCall, SipEndpointConfig, SipUserAgent
 
 logger = logging.getLogger(__name__)
 
+INBOUND_GREETING_INSTRUCTION = (
+    "Это входящий телефонный звонок. Сразу после соединения коротко поздоровайся "
+    "и представься, не жди, пока абонент заговорит первым."
+)
+DEFAULT_INBOUND_GREETING = "Поздоровайся коротко и представься."
+
+
+def _ring_delay_seconds(account_value: Any, fallback: float | None) -> float:
+    if account_value is not None:
+        return max(0.0, float(account_value))
+    if fallback is not None:
+        return max(0.0, float(fallback))
+    return 4.0
+
 
 class SipGateway:
     def __init__(self, settings: Settings, events: EventHub) -> None:
@@ -105,6 +119,10 @@ class SipGateway:
                 stun_server=account.stun_server or self.settings.sip_stun_server or None,
                 public_ip=account.public_ip or self.settings.sip_public_ip or None,
                 max_concurrent_calls=max(1, account.max_concurrent_calls or 1),
+                ring_delay_seconds=_ring_delay_seconds(
+                    getattr(account, "ring_delay_seconds", None),
+                    self.settings.sip_ring_delay_seconds,
+                ),
                 local_sip_port=local_port,
                 rtp_port_min=self.settings.sip_rtp_port_min,
                 rtp_port_max=self.settings.sip_rtp_port_max,
@@ -286,6 +304,8 @@ class SipGateway:
         self,
         agent: Agent,
         sip_call_id_ref: list[str],
+        *,
+        inbound: bool = False,
     ) -> RealtimeSession:
         if agent.llm_profile_id is None:
             raise RuntimeError("Agent has no LLM profile for Realtime")
@@ -301,11 +321,17 @@ class SipGateway:
         config = agent.config or {}
         voice = str(config.get("realtime_voice") or "marin")
         model = str(config.get("realtime_model") or "gpt-realtime")
+        instructions = agent.prompt or "You are a helpful voice agent on a phone call."
+        if inbound:
+            extra = str(config.get("inbound_greeting") or "").strip()
+            instructions = (
+                f"{instructions}\n\n{INBOUND_GREETING_INSTRUCTION}"
+                + (f"\nФормулировка приветствия: {extra}" if extra else "")
+            )
 
         async def on_transcript(role: str, text: str) -> None:
             sip_call_id = sip_call_id_ref[0] if sip_call_id_ref else None
             if not sip_call_id:
-                # resolve by matching session identity later
                 for key, value in self._realtime.items():
                     if value is session:
                         sip_call_id = key
@@ -328,7 +354,7 @@ class SipGateway:
         session = RealtimeSession(
             api_key=api_key,
             base_url=base_url,
-            instructions=agent.prompt or "You are a helpful voice agent on a phone call.",
+            instructions=instructions,
             voice=voice,
             model=model,
             http_proxy=http_proxy,
@@ -336,25 +362,43 @@ class SipGateway:
         )
         return session
 
-    async def _start_realtime(self, agent: Agent, call: ActiveCall) -> RealtimeSession:
+    async def _start_realtime(
+        self,
+        agent: Agent,
+        call: ActiveCall,
+        *,
+        inbound: bool = False,
+    ) -> RealtimeSession:
         sip_ref = [call.call_id]
-        session = await self._build_realtime_session(agent, sip_ref)
+        session = await self._build_realtime_session(agent, sip_ref, inbound=inbound)
         await session.connect()
         self._realtime[call.call_id] = session
         call.on_rtp = session.send_pcm24
         call.playback_provider = session.read_playback_frame
+        if inbound:
+            greeting = str((agent.config or {}).get("inbound_greeting") or "").strip()
+            await session.request_response(greeting or DEFAULT_INBOUND_GREETING)
         return session
 
     async def _on_incoming(self, account_id: int, call: ActiveCall) -> None:
         agent = await self._resolve_agent(account_id)
-        db_id = await self._create_db_call(
-            agent_id=agent.id if agent else None,
-            sip_account_id=account_id,
-            direction="inbound",
-            remote_number=call.remote_number,
-            status="answered",
-            sip_call_id=call.call_id,
-        )
+        if call.call_id in self._call_map:
+            await self._update_db_call(
+                call.call_id,
+                status="answered",
+                answered_at=utcnow(),
+                agent_id=agent.id if agent else None,
+            )
+            db_id = self._call_map[call.call_id]
+        else:
+            db_id = await self._create_db_call(
+                agent_id=agent.id if agent else None,
+                sip_account_id=account_id,
+                direction="inbound",
+                remote_number=call.remote_number,
+                status="answered",
+                sip_call_id=call.call_id,
+            )
         await self.events.publish(
             "sip.call.started",
             {
@@ -370,7 +414,7 @@ class SipGateway:
             logger.warning("Inbound SIP call on account %s with no agent", account_id)
             return
         try:
-            await self._start_realtime(agent, call)
+            await self._start_realtime(agent, call, inbound=True)
         except Exception as exc:
             logger.exception("Realtime start failed for inbound call")
             await self._update_db_call(call.call_id, status="failed", hangup_cause=str(exc))
@@ -384,6 +428,16 @@ class SipGateway:
         if status == "answered":
             fields = {"status": "answered", "answered_at": utcnow()}
         elif status == "ringing":
+            if sip_call_id not in self._call_map:
+                agent = await self._resolve_agent(account_id)
+                await self._create_db_call(
+                    agent_id=agent.id if agent else None,
+                    sip_account_id=account_id,
+                    direction=str(payload.get("direction") or "inbound"),
+                    remote_number=str(payload.get("remote_number") or ""),
+                    status="ringing",
+                    sip_call_id=sip_call_id,
+                )
             fields = {"status": "ringing"}
         elif status == "failed":
             fields = {"status": "failed", "ended_at": utcnow(), "hangup_cause": str(payload.get("code") or "failed")}

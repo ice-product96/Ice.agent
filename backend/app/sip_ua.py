@@ -81,6 +81,7 @@ class SipEndpointConfig:
     stun_server: str | None = None
     public_ip: str | None = None
     max_concurrent_calls: int = 1
+    ring_delay_seconds: float = 4.0
     local_sip_port: int = 5060
     rtp_port_min: int = 10000
     rtp_port_max: int = 10199
@@ -110,6 +111,9 @@ class ActiveCall:
     media_task: asyncio.Task[None] | None = None
     on_rtp: OnRtpPcm24 | None = None
     playback_provider: Callable[[], bytes] | None = None
+    invite_headers: dict[str, str] = field(default_factory=dict)
+    invite_addr: tuple[str, int] | None = None
+    cancelled: asyncio.Event | None = None
     seq: int = field(default_factory=lambda: random.randint(1, 0xFFFF))
     timestamp: int = field(default_factory=lambda: random.randint(1, 0xFFFFFFFF))
     ssrc: int = field(default_factory=lambda: random.randint(1, 0xFFFFFFFF))
@@ -501,6 +505,8 @@ class SipUserAgent:
         elif method == "ACK":
             call_id = headers.get("Call-ID", "")
             call = self.calls.get(call_id)
+            if call is not None and call.state == "ringing":
+                return
             if call:
                 call.state = "answered"
                 if self.on_call_state:
@@ -608,10 +614,14 @@ class SipUserAgent:
         body: str,
         addr: tuple[str, int],
     ) -> None:
+        call_id = headers.get("Call-ID", f"in-{random.randint(10**8, 10**12)}")
+        existing = self.calls.get(call_id)
+        if existing is not None:
+            self._retransmit_invite_response(existing, headers, addr)
+            return
         if len([c for c in self.calls.values() if c.state in {"ringing", "answered", "early", "dialing"}]) >= self.config.max_concurrent_calls:
             self._reply(486, "Busy Here", headers, addr)
             return
-        call_id = headers.get("Call-ID", f"in-{random.randint(10**8, 10**12)}")
         remote = headers.get("From", "")
         number_match = re.search(r"sip:([^@>;]+)", remote)
         remote_number = number_match.group(1) if number_match else "unknown"
@@ -641,18 +651,76 @@ class SipUserAgent:
             from_header=headers.get("From", ""),
             to_header=to_header,
             contact=headers.get("Contact", ""),
+            invite_headers=dict(headers),
+            invite_addr=addr,
+            cancelled=asyncio.Event(),
         )
         self.calls[call_id] = call
-        self._reply(100, "Trying", headers, addr)
+        self._reply(100, "Trying", headers, addr, extra={"To": to_header})
         self._reply(180, "Ringing", headers, addr, extra={"To": to_header})
-        sdp = self._local_sdp(rtp_port, codec)
+        if self.on_call_state:
+            await self.on_call_state(
+                call.call_id,
+                {"status": "ringing", "direction": "inbound", "remote_number": remote_number},
+            )
+        asyncio.create_task(self._answer_after_ring(call), name=f"sip-ring-{call_id[:16]}")
+
+    def _retransmit_invite_response(
+        self,
+        call: ActiveCall,
+        headers: dict[str, str],
+        addr: tuple[str, int],
+    ) -> None:
+        if call.state == "ringing":
+            self._reply(100, "Trying", headers, addr, extra={"To": call.to_header})
+            self._reply(180, "Ringing", headers, addr, extra={"To": call.to_header})
+            return
+        if call.state == "answered":
+            sdp = self._local_sdp(call.local_rtp_port, call.codec)
+            self._reply(
+                200,
+                "OK",
+                headers,
+                addr,
+                extra={
+                    "To": call.to_header,
+                    "Content-Type": "application/sdp",
+                    "Content-Length": str(len(sdp.encode("utf-8"))),
+                },
+                body=sdp,
+            )
+
+    async def _answer_after_ring(self, call: ActiveCall) -> None:
+        try:
+            await self._answer_after_ring_inner(call)
+        except Exception:
+            logger.exception("inbound answer failed for %s", call.call_id)
+
+    async def _answer_after_ring_inner(self, call: ActiveCall) -> None:
+        delay = max(0.0, float(self.config.ring_delay_seconds if self.config.ring_delay_seconds is not None else 0))
+        if delay > 0 and call.cancelled is not None:
+            try:
+                await asyncio.wait_for(call.cancelled.wait(), timeout=delay)
+            except TimeoutError:
+                pass
+            else:
+                return
+        if call.call_id not in self.calls or call.state != "ringing":
+            return
+        if call.cancelled is not None and call.cancelled.is_set():
+            return
+        headers = call.invite_headers
+        addr = call.invite_addr
+        if not headers or addr is None:
+            return
+        sdp = self._local_sdp(call.local_rtp_port, call.codec)
         self._reply(
             200,
             "OK",
             headers,
             addr,
             extra={
-                "To": to_header,
+                "To": call.to_header,
                 "Content-Type": "application/sdp",
                 "Content-Length": str(len(sdp.encode("utf-8"))),
             },
@@ -673,6 +741,12 @@ class SipUserAgent:
     async def _handle_cancel(self, headers: dict[str, str], addr: tuple[str, int]) -> None:
         call_id = headers.get("Call-ID", "")
         self._reply(200, "OK", headers, addr)
+        call = self.calls.get(call_id)
+        if call is not None:
+            if call.cancelled is not None and not call.cancelled.is_set():
+                call.cancelled.set()
+            if call.invite_headers and call.invite_addr and call.state == "ringing":
+                self._reply(487, "Request Terminated", call.invite_headers, call.invite_addr, extra={"To": call.to_header})
         await self.hangup(call_id, cause="cancelled", send_bye=False)
 
     async def _handle_outbound_response(
@@ -786,6 +860,8 @@ class SipUserAgent:
         call = self.calls.pop(call_id, None)
         if call is None:
             return
+        if call.cancelled is not None and not call.cancelled.is_set():
+            call.cancelled.set()
         call.state = "ended"
         if call.media_task:
             call.media_task.cancel()

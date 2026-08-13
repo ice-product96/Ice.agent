@@ -23,6 +23,7 @@ export interface Agent {
   tool_permissions?: string[]
   realtime_voice?: string
   realtime_model?: string
+  inbound_greeting?: string
   links: AgentLinkRef[]
   typing_enabled: boolean
   enabled: boolean
@@ -48,6 +49,7 @@ export interface SipAccount {
   enabled: boolean
   register_on_startup: boolean
   max_concurrent_calls: number
+  ring_delay_seconds?: number
   registered?: boolean
   registration_status?: string
   last_error?: string | null

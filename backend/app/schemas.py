@@ -73,6 +73,7 @@ class SipAccountIn(BaseModel):
     enabled: bool = True
     register_on_startup: bool = True
     max_concurrent_calls: int = Field(1, ge=1, le=32)
+    ring_delay_seconds: float = Field(4.0, ge=0, le=30)
 
 
 class SipAccountOut(ORMModel):
@@ -91,6 +92,7 @@ class SipAccountOut(ORMModel):
     enabled: bool
     register_on_startup: bool
     max_concurrent_calls: int
+    ring_delay_seconds: float = 4.0
     has_password: bool
     registered: bool = False
     registration_status: str = "unknown"

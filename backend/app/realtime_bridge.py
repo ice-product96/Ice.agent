@@ -145,6 +145,7 @@ class RealtimeSession:
         self._ws: ClientConnection | None = None
         self._reader: asyncio.Task[None] | None = None
         self._closed = asyncio.Event()
+        self._session_ready = asyncio.Event()
         self._user_parts: list[str] = []
         self._assistant_parts: list[str] = []
 
@@ -179,6 +180,25 @@ class RealtimeSession:
                 connect_kwargs["server_hostname"] = parsed_ws.hostname
         self._ws = await websockets.connect(ws_url, **connect_kwargs)
         self._reader = asyncio.create_task(self._read_loop(), name="realtime-reader")
+        try:
+            await asyncio.wait_for(self._session_ready.wait(), timeout=8)
+        except TimeoutError:
+            logger.warning("Realtime session.created timed out, greeting may fail")
+
+    async def request_response(self, instructions: str | None = None) -> None:
+        """Ask the model to speak immediately (incoming-call greeting)."""
+        if self._ws is None or self.closed:
+            return
+        if not self._session_ready.is_set():
+            try:
+                await asyncio.wait_for(self._session_ready.wait(), timeout=5)
+            except TimeoutError:
+                logger.warning("Realtime not ready for response.create")
+                return
+        event: dict[str, Any] = {"type": "response.create"}
+        if instructions:
+            event["response"] = {"instructions": instructions}
+        await self._ws.send(json.dumps(event))
 
     async def close(self) -> None:
         self._closed.set()
@@ -243,6 +263,8 @@ class RealtimeSession:
 
     async def _handle_event(self, event: dict[str, Any]) -> None:
         etype = str(event.get("type") or "")
+        if etype in {"session.created", "session.updated"}:
+            self._session_ready.set()
         if self.on_event:
             try:
                 await self.on_event(event)

@@ -72,6 +72,7 @@ class AgentBody(BaseModel):
     status: str | None = None
     realtime_voice: str | None = None
     realtime_model: str | None = None
+    inbound_greeting: str | None = None
 
 
 class SipAccountBody(BaseModel):
@@ -92,6 +93,7 @@ class SipAccountBody(BaseModel):
     enabled: bool = True
     register_on_startup: bool = True
     max_concurrent_calls: int = 1
+    ring_delay_seconds: float = 4.0
 
 
 class SipDialBody(BaseModel):
@@ -422,6 +424,7 @@ async def agent_json(db: AsyncSession, agent: Agent) -> dict[str, Any]:
         "tool_permissions": config.get("tool_permissions", []),
         "realtime_voice": config.get("realtime_voice", "marin"),
         "realtime_model": config.get("realtime_model", "gpt-realtime"),
+        "inbound_greeting": config.get("inbound_greeting", ""),
         "links": [
             {
                 "id": link.id,
@@ -494,6 +497,8 @@ def apply_agent(agent: Agent, payload: AgentBody) -> None:
         config["realtime_voice"] = payload.realtime_voice
     if payload.realtime_model is not None:
         config["realtime_model"] = payload.realtime_model
+    if payload.inbound_greeting is not None:
+        config["inbound_greeting"] = payload.inbound_greeting
     agent.config = config
 
 
@@ -850,6 +855,11 @@ def sip_json(account: SipAccount, request: Request | None = None) -> dict[str, A
         "enabled": account.enabled,
         "register_on_startup": account.register_on_startup,
         "max_concurrent_calls": account.max_concurrent_calls,
+        "ring_delay_seconds": (
+            4.0
+            if getattr(account, "ring_delay_seconds", None) is None
+            else float(account.ring_delay_seconds)
+        ),
         "registered": registered,
         "registration_status": registration_status,
         "last_error": last_error,
@@ -913,6 +923,7 @@ async def create_sip_account(
         enabled=payload.enabled,
         register_on_startup=payload.register_on_startup,
         max_concurrent_calls=max(1, payload.max_concurrent_calls),
+        ring_delay_seconds=max(0.0, min(30.0, float(payload.ring_delay_seconds))),
     )
     db.add(account)
     await db.commit()
@@ -948,6 +959,7 @@ async def update_sip_account(
     account.enabled = payload.enabled
     account.register_on_startup = payload.register_on_startup
     account.max_concurrent_calls = max(1, payload.max_concurrent_calls)
+    account.ring_delay_seconds = max(0.0, min(30.0, float(payload.ring_delay_seconds)))
     if payload.clear_password:
         account.password_ciphertext = None
     elif payload.password:

@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     sip_rtp_port_max: int = 10199
     sip_stun_server: str = ""
     sip_public_ip: str = ""
+    sip_ring_delay_seconds: float = 4.0
 
     @property
     def admin_ids(self) -> set[int]:

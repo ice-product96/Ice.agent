@@ -84,6 +84,7 @@ class SipAccount(TimestampMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     register_on_startup: Mapped[bool] = mapped_column(Boolean, default=True)
     max_concurrent_calls: Mapped[int] = mapped_column(Integer, default=1)
+    ring_delay_seconds: Mapped[float] = mapped_column(Float, default=4.0)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     agents: Mapped[list["Agent"]] = relationship(back_populates="sip_account")
 
@@ -301,6 +302,7 @@ async def create_schema() -> None:
             "ALTER TABLE runtime_settings ADD COLUMN IF NOT EXISTS tavily_api_key_ciphertext TEXT",
             "ALTER TABLE runtime_settings ADD COLUMN IF NOT EXISTS tavily_http_proxy VARCHAR(1024)",
             "ALTER TABLE agents ADD COLUMN IF NOT EXISTS sip_account_id INTEGER",
+            "ALTER TABLE sip_accounts ADD COLUMN IF NOT EXISTS ring_delay_seconds FLOAT",
         ):
             try:
                 async with connection.begin_nested():
