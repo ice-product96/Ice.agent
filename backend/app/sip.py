@@ -42,6 +42,7 @@ class SipGateway:
         self._reg_status: dict[int, dict[str, Any]] = {}
         self._call_map: dict[str, int] = {}  # sip call-id -> sip_calls.id
         self._realtime: dict[str, RealtimeSession] = {}  # sip call-id -> session
+        self._pending_realtime: dict[str, asyncio.Task[RealtimeSession]] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -378,8 +379,16 @@ class SipGateway:
         inbound: bool = False,
     ) -> RealtimeSession:
         sip_ref = [call.call_id]
-        session = await self._build_realtime_session(agent, sip_ref, inbound=inbound)
-        await session.connect()
+        pending = self._pending_realtime.pop(call.call_id, None)
+        if pending is not None:
+            try:
+                session = await pending
+            except Exception:
+                session = await self._build_realtime_session(agent, sip_ref, inbound=inbound)
+                await session.connect()
+        else:
+            session = await self._build_realtime_session(agent, sip_ref, inbound=inbound)
+            await session.connect()
         self._realtime[call.call_id] = session
         call.on_rtp = session.send_pcm24
         call.playback_provider = session.read_playback_frame
@@ -387,6 +396,44 @@ class SipGateway:
             greeting = str((agent.config or {}).get("inbound_greeting") or "").strip()
             await session.request_response(greeting or DEFAULT_INBOUND_GREETING)
         return session
+
+    async def _prefetch_realtime(self, account_id: int, sip_call_id: str) -> None:
+        if sip_call_id in self._pending_realtime or sip_call_id in self._realtime:
+            return
+        agent = await self._resolve_agent(account_id)
+        if agent is None:
+            return
+
+        async def _build() -> RealtimeSession:
+            session = await self._build_realtime_session(agent, [sip_call_id], inbound=True)
+            await session.connect()
+            return session
+
+        self._pending_realtime[sip_call_id] = asyncio.create_task(
+            _build(),
+            name=f"rt-prefetch-{sip_call_id[:16]}",
+        )
+
+    async def _cancel_prefetch(self, sip_call_id: str) -> None:
+        task = self._pending_realtime.pop(sip_call_id, None)
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                return
+        try:
+            session = task.result()
+        except Exception:
+            return
+        try:
+            await session.close()
+        except Exception:
+            pass
 
     async def _on_incoming(self, account_id: int, call: ActiveCall) -> None:
         agent = await self._resolve_agent(account_id)
@@ -420,11 +467,18 @@ class SipGateway:
         )
         if agent is None:
             logger.warning("Inbound SIP call on account %s with no agent", account_id)
+            await self._cancel_prefetch(call.call_id)
             return
         try:
             await self._start_realtime(agent, call, inbound=True)
+            logger.info(
+                "Realtime bound to inbound call %s agent=%s",
+                call.call_id[:24],
+                agent.id,
+            )
         except Exception as exc:
             logger.exception("Realtime start failed for inbound call")
+            await self._cancel_prefetch(call.call_id)
             await self._update_db_call(call.call_id, status="failed", hangup_cause=str(exc))
             ua = self._agents.get(account_id)
             if ua:
@@ -447,9 +501,13 @@ class SipGateway:
                     sip_call_id=sip_call_id,
                 )
             fields = {"status": "ringing"}
+            if str(payload.get("direction") or "inbound") == "inbound":
+                await self._prefetch_realtime(account_id, sip_call_id)
         elif status == "failed":
+            await self._cancel_prefetch(sip_call_id)
             fields = {"status": "failed", "ended_at": utcnow(), "hangup_cause": str(payload.get("code") or "failed")}
         elif status == "ended":
+            await self._cancel_prefetch(sip_call_id)
             session = self._realtime.pop(sip_call_id, None)
             transcript = ""
             if session:
@@ -461,12 +519,30 @@ class SipGateway:
                 "hangup_cause": str(payload.get("cause") or "ended"),
                 "transcript": transcript,
             }
+            # Refresh REGISTER so NAT binding / Contact stays alive after a call.
+            ua = self._agents.get(account_id)
+            if ua is not None and ua.registered:
+                asyncio.create_task(self._refresh_register(account_id), name=f"sip-refresh-{account_id}")
         if fields:
             await self._update_db_call(sip_call_id, **fields)
         await self.events.publish(
             "sip.call.state",
             {"sip_account_id": account_id, "sip_call_id": sip_call_id, **payload},
         )
+
+    async def _refresh_register(self, account_id: int) -> None:
+        ua = self._agents.get(account_id)
+        if ua is None:
+            return
+        try:
+            await ua.register()
+            self._reg_status[account_id] = {
+                "registered": ua.registered,
+                "status": ua.registration_status,
+                "error": None,
+            }
+        except Exception as exc:
+            logger.warning("SIP re-REGISTER after call failed for account %s: %s", account_id, exc)
 
     async def hangup(self, *, sip_call_id: str | None = None, db_id: int | None = None) -> None:
         if sip_call_id is None and db_id is not None:

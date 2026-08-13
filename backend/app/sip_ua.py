@@ -167,6 +167,10 @@ class ActiveCall:
     invite_headers: dict[str, str] = field(default_factory=dict)
     invite_addr: tuple[str, int] | None = None
     cancelled: asyncio.Event | None = None
+    answered_at: float | None = None
+    last_rtp_at: float | None = None
+    rtp_packets_rx: int = 0
+    rtp_packets_tx: int = 0
     seq: int = field(default_factory=lambda: random.randint(1, 0xFFFF))
     timestamp: int = field(default_factory=lambda: random.randint(1, 0xFFFFFFFF))
     ssrc: int = field(default_factory=lambda: random.randint(1, 0xFFFFFFFF))
@@ -180,9 +184,26 @@ class RtpProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
 
-    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:  # noqa: ARG002
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         if len(data) < 12:
             return
+        # Symmetric RTP: Telphin/NAT often sends media from a different IP:port than SDP.
+        host, port = addr[0], int(addr[1])
+        if _is_ipv4(host) and (
+            self.call.remote_rtp_host != host or self.call.remote_rtp_port != port
+        ):
+            logger.info(
+                "RTP peer learned %s:%s -> %s:%s (call %s)",
+                self.call.remote_rtp_host,
+                self.call.remote_rtp_port,
+                host,
+                port,
+                self.call.call_id[:24],
+            )
+            self.call.remote_rtp_host = host
+            self.call.remote_rtp_port = port
+        self.call.last_rtp_at = time.time()
+        self.call.rtp_packets_rx += 1
         payload = data[12:]
         if not payload or self.call.on_rtp is None:
             return
@@ -221,6 +242,7 @@ class RtpProtocol(asyncio.DatagramProtocol):
         if not _is_ipv4(dest):
             return
         self.transport.sendto(bytes(header) + payload, (dest, self.call.remote_rtp_port))
+        self.call.rtp_packets_tx += 1
 
 
 class SipProtocol(asyncio.DatagramProtocol):
@@ -337,6 +359,23 @@ class SipUserAgent:
             )
             sockname = self._transport.get_extra_info("sockname")
             self.config.local_sip_port = int(sockname[1])
+        if self.config.public_ip:
+            self.local_ip = self.config.public_ip
+        logger.info(
+            "SIP UA started login=%s contact=%s:%s advertises=%s -> %s:%s",
+            self.config.login,
+            self.local_ip,
+            self.config.local_sip_port,
+            self.local_ip,
+            self._proxy_ip,
+            self._proxy_port,
+        )
+        if self.local_ip.startswith(("10.", "172.", "192.168.", "127.")):
+            logger.warning(
+                "SIP Contact/SDP IP %s looks private — set ICE_SIP_PUBLIC_IP or account Public IP "
+                "or remote party may hear silence / miss inbound after NAT",
+                self.local_ip,
+            )
 
     async def close(self) -> None:
         self._closed = True
@@ -717,6 +756,23 @@ class SipUserAgent:
     async def _media_loop(self, call: ActiveCall) -> None:
         try:
             while call.state in {"ringing", "answered", "early"} and call.rtp_protocol:
+                now = time.time()
+                if call.state == "answered" and call.answered_at is not None:
+                    # Stuck call without BYE would block the next inbound (Busy Here).
+                    if call.last_rtp_at is None and (now - call.answered_at) > 25:
+                        logger.warning(
+                            "SIP call %s: no RTP for 25s after answer — hanging up",
+                            call.call_id[:24],
+                        )
+                        asyncio.create_task(self.hangup(call.call_id, cause="rtp_timeout"))
+                        return
+                    if call.last_rtp_at is not None and (now - call.last_rtp_at) > 45:
+                        logger.warning(
+                            "SIP call %s: RTP stalled for 45s — hanging up",
+                            call.call_id[:24],
+                        )
+                        asyncio.create_task(self.hangup(call.call_id, cause="rtp_timeout"))
+                        return
                 pcm24 = b""
                 if call.playback_provider:
                     try:
@@ -733,6 +789,27 @@ class SipUserAgent:
         except Exception:
             logger.exception("media loop failed for %s", call.call_id)
 
+    def _active_calls(self) -> list[ActiveCall]:
+        return [c for c in self.calls.values() if c.state in {"ringing", "answered", "early", "dialing"}]
+
+    async def _reclaim_stale_calls(self) -> None:
+        now = time.time()
+        for call in list(self.calls.values()):
+            stale = False
+            if call.state == "answered":
+                if call.answered_at and call.last_rtp_at is None and (now - call.answered_at) > 20:
+                    stale = True
+                elif call.last_rtp_at and (now - call.last_rtp_at) > 30:
+                    stale = True
+                elif call.answered_at and (now - call.answered_at) > 3600:
+                    stale = True
+            elif call.state == "ringing" and call.answered_at is None:
+                # answered_at unused while ringing — use invite time via cancelled wait; track via invite
+                pass
+            if stale:
+                logger.warning("Reclaiming stale SIP call %s state=%s", call.call_id[:24], call.state)
+                await self.hangup(call.call_id, cause="stale_reclaim", send_bye=True)
+
     async def _handle_invite(
         self,
         start: str,
@@ -745,9 +822,20 @@ class SipUserAgent:
         if existing is not None:
             self._retransmit_invite_response(existing, headers, addr)
             return
-        if len([c for c in self.calls.values() if c.state in {"ringing", "answered", "early", "dialing"}]) >= self.config.max_concurrent_calls:
-            self._reply(486, "Busy Here", headers, addr)
-            return
+        await self._reclaim_stale_calls()
+        if len(self._active_calls()) >= self.config.max_concurrent_calls:
+            # Last resort: drop oldest answered call so inbound is not permanently stuck.
+            answered = [c for c in self._active_calls() if c.state == "answered"]
+            if answered:
+                oldest = min(answered, key=lambda c: c.answered_at or 0)
+                logger.warning(
+                    "Max calls reached — dropping %s to accept inbound",
+                    oldest.call_id[:24],
+                )
+                await self.hangup(oldest.call_id, cause="replaced_by_inbound")
+            if len(self._active_calls()) >= self.config.max_concurrent_calls:
+                self._reply(486, "Busy Here", headers, addr)
+                return
         remote = headers.get("From", "")
         number_match = re.search(r"sip:([^@>;]+)", remote)
         remote_number = number_match.group(1) if number_match else "unknown"
@@ -854,10 +942,22 @@ class SipUserAgent:
         )
         await self._setup_rtp(call)
         call.state = "answered"
+        call.answered_at = time.time()
+        # Bind Realtime / media without blocking SIP ACKs longer than needed:
+        # fire callback as task if it is slow (OpenAI connect).
         if self.on_incoming:
-            await self.on_incoming(call)
+            asyncio.create_task(self._safe_on_incoming(call), name=f"sip-in-{call.call_id[:16]}")
         if self.on_call_state:
             await self.on_call_state(call.call_id, {"status": "answered", "direction": "inbound"})
+
+    async def _safe_on_incoming(self, call: ActiveCall) -> None:
+        if self.on_incoming is None:
+            return
+        try:
+            await self.on_incoming(call)
+        except Exception:
+            logger.exception("on_incoming failed for %s", call.call_id)
+            await self.hangup(call.call_id, cause="on_incoming_failed")
 
     async def _handle_bye(self, headers: dict[str, str], addr: tuple[str, int]) -> None:
         call_id = headers.get("Call-ID", "")
@@ -931,7 +1031,8 @@ class SipUserAgent:
         on_rtp: OnRtpPcm24 | None = None,
         playback_provider: Callable[[], bytes] | None = None,
     ) -> ActiveCall:
-        active = [c for c in self.calls.values() if c.state in {"ringing", "answered", "early", "dialing"}]
+        await self._reclaim_stale_calls()
+        active = self._active_calls()
         if len(active) >= self.config.max_concurrent_calls:
             raise RuntimeError("Max concurrent calls reached for this SIP account")
         number = re.sub(r"[^\d+*#]", "", number)
@@ -989,6 +1090,15 @@ class SipUserAgent:
         if call.cancelled is not None and not call.cancelled.is_set():
             call.cancelled.set()
         call.state = "ended"
+        logger.info(
+            "SIP hangup %s cause=%s rtp_rx=%s rtp_tx=%s peer=%s:%s",
+            call_id[:24],
+            cause,
+            call.rtp_packets_rx,
+            call.rtp_packets_tx,
+            call.remote_rtp_host,
+            call.remote_rtp_port,
+        )
         if call.media_task:
             call.media_task.cancel()
             try:

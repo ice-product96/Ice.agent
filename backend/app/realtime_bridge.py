@@ -146,6 +146,8 @@ class RealtimeSession:
         self._reader: asyncio.Task[None] | None = None
         self._closed = asyncio.Event()
         self._session_ready = asyncio.Event()
+        self._greeting_until = 0.0
+        self._audio_chunks = 0
         self._user_parts: list[str] = []
         self._assistant_parts: list[str] = []
 
@@ -195,10 +197,18 @@ class RealtimeSession:
             except TimeoutError:
                 logger.warning("Realtime not ready for response.create")
                 return
-        event: dict[str, Any] = {"type": "response.create"}
+        # Protect greeting from barge-in for a few seconds.
+        self._greeting_until = asyncio.get_running_loop().time() + 4.0
+        event: dict[str, Any] = {
+            "type": "response.create",
+            "response": {
+                "output_modalities": ["audio"],
+            },
+        }
         if instructions:
-            event["response"] = {"instructions": instructions}
+            event["response"]["instructions"] = instructions
         await self._ws.send(json.dumps(event))
+        logger.info("Realtime response.create sent (greeting)")
 
     async def close(self) -> None:
         self._closed.set()
@@ -265,6 +275,9 @@ class RealtimeSession:
         etype = str(event.get("type") or "")
         if etype in {"session.created", "session.updated"}:
             self._session_ready.set()
+            logger.info("Realtime %s", etype)
+        if etype == "error":
+            logger.error("Realtime error event: %s", event)
         if self.on_event:
             try:
                 await self.on_event(event)
@@ -275,9 +288,15 @@ class RealtimeSession:
             b64 = event.get("delta") or event.get("audio")
             if isinstance(b64, str) and b64:
                 self.playback.append(base64.b64decode(b64))
+                self._audio_chunks += 1
+                if self._audio_chunks == 1:
+                    logger.info("Realtime first audio chunk received")
             return
 
         if etype == "input_audio_buffer.speech_started":
+            # Do not wipe greeting while the agent is still saying hello.
+            if asyncio.get_running_loop().time() < self._greeting_until:
+                return
             self.playback.clear()
             return
 
@@ -310,3 +329,7 @@ class RealtimeSession:
                 else:
                     self._assistant_parts.append(str(text))
             return
+
+        if etype == "response.done":
+            status = (event.get("response") or {}).get("status")
+            logger.info("Realtime response.done status=%s audio_chunks=%s", status, self._audio_chunks)
