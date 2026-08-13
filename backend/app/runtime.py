@@ -215,6 +215,7 @@ class AgentRuntime:
         events: EventHub,
         telegram: TelegramGateway | None = None,
         mcp: McpManager | None = None,
+        sip: Any | None = None,
     ) -> None:
         self.settings = settings
         self.memory = memory
@@ -222,6 +223,7 @@ class AgentRuntime:
         self.events = events
         self.telegram = telegram
         self.mcp = mcp
+        self.sip = sip
         self.task_bus: TaskBus | None = None
         self.scheduler: Any = None
         self.conversations = ConversationContextService()
@@ -274,6 +276,43 @@ class AgentRuntime:
                         "Use this instead of writing 'silence', an emoji, or an explanation."
                     ),
                 )
+        tools_enabled = set((agent.config or {}).get("tools") or [])
+        if self.sip and agent.sip_account_id is not None and "sip" in tools_enabled:
+            async def sip_dial(number: str) -> dict[str, Any]:
+                """Place an outbound phone call via the agent's SIP account and talk with OpenAI Realtime."""
+                from .db import SipAccount
+
+                if db is None:
+                    raise RuntimeError("Database session is required for sip_dial")
+                account = await db.get(SipAccount, agent.sip_account_id)
+                if account is None:
+                    raise RuntimeError("SIP account not found")
+                return await self.sip.dial(account=account, agent=agent, number=number)
+
+            async def sip_hangup(call_id: str = "") -> dict[str, Any]:
+                """Hang up an active SIP call. Pass db call id or SIP Call-ID; empty hangs up nothing."""
+                if not call_id:
+                    active = [
+                        item
+                        for item in self.sip.list_active_calls()
+                        if item.get("sip_account_id") == agent.sip_account_id
+                    ]
+                    if not active:
+                        return {"ok": False, "error": "no active calls"}
+                    call_id = str(active[0].get("db_id") or active[0].get("sip_call_id"))
+                if str(call_id).isdigit():
+                    await self.sip.hangup(db_id=int(call_id))
+                else:
+                    await self.sip.hangup(sip_call_id=str(call_id))
+                return {"ok": True, "call_id": call_id}
+
+            async def sip_status() -> dict[str, Any]:
+                """Return SIP registration and active calls for this agent's account."""
+                return await self.sip.status(agent.sip_account_id)
+
+            registry.register(sip_dial, "sip_dial", "Dial a phone number through the agent's SIP account")
+            registry.register(sip_hangup, "sip_hangup", "Hang up an active SIP call")
+            registry.register(sip_status, "sip_status", "SIP registration and active call status")
         if self.mcp and mcp_server_names:
             await self.mcp.register_tools(registry, mcp_server_names)
         if self.task_bus:

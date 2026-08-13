@@ -11,13 +11,14 @@ from .config import Settings, get_settings
 from .contract import router as contract_router, websocket_events
 from .db import (
     AdminSettings, Agent, LlmProfile, McpServer, RuntimeSettings, SessionLocal,
-    TelegramAccount, create_schema,
+    SipAccount, TelegramAccount, create_schema,
 )
 from .events import events
 from .integrations import McpManager, MemoryStore, WebSearch, exception_text
 from .routing import TelegramEventRouter
 from .runtime import AgentRuntime, TaskBus
 from .scheduler import CronManager
+from .sip import SipGateway
 from .telegram import TelegramGateway
 from .secrets import SecretStore
 
@@ -28,9 +29,10 @@ async def lifespan(app: FastAPI):
     await create_schema()
     memory = MemoryStore()
     telegram = TelegramGateway(settings)
+    sip = SipGateway(settings, events)
     mcp = McpManager()
     search = WebSearch()
-    runtime = AgentRuntime(settings, memory, search, events, telegram, mcp)
+    runtime = AgentRuntime(settings, memory, search, events, telegram, mcp, sip=sip)
     task_bus = TaskBus(SessionLocal, events)
     runtime.bind_task_bus(task_bus)
     task_bus.bind_runtime(runtime)
@@ -40,6 +42,7 @@ async def lifespan(app: FastAPI):
     telegram.register_callback("callback_query", telegram_router.callback_query)
     async with SessionLocal() as db:
         accounts = (await db.scalars(select(TelegramAccount))).all()
+        sip_accounts = (await db.scalars(select(SipAccount))).all()
         servers = (await db.scalars(select(McpServer).where(McpServer.enabled.is_(True)))).all()
         admin_settings = await db.get(AdminSettings, 1)
         runtime_settings = await db.get(RuntimeSettings, 1)
@@ -93,6 +96,10 @@ async def lifespan(app: FastAPI):
         await telegram.restore(accounts)
     except Exception as exc:
         await events.publish("telegram.startup_failed", {"error": str(exc)})
+    try:
+        await sip.restore(list(sip_accounts))
+    except Exception as exc:
+        await events.publish("sip.startup_failed", {"error": str(exc)})
     mcp_startup_stops: dict[int, asyncio.Event] = {}
 
     async def connect_mcp(server: McpServer) -> None:
@@ -144,6 +151,7 @@ async def lifespan(app: FastAPI):
     app.state.memory = memory
     app.state.search = search
     app.state.telegram = telegram
+    app.state.sip = sip
     app.state.mcp = mcp
     app.state.runtime = runtime
     app.state.task_bus = task_bus
@@ -155,6 +163,7 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(*mcp_startup_tasks, return_exceptions=True)
     scheduler.shutdown()
     await task_bus.stop()
+    await sip.close()
     await telegram.close()
     await mcp.close()
 

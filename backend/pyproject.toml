@@ -24,6 +24,8 @@ dependencies = [
   "duckduckgo-search>=7.3",
   "cryptography>=45.0",
   "tzdata",
+  "audioop-lts>=0.2.1; python_version>='3.13'",
+  "websockets>=14.0",
 ]
 
 [project.optional-dependencies]

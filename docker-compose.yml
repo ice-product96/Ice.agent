@@ -82,15 +82,23 @@ services:
         NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
     container_name: iceagent-api
     env_file: .env
+    ports:
+      # LAN + localhost; 8000 внутри контейнера не конфликтует с pokerclub (у них без host publish)
+      - "8040:8000"
+      # SIP UA (signaling + RTP). Host firewall must allow UDP if NAT/public АТС.
+      - "5060:5060/udp"
+      - "10000-10199:10000-10199/udp"
     environment:
       ICE_DATABASE_URL: postgresql+asyncpg://ice:ice@postgres:5432/ice_agent
       ICE_SESSION_DIR: /app/data/sessions
       ICE_BACKUP_DIR: /app/data/backups
+      ICE_SIP_BIND_PORT: "5060"
+      ICE_SIP_RTP_PORT_MIN: "10000"
+      ICE_SIP_RTP_PORT_MAX: "10199"
+      # Set ICE_SIP_PUBLIC_IP to the server's public/LAN IP advertised in SDP when behind NAT
+      ICE_SIP_PUBLIC_IP: ${ICE_SIP_PUBLIC_IP:-}
     volumes:
       - iceagent_agent_data:/app/data
-    ports:
-      # LAN + localhost; 8000 внутри контейнера не конфликтует с pokerclub (у них без host publish)
-      - "8040:8000"
     depends_on:
       postgres:
         condition: service_healthy

@@ -2,7 +2,7 @@ import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 
 import {
   Activity, Bot, BrainCircuit, CalendarClock, CheckCircle2, ChevronRight, CircleAlert,
   Clock3, Database, FileText, Globe2, KeyRound, LayoutDashboard, Link2, LoaderCircle, LogOut, Menu,
-  MessageCircle, MessagesSquare, Moon, Plus, RefreshCw, Search, ServerCog, Settings, ShieldCheck,
+  MessageCircle, MessagesSquare, Moon, Phone, PhoneCall, PhoneOff, Plus, RefreshCw, Search, ServerCog, Settings, ShieldCheck,
   Sparkles, Trash2, Users, Wifi, WifiOff, X, Zap,
 } from 'lucide-react'
 import { api, openLiveSocket } from './api'
@@ -10,10 +10,10 @@ import { agentModelPresets, profileModelPresets } from './llmModels'
 import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, RuntimeSettings,
-  Status, TelegramAccount,
+  SipAccount, SipCall, Status, TelegramAccount,
 } from './types'
 
-type Page = 'dashboard' | 'agents' | 'connections' | 'runtime' | 'telegram' | 'conversations' | 'memory' | 'mcp' | 'cron' | 'settings' | 'logs' | 'tasks'
+type Page = 'dashboard' | 'agents' | 'connections' | 'runtime' | 'telegram' | 'sip' | 'calls' | 'conversations' | 'memory' | 'mcp' | 'cron' | 'settings' | 'logs' | 'tasks'
 type Icon = typeof LayoutDashboard
 
 const nav: { id: Page; label: string; icon: Icon; group?: string }[] = [
@@ -21,6 +21,8 @@ const nav: { id: Page; label: string; icon: Icon; group?: string }[] = [
   { id: 'agents', label: 'Агенты', icon: Bot },
   { id: 'connections', label: 'Подключения', icon: KeyRound },
   { id: 'telegram', label: 'Telegram', icon: MessageCircle },
+  { id: 'sip', label: 'SIP', icon: Phone },
+  { id: 'calls', label: 'Звонки', icon: PhoneCall },
   { id: 'conversations', label: 'Диалоги', icon: MessagesSquare },
   { id: 'memory', label: 'Память', icon: BrainCircuit },
   { id: 'mcp', label: 'MCP-серверы', icon: ServerCog, group: 'Автоматизация' },
@@ -36,6 +38,8 @@ const title: Record<Page, [string, string]> = {
   agents: ['Агенты', 'Настройка интеллекта, подключений и возможностей'],
   connections: ['Подключения и провайдеры', 'Управление учётными данными LLM и эндпоинтами моделей'],
   telegram: ['Аккаунты Telegram', 'Управление подключёнными пользовательскими и бот-сессиями'],
+  sip: ['SIP-аккаунты', 'Регистрация в АТС и привязка к агентам для голосовых звонков'],
+  calls: ['Звонки', 'Активные и завершённые SIP-звонки через OpenAI Realtime'],
   conversations: ['Диалоги', 'Просмотр контекста агентов и транскриптов'],
   memory: ['Память', 'Просмотр и управление сохранённым контекстом агентов'],
   mcp: ['MCP-серверы', 'Подключение агентов к внешним инструментам и ресурсам'],
@@ -58,7 +62,7 @@ const taskStatusLabel: Record<string, string> = {
 function serviceDisplayName(name: string) {
   const key = name.toLowerCase().replaceAll('_', ' ')
   const map: Record<string, string> = {
-    llm: 'LLM', search: 'Поиск', memory: 'Память', telegram: 'Telegram', mcp: 'MCP',
+    llm: 'LLM', search: 'Поиск', memory: 'Память', telegram: 'Telegram', sip: 'SIP', mcp: 'MCP',
   }
   return map[key] || name.replaceAll('_', ' ')
 }
@@ -66,7 +70,7 @@ function serviceDisplayName(name: string) {
 function toolDisplayName(tool: string) {
   const map: Record<string, string> = {
     web_search: 'веб-поиск', memory: 'память', code_execution: 'выполнение кода',
-    telegram: 'Telegram', filesystem: 'файловая система', mcp: 'MCP',
+    telegram: 'Telegram', sip: 'SIP', filesystem: 'файловая система', mcp: 'MCP',
   }
   return map[tool] || tool.replace('_', ' ')
 }
@@ -197,6 +201,7 @@ function DashboardScreen({ go }: { go: (p: Page) => void }) {
   const d = data
   const agents = d.agents ?? { total: d.counts?.agents ?? d.agents_count ?? 0, online: 0, errors: 0 }
   const telegram = d.telegram_accounts ?? { total: d.counts?.telegram_accounts ?? d.telegram_accounts_count ?? 0, connected: 0 }
+  const sip = d.sip_accounts ?? { total: d.counts?.sip_accounts ?? d.sip_accounts_count ?? 0, registered: 0, active_calls: 0 }
   const tasks = d.tasks ?? { running: 0, queued: 0, completed_today: 0 }
   const mcp = d.mcp_servers ?? { total: d.counts?.mcp_servers ?? d.mcp_servers_count ?? 0, online: 0 }
   const memoryItems = d.memory_items ?? 0
@@ -205,6 +210,7 @@ function DashboardScreen({ go }: { go: (p: Page) => void }) {
   const stats = [
     ['Активные агенты', agents.online, `${agents.total} настроено`, Bot, 'violet'],
     ['Telegram', telegram.connected, `${telegram.total} аккаунтов`, MessageCircle, 'blue'],
+    ['SIP', sip.registered, `${sip.total} аккаунтов · ${sip.active_calls || 0} звонков`, Phone, 'cyan'],
     ['Выполняемые задачи', tasks.running, `${tasks.queued} в очереди`, Zap, 'amber'],
     ['Записи памяти', memoryItems, 'Сохранённый контекст', BrainCircuit, 'cyan'],
     ...(conversationCount === undefined
@@ -239,6 +245,7 @@ function DashboardScreen({ go }: { go: (p: Page) => void }) {
           {[['Runtime агентов', `${agents.online}/${agents.total}`, agents.errors ? 'error' : 'online'],
             ['Шлюз MCP', `${mcp.online}/${mcp.total}`, mcp.online ? 'online' : 'offline'],
             ['Мост Telegram', `${telegram.connected} подключено`, telegram.connected ? 'online' : 'offline'],
+            ['SIP UA', `${sip.registered} зарегистрировано`, sip.registered ? 'online' : 'offline'],
             ['Воркер задач', `${tasks.running} выполняется`, 'online']].map(([name, val, status]) =>
             <div className="service-row" key={name}><span className={`service-icon ${status}`}><Wifi size={17}/></span><div><strong>{name}</strong><small>{val}</small></div><StatusDot status={status as Status}/></div>)}
         </div>
@@ -246,7 +253,7 @@ function DashboardScreen({ go }: { go: (p: Page) => void }) {
       <section className="panel"><SectionHead title="Быстрые действия" text="Частые задачи рабочей области"/>
         <div className="quick-grid">
           {[['Создать агента', 'Настроить нового AI-агента', Bot, 'agents'], ['Подключить Telegram', 'Добавить аккаунт мессенджера', MessageCircle, 'telegram'],
-            ['Добавить MCP-сервер', 'Подключить внешние инструменты', ServerCog, 'mcp'], ['Запланировать задачу', 'Автоматизировать повторяющуюся задачу', Clock3, 'cron']].map(([label, sub, Icon, page]) =>
+            ['Добавить SIP', 'Аккаунт АТС для голосовых звонков', Phone, 'sip'], ['Запланировать задачу', 'Автоматизировать повторяющуюся задачу', Clock3, 'cron']].map(([label, sub, Icon, page]) =>
             <button className="quick-action" key={label as string} onClick={() => go(page as Page)}><span><Icon size={19}/></span><div><strong>{label as string}</strong><small>{sub as string}</small></div><ChevronRight size={16}/></button>)}
         </div>
       </section>
@@ -262,11 +269,13 @@ function AgentsScreen() {
   const { data = [], setData, loading, error, refresh } = useLoad(api.agents.list, [])
   const profiles = useLoad(api.llmProfiles.list, [])
   const telegram = useLoad(api.telegram.list, [])
+  const sip = useLoad(api.sip.list, [])
   const [editing, setEditing] = useState<Partial<Agent> | null>(null)
   const [deleting, setDeleting] = useState<Agent | null>(null)
-  if (loading || profiles.loading || telegram.loading) return <Loading/>
+  if (loading || profiles.loading || telegram.loading || sip.loading) return <Loading/>
   const profileName = (id?: string) => profiles.data?.find(p => String(p.id) === String(id))?.name || (id ? 'Неизвестный профиль LLM' : 'Без профиля LLM')
   const telegramName = (id?: string) => telegram.data?.find(a => String(a.id) === String(id))?.name || (id ? 'Неизвестный аккаунт Telegram' : 'Без аккаунта Telegram')
+  const sipName = (id?: string) => sip.data?.find(a => String(a.id) === String(id))?.name || (id ? 'Неизвестный SIP' : 'Без SIP')
   return <>
     {error && <Alert message={error}/>}
     <SectionHead title={`${data.length} настроенных агентов`} text="У каждого агента изолированное поведение и подключения" action={<button className="primary" onClick={() => setEditing(emptyAgent)}><Plus size={17}/>Новый агент</button>}/>
@@ -274,12 +283,12 @@ function AgentsScreen() {
       <div className="card-grid">{data.map(agent => <article className="entity-card" key={agent.id}>
         <div className="entity-top"><span className="entity-avatar"><Bot/></span><StatusDot status={agent.status || (agent.enabled && agent.llm_profile_id ? 'online' : agent.enabled ? 'pending' : 'paused')}/></div>
         <h3>{agent.name}</h3><p>{agent.description || 'Описание не указано.'}</p>
-        <div className="binding-list"><span><KeyRound size={13}/>{profileName(agent.llm_profile_id)}</span><span><MessageCircle size={13}/>{telegramName(agent.telegram_account_id)}</span></div>
+        <div className="binding-list"><span><KeyRound size={13}/>{profileName(agent.llm_profile_id)}</span><span><MessageCircle size={13}/>{telegramName(agent.telegram_account_id)}</span><span><Phone size={13}/>{sipName(agent.sip_account_id)}</span></div>
         <div className="chip-row"><span className="chip">{agent.provider || 'openai'}</span><span className="chip">{agent.model || 'Без модели'}</span>{agent.tools.slice(0, 2).map(t => <span className="chip" key={t}>{toolDisplayName(t)}</span>)}</div>
         <div className="entity-meta"><span><Link2 size={14}/>{agent.links.length} связей</span><span>{agent.typing_enabled ? 'Индикатор набора вкл.' : 'Индикатор набора выкл.'}</span></div>
         <div className="card-actions"><button className="secondary" onClick={() => setEditing(agent)}>Настроить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(agent)}><Trash2 size={17}/></button></div>
       </article>)}</div>}
-    {editing && <AgentForm value={editing} agents={data} profiles={profiles.data || []} telegram={telegram.data || []} onClose={() => setEditing(null)} onSave={async value => {
+    {editing && <AgentForm value={editing} agents={data} profiles={profiles.data || []} telegram={telegram.data || []} sip={sip.data || []} onClose={() => setEditing(null)} onSave={async value => {
       if (value.id) { const saved = await api.agents.update(value.id, value); setData(data.map(a => a.id === saved.id ? saved : a)) }
       else { const saved = await api.agents.create(value as Omit<Agent, 'id'>); setData([...data, saved]) }
       setEditing(null)
@@ -289,11 +298,14 @@ function AgentsScreen() {
   </>
 }
 
-function AgentForm({ value, agents, profiles, telegram, onClose, onSave }: { value: Partial<Agent>; agents: Agent[]; profiles: LlmProfile[]; telegram: TelegramAccount[]; onClose: () => void; onSave: (v: Partial<Agent>) => Promise<void> }) {
+function AgentForm({ value, agents, profiles, telegram, sip, onClose, onSave }: {
+  value: Partial<Agent>; agents: Agent[]; profiles: LlmProfile[]; telegram: TelegramAccount[]; sip: SipAccount[];
+  onClose: () => void; onSave: (v: Partial<Agent>) => Promise<void>
+}) {
   const [form, setForm] = useState(value)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const toolOptions = ['web_search', 'memory', 'code_execution', 'telegram', 'filesystem', 'mcp']
+  const toolOptions = ['web_search', 'memory', 'code_execution', 'telegram', 'sip', 'filesystem', 'mcp']
   const permissionOptions = [
     ['telegram_delete_dialog', 'Удалять диалоги Telegram'],
     ['telegram_delete_messages', 'Удалять сообщения Telegram'],
@@ -346,6 +358,9 @@ function AgentForm({ value, agents, profiles, telegram, onClose, onSave }: { val
           {modelSelectValue === '__custom__' && <input required value={form.model || ''} onChange={e => patch({ model: e.target.value })} placeholder="gpt-5.6-terra" style={{ marginTop: '0.5rem' }}/>}
         </Field>
         <Field label="Аккаунт Telegram" hint="Необязательная мессенджер-идентичность"><select value={form.telegram_account_id || ''} onChange={e => patch({ telegram_account_id: e.target.value || undefined })}><option value="">Без аккаунта Telegram</option>{telegram.map(a => <option value={a.id} key={a.id}>{a.name} · {a.phone}{a.readiness && a.readiness !== 'ready' ? ` (${a.readiness})` : ''}</option>)}</select></Field>
+        <Field label="SIP-аккаунт" hint="Для входящих/исходящих голосовых звонков через OpenAI Realtime"><select value={form.sip_account_id || ''} onChange={e => patch({ sip_account_id: e.target.value || undefined })}><option value="">Без SIP</option>{sip.map(a => <option value={a.id} key={a.id}>{a.name} · {a.login}{a.registered ? ' (reg)' : ''}</option>)}</select></Field>
+        <Field label="Realtime voice" hint="Голос OpenAI Realtime на звонках"><input value={form.realtime_voice || 'marin'} onChange={e => patch({ realtime_voice: e.target.value })} placeholder="marin"/></Field>
+        <Field label="Realtime model" hint="Модель Realtime-сессии"><input value={form.realtime_model || 'gpt-realtime'} onChange={e => patch({ realtime_model: e.target.value })} placeholder="gpt-realtime"/></Field>
         <Field label="Системный промпт" wide><textarea required rows={7} value={form.prompt || ''} onChange={e => patch({ prompt: e.target.value })} placeholder="Вы полезный агент…"/></Field>
         <Field label="Инструменты" wide><div className="check-grid">{toolOptions.map(tool => <label className="check" key={tool}><input type="checkbox" checked={(form.tools || []).includes(tool)} onChange={() => patch({ tools: (form.tools || []).includes(tool) ? form.tools!.filter(t => t !== tool) : [...(form.tools || []), tool] })}/><span>{toolDisplayName(tool)}</span></label>)}</div></Field>
         <Field label="Опасные действия" hint="Отправка сообщений и вступление в каналы уже входят в инструмент Telegram. Здесь — только необратимые операции." wide><div className="check-grid">{permissionOptions.map(([permission, label]) => <label className="check" key={permission}><input type="checkbox" checked={(form.tool_permissions || []).includes(permission)} onChange={() => patch({ tool_permissions: (form.tool_permissions || []).includes(permission) ? form.tool_permissions!.filter(item => item !== permission) : [...(form.tool_permissions || []), permission] })}/><span>{label}</span></label>)}</div></Field>
@@ -432,6 +447,153 @@ function LlmProfileForm({ value, onClose, onSave }: { value: Partial<LlmProfile>
       <div className="toggle-box wide"><Toggle label="Профиль включён" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div>
     </div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Отмена</button><button className="primary" disabled={busy}>{busy && <LoaderCircle className="spin" size={16}/>}Сохранить профиль</button></div>
   </form></Modal>
+}
+
+const emptySip: Partial<SipAccount> & { password?: string } = {
+  name: '', sip_server: 'voice.telphin.com:5068', domain: 'sip.telphin.com', login: '',
+  auth_username: '', transport: 'udp', display_name: '', enabled: true, register_on_startup: true,
+  max_concurrent_calls: 1, password: '',
+}
+
+function SipScreen() {
+  const { data = [], setData, loading, error, refresh } = useLoad(api.sip.list, [])
+  const [editing, setEditing] = useState<(Partial<SipAccount> & { password?: string }) | null>(null)
+  const [deleting, setDeleting] = useState<SipAccount | null>(null)
+  const [busyId, setBusyId] = useState<string>()
+  if (loading) return <Loading/>
+  return <>
+    {error && <Alert message={error}/>}
+    <SectionHead title={`${data.length} SIP-аккаунтов`} text="Регистрация в АТС (Telphin и др.) для голосовых агентов" action={<button className="primary" onClick={() => setEditing(emptySip)}><Plus size={17}/>Добавить SIP</button>}/>
+    {data.length === 0 ? <Empty icon={Phone} title="Нет SIP-аккаунтов" text="Добавьте логин/пароль АТС, затем привяжите аккаунт к агенту."/> :
+      <div className="card-grid">{data.map(account => <article className="entity-card" key={account.id}>
+        <div className="entity-top"><span className="entity-avatar"><Phone/></span><StatusDot status={account.registered ? 'online' : account.enabled ? 'pending' : 'paused'}/></div>
+        <h3>{account.name}</h3>
+        <p>{account.login}@{account.domain}</p>
+        <div className="chip-row"><span className="chip">{account.sip_server}</span><span className="chip">{account.transport}</span><span className="chip">{account.registration_status || 'offline'}</span></div>
+        <div className={`secret-state ${account.has_password ? 'configured' : ''}`}><ShieldCheck size={14}/>{account.has_password ? 'Пароль настроен · ••••••••' : 'Пароль отсутствует'}</div>
+        <div className="card-actions">
+          <button className="secondary" disabled={busyId === account.id} onClick={async () => {
+            setBusyId(account.id)
+            try { const saved = await api.sip.register(account.id); setData(data.map(a => a.id === saved.id ? saved : a)) }
+            finally { setBusyId(undefined) }
+          }}>{busyId === account.id ? <LoaderCircle className="spin" size={15}/> : <Wifi size={15}/>}REGISTER</button>
+          <button className="secondary" onClick={() => setEditing(account)}>Изменить</button>
+          <button className="icon-button danger-ghost" onClick={() => setDeleting(account)}><Trash2 size={17}/></button>
+        </div>
+      </article>)}</div>}
+    {editing && <SipAccountForm value={editing} onClose={() => setEditing(null)} onSave={async value => {
+      const saved = value.id
+        ? await api.sip.update(value.id, value)
+        : await api.sip.create(value as Partial<SipAccount> & { name: string; login: string; password?: string })
+      setData(value.id ? data.map(a => a.id === saved.id ? saved : a) : [...data, saved])
+      setEditing(null)
+    }}/>}
+    {deleting && <ConfirmDelete name={deleting.name} onClose={() => setDeleting(null)} onDelete={async () => {
+      await api.sip.remove(deleting.id); setData(data.filter(a => a.id !== deleting.id))
+    }}/>}
+    {error && <button className="secondary" onClick={refresh}><RefreshCw size={16}/>Повторить</button>}
+  </>
+}
+
+function SipAccountForm({ value, onClose, onSave }: {
+  value: Partial<SipAccount> & { password?: string }
+  onClose: () => void
+  onSave: (v: Partial<SipAccount> & { password?: string; clear_password?: boolean }) => Promise<void>
+}) {
+  const [form, setForm] = useState(value)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const patch = (v: Partial<typeof form>) => setForm(f => ({ ...f, ...v }))
+  async function submit(e: FormEvent) {
+    e.preventDefault(); setBusy(true); setError('')
+    try { await onSave(form) } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить'); setBusy(false) }
+  }
+  return <Modal title={form.id ? 'SIP-аккаунт' : 'Новый SIP-аккаунт'} subtitle="Параметры регистрации в АТС" onClose={onClose}>
+    <form onSubmit={submit}>
+      {error && <Alert message={error}/>}
+      <div className="form-grid">
+        <Field label="Имя"><input required value={form.name || ''} onChange={e => patch({ name: e.target.value })} placeholder="Telphin sales"/></Field>
+        <Field label="Логин"><input required value={form.login || ''} onChange={e => patch({ login: e.target.value })} placeholder="062xxx"/></Field>
+        <Field label="SIP server" hint="host:port"><input required value={form.sip_server || ''} onChange={e => patch({ sip_server: e.target.value })} placeholder="voice.telphin.com:5068"/></Field>
+        <Field label="Domain"><input required value={form.domain || ''} onChange={e => patch({ domain: e.target.value })} placeholder="sip.telphin.com"/></Field>
+        <Field label="Auth username" hint="Часто совпадает с логином"><input value={form.auth_username || ''} onChange={e => patch({ auth_username: e.target.value })} placeholder={form.login || ''}/></Field>
+        <Field label="Пароль" hint={form.id ? 'Оставьте пустым, чтобы не менять' : 'Обязателен'}><input type="password" value={form.password || ''} onChange={e => patch({ password: e.target.value })} autoComplete="new-password" required={!form.id}/></Field>
+        <Field label="Transport"><select value={form.transport || 'udp'} onChange={e => patch({ transport: e.target.value })}><option value="udp">UDP</option><option value="tcp">TCP</option></select></Field>
+        <Field label="Proxy (опц.)"><input value={form.sip_proxy || ''} onChange={e => patch({ sip_proxy: e.target.value })} placeholder="пусто = sip_server"/></Field>
+        <Field label="Display name"><input value={form.display_name || ''} onChange={e => patch({ display_name: e.target.value })}/></Field>
+        <Field label="Caller ID"><input value={form.caller_id || ''} onChange={e => patch({ caller_id: e.target.value })}/></Field>
+        <Field label="Public IP" hint="IP в SDP за NAT"><input value={form.public_ip || ''} onChange={e => patch({ public_ip: e.target.value })} placeholder="192.168.10.64"/></Field>
+        <Field label="STUN"><input value={form.stun_server || ''} onChange={e => patch({ stun_server: e.target.value })}/></Field>
+        <Field label="Макс. параллельных звонков"><input type="number" min={1} max={32} value={form.max_concurrent_calls ?? 1} onChange={e => patch({ max_concurrent_calls: Number(e.target.value) || 1 })}/></Field>
+        <div className="toggle-box"><Toggle label="Включён" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div>
+        <div className="toggle-box"><Toggle label="REGISTER при старте" checked={form.register_on_startup ?? true} onChange={v => patch({ register_on_startup: v })}/></div>
+      </div>
+      <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Отмена</button><button className="primary" disabled={busy}>{busy && <LoaderCircle className="spin" size={16}/>}Сохранить</button></div>
+    </form>
+  </Modal>
+}
+
+function CallsScreen() {
+  const agents = useLoad(api.agents.list, [])
+  const { data, loading, error, refresh, setData } = useLoad(() => api.sip.calls(false), [])
+  const [agentId, setAgentId] = useState('')
+  const [number, setNumber] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [dialError, setDialError] = useState('')
+  useEffect(() => {
+    const timer = window.setInterval(() => { void refresh() }, 5000)
+    return () => window.clearInterval(timer)
+  }, [refresh])
+  if (loading || agents.loading) return <Loading/>
+  const items = data?.items || []
+  const active = data?.active || []
+  const sipAgents = (agents.data || []).filter(a => a.sip_account_id)
+  async function dial(e: FormEvent) {
+    e.preventDefault(); setBusy(true); setDialError('')
+    try {
+      await api.sip.dial({ agent_id: agentId, number })
+      await refresh()
+      setNumber('')
+    } catch (err) {
+      setDialError(err instanceof Error ? err.message : 'Не удалось позвонить')
+    } finally { setBusy(false) }
+  }
+  return <>
+    {(error || dialError) && <Alert message={error || dialError}/>}
+    <SectionHead title="SIP-звонки" text="Исходящие и входящие звонки агентов через OpenAI Realtime" action={<button className="secondary" onClick={refresh}><RefreshCw size={16}/>Обновить</button>}/>
+    <section className="panel">
+      <SectionHead title="Новый звонок" text="Агент должен иметь SIP-аккаунт, инструмент sip и профиль OpenAI"/>
+      <form onSubmit={dial} className="form-grid">
+        <Field label="Агент"><select required value={agentId} onChange={e => setAgentId(e.target.value)}><option value="">Выберите агента</option>{sipAgents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</select></Field>
+        <Field label="Номер"><input required value={number} onChange={e => setNumber(e.target.value)} placeholder="+79001234567"/></Field>
+        <div className="modal-actions" style={{ gridColumn: '1 / -1' }}><button className="primary" disabled={busy || !agentId}>{busy ? <LoaderCircle className="spin" size={16}/> : <PhoneCall size={16}/>}Позвонить</button></div>
+      </form>
+    </section>
+    {active.length > 0 && <section className="panel">
+      <SectionHead title={`Активные (${active.length})`} text="Живые сессии SIP UA"/>
+      <div className="card-grid">{active.map((call, idx) => {
+        const id = String(call.db_id || call.sip_call_id || idx)
+        return <article className="entity-card" key={id}>
+          <div className="entity-top"><span className="entity-avatar"><PhoneCall/></span><StatusDot status="online"/></div>
+          <h3>{String(call.remote_number || '—')}</h3>
+          <p>{String(call.direction || '')} · {String(call.status || '')}</p>
+          <div className="card-actions"><button className="secondary" onClick={async () => { await api.sip.hangup(id); await refresh() }}><PhoneOff size={15}/>Сбросить</button></div>
+        </article>
+      })}</div>
+    </section>}
+    <section className="panel">
+      <SectionHead title={`История (${items.length})`} text="Транскрипты Realtime сохраняются в карточке звонка"/>
+      {items.length === 0 ? <Empty icon={PhoneCall} title="Звонков пока нет" text="Исходящие и входящие появятся здесь."/> :
+        <div className="log-view">{items.map((call: SipCall) => <div className="log-row" key={call.id}>
+          <time>{call.started_at ? new Date(call.started_at).toLocaleString() : new Date(call.created_at || Date.now()).toLocaleString()}</time>
+          <span className={`log-level ${call.status === 'ended' ? 'info' : call.status === 'failed' ? 'error' : 'warning'}`}>{call.status}</span>
+          <strong>{call.direction} · {call.remote_number}</strong>
+          <p>{call.transcript ? call.transcript.slice(0, 240) : (call.hangup_cause || 'без транскрипта')}</p>
+          {['dialing', 'ringing', 'answered', 'early'].includes(call.status) &&
+            <button className="secondary compact" onClick={async () => { await api.sip.hangup(call.id); setData(await api.sip.calls(false)) }}><PhoneOff size={14}/>Hangup</button>}
+        </div>)}</div>}
+    </section>
+  </>
 }
 
 function TelegramScreen() {
@@ -914,6 +1076,7 @@ export default function App() {
   if (!authenticated) return <Login onLogin={() => setAuthenticated(true)}/>
   const screen = {
     dashboard: <DashboardScreen go={setPage}/>, agents: <AgentsScreen/>, telegram: <TelegramScreen/>,
+    sip: <SipScreen/>, calls: <CallsScreen/>,
     conversations: <ConversationsScreen/>, connections: <ConnectionsScreen/>, runtime: <RuntimeScreen/>, memory: <MemoryScreen/>, mcp: <McpScreen/>, cron: <CronScreen/>, settings: <SettingsScreen/>,
     logs: <LiveScreen mode="logs"/>, tasks: <LiveScreen mode="tasks"/>,
   }[page] ?? <DashboardScreen go={setPage}/>

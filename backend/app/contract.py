@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import Settings, get_settings
 from .db import (
     AdminSettings, Agent, AgentLink, AgentTask, CronJob, LlmProfile, McpServer,
-    ConversationState, MessageLog, RuntimeSettings, TelegramAccount, get_db,
+    ConversationState, MessageLog, RuntimeSettings, SipAccount, SipCall,
+    TelegramAccount, get_db,
 )
 from .events import events
 from .integrations import exception_text
@@ -61,6 +62,7 @@ class AgentBody(BaseModel):
     provider: str = "openai"
     account_id: int | str | None = None
     telegram_account_id: int | str | None = None
+    sip_account_id: int | str | None = None
     llm_profile_id: int | str | None = None
     tools: list[Any] = Field(default_factory=list)
     tool_permissions: list[str] = Field(default_factory=list)
@@ -68,6 +70,34 @@ class AgentBody(BaseModel):
     typing_enabled: bool = True
     enabled: bool = True
     status: str | None = None
+    realtime_voice: str | None = None
+    realtime_model: str | None = None
+
+
+class SipAccountBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str
+    sip_server: str = "voice.telphin.com:5068"
+    domain: str = "sip.telphin.com"
+    login: str
+    auth_username: str | None = None
+    password: str = ""
+    clear_password: bool = False
+    transport: str = "udp"
+    sip_proxy: str | None = None
+    display_name: str = ""
+    caller_id: str | None = None
+    stun_server: str | None = None
+    public_ip: str | None = None
+    enabled: bool = True
+    register_on_startup: bool = True
+    max_concurrent_calls: int = 1
+
+
+class SipDialBody(BaseModel):
+    agent_id: int | str
+    number: str
+    sip_account_id: int | str | None = None
 
 
 class TelegramLoginBody(BaseModel):
@@ -152,6 +182,8 @@ async def dashboard(
     counts = {
         "agents": await count(Agent),
         "telegram_accounts": await count(TelegramAccount),
+        "sip_accounts": await count(SipAccount),
+        "sip_calls": await count(SipCall),
         "mcp_servers": await count(McpServer),
         "cron_jobs": await count(CronJob),
         "tasks": await count(AgentTask),
@@ -165,6 +197,10 @@ async def dashboard(
     accounts = {
         item.id: item
         for item in (await db.scalars(select(TelegramAccount))).all()
+    }
+    sip_accounts = {
+        item.id: item
+        for item in (await db.scalars(select(SipAccount))).all()
     }
     agent_readiness = []
     for agent in (await db.scalars(select(Agent).order_by(Agent.id))).all():
@@ -184,6 +220,14 @@ async def dashboard(
                 reasons.append("telegram_account_unauthorized")
             elif not account.api_id or not account.api_hash_ciphertext:
                 reasons.append("telegram_credentials_missing")
+        if agent.sip_account_id is not None:
+            sip_account = sip_accounts.get(agent.sip_account_id)
+            if sip_account is None:
+                reasons.append("sip_account_missing")
+            elif not sip_account.enabled:
+                reasons.append("sip_account_disabled")
+            elif not sip_account.password_ciphertext:
+                reasons.append("sip_credentials_missing")
         agent_readiness.append({
             "agent_id": agent.id,
             "ready": agent.enabled and not reasons,
@@ -259,6 +303,18 @@ async def dashboard(
                 else "configured"
             )
         },
+        "sip": {
+            "status": (
+                "missing"
+                if not sip_accounts
+                else "degraded"
+                if any(
+                    not item.enabled or not item.password_ciphertext
+                    for item in sip_accounts.values()
+                )
+                else "configured"
+            )
+        },
         "mcp": {
             "status": (
                 "missing"
@@ -275,6 +331,17 @@ async def dashboard(
     agents_online = sum(1 for item in agent_readiness if item["ready"])
     agents_errors = sum(1 for item in agent_readiness if item["reasons"])
     telegram_connected = sum(1 for item in accounts.values() if item.authorized and item.enabled)
+    sip_gateway = getattr(request.app.state, "sip", None)
+    sip_registered = 0
+    active_sip_calls = 0
+    if sip_gateway is not None:
+        for item in sip_accounts.values():
+            reg = sip_gateway.registration(item.id)
+            if reg.get("registered"):
+                sip_registered += 1
+        active_sip_calls = len(sip_gateway.list_active_calls())
+    else:
+        sip_registered = sum(1 for item in sip_accounts.values() if item.enabled and item.password_ciphertext)
     tasks_running = int(
         await db.scalar(select(func.count()).select_from(AgentTask).where(AgentTask.status == "running")) or 0
     )
@@ -305,6 +372,11 @@ async def dashboard(
         "telegram_accounts": {
             "total": counts["telegram_accounts"],
             "connected": telegram_connected,
+        },
+        "sip_accounts": {
+            "total": counts["sip_accounts"],
+            "registered": sip_registered,
+            "active_calls": active_sip_calls,
         },
         "tasks": {
             "running": tasks_running,
@@ -344,9 +416,12 @@ async def agent_json(db: AsyncSession, agent: Agent) -> dict[str, Any]:
         "provider": agent.model_provider,
         "account_id": agent.telegram_account_id,
         "telegram_account_id": agent.telegram_account_id,
+        "sip_account_id": agent.sip_account_id,
         "llm_profile_id": agent.llm_profile_id,
         "tools": config.get("tools", []),
         "tool_permissions": config.get("tool_permissions", []),
+        "realtime_voice": config.get("realtime_voice", "marin"),
+        "realtime_model": config.get("realtime_model", "gpt-realtime"),
         "links": [
             {
                 "id": link.id,
@@ -397,6 +472,11 @@ def apply_agent(agent: Agent, payload: AgentBody) -> None:
     agent.model_name = payload.model
     agent.model_provider = payload.provider
     agent.telegram_account_id = as_int(account, "account_id") if account is not None else None
+    agent.sip_account_id = (
+        as_int(payload.sip_account_id, "sip_account_id")
+        if payload.sip_account_id is not None and str(payload.sip_account_id).strip() != ""
+        else None
+    )
     agent.llm_profile_id = (
         as_int(payload.llm_profile_id, "llm_profile_id")
         if payload.llm_profile_id is not None
@@ -410,6 +490,10 @@ def apply_agent(agent: Agent, payload: AgentBody) -> None:
         tool_permissions=payload.tool_permissions,
         typing_enabled=payload.typing_enabled,
     )
+    if payload.realtime_voice is not None:
+        config["realtime_voice"] = payload.realtime_voice
+    if payload.realtime_model is not None:
+        config["realtime_model"] = payload.realtime_model
     agent.config = config
 
 
@@ -425,6 +509,9 @@ async def create_agent(payload: AgentBody, db: AsyncSession = Depends(get_db)) -
         LlmProfile, as_int(payload.llm_profile_id, "llm_profile_id")
     ) is None:
         raise HTTPException(status_code=422, detail="LLM profile not found")
+    if payload.sip_account_id is not None and str(payload.sip_account_id).strip() != "":
+        if await db.get(SipAccount, as_int(payload.sip_account_id, "sip_account_id")) is None:
+            raise HTTPException(status_code=422, detail="SIP account not found")
     agent = Agent(name=payload.name)
     apply_agent(agent, payload)
     db.add(agent)
@@ -719,6 +806,250 @@ async def telegram_verify(payload: TelegramVerifyBody, request: Request, db: Asy
     await db.commit()
     await db.refresh(account)
     return telegram_json(account)
+
+
+def sip_json(account: SipAccount, request: Request | None = None) -> dict[str, Any]:
+    registered = False
+    registration_status = "offline"
+    if request is not None and getattr(request.app.state, "sip", None) is not None:
+        reg = request.app.state.sip.registration(account.id)
+        registered = bool(reg.get("registered"))
+        registration_status = str(reg.get("status") or ("registered" if registered else "offline"))
+    return {
+        "id": account.id,
+        "name": account.name,
+        "sip_server": account.sip_server,
+        "domain": account.domain,
+        "login": account.login,
+        "auth_username": account.auth_username,
+        "has_password": bool(account.password_ciphertext),
+        "password_masked": masked_secret(account.password_ciphertext),
+        "transport": account.transport,
+        "sip_proxy": account.sip_proxy,
+        "display_name": account.display_name,
+        "caller_id": account.caller_id,
+        "stun_server": account.stun_server,
+        "public_ip": account.public_ip,
+        "enabled": account.enabled,
+        "register_on_startup": account.register_on_startup,
+        "max_concurrent_calls": account.max_concurrent_calls,
+        "registered": registered,
+        "registration_status": registration_status,
+        "status": "online" if registered else ("pending" if account.enabled else "offline"),
+        "created_at": iso(account.created_at),
+        "updated_at": iso(account.updated_at),
+    }
+
+
+def sip_call_json(call: SipCall) -> dict[str, Any]:
+    return {
+        "id": call.id,
+        "agent_id": call.agent_id,
+        "sip_account_id": call.sip_account_id,
+        "direction": call.direction,
+        "remote_number": call.remote_number,
+        "status": call.status,
+        "started_at": iso(call.started_at),
+        "answered_at": iso(call.answered_at),
+        "ended_at": iso(call.ended_at),
+        "hangup_cause": call.hangup_cause,
+        "transcript": call.transcript,
+        "metadata_json": call.metadata_json or {},
+        "sip_call_id": (call.metadata_json or {}).get("sip_call_id"),
+        "created_at": iso(call.created_at),
+        "updated_at": iso(call.updated_at),
+    }
+
+
+@router.get("/sip/accounts", dependencies=auth)
+async def list_sip_accounts(request: Request, db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
+    items = (await db.scalars(select(SipAccount).order_by(SipAccount.id))).all()
+    return [sip_json(item, request) for item in items]
+
+
+@router.post("/sip/accounts", dependencies=auth, status_code=201)
+async def create_sip_account(
+    payload: SipAccountBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    secrets = SecretStore.from_settings(get_settings())
+    if not payload.password:
+        raise HTTPException(status_code=422, detail="password is required")
+    existing = await db.scalar(select(SipAccount).where(SipAccount.name == payload.name))
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="SIP account name already exists")
+    account = SipAccount(
+        name=payload.name,
+        sip_server=payload.sip_server,
+        domain=payload.domain,
+        login=payload.login,
+        auth_username=payload.auth_username or payload.login,
+        password_ciphertext=secrets.encrypt(payload.password),
+        transport=payload.transport or "udp",
+        sip_proxy=payload.sip_proxy,
+        display_name=payload.display_name or payload.name,
+        caller_id=payload.caller_id,
+        stun_server=payload.stun_server,
+        public_ip=payload.public_ip,
+        enabled=payload.enabled,
+        register_on_startup=payload.register_on_startup,
+        max_concurrent_calls=max(1, payload.max_concurrent_calls),
+    )
+    db.add(account)
+    await db.commit()
+    await db.refresh(account)
+    if account.enabled and account.register_on_startup and getattr(request.app.state, "sip", None):
+        try:
+            await request.app.state.sip.register_account(account)
+        except Exception as exc:
+            await events.publish("sip.register_failed", {"account_id": account.id, "error": str(exc)})
+    return sip_json(account, request)
+
+
+@router.patch("/sip/accounts/{account_id}", dependencies=auth)
+async def update_sip_account(
+    account_id: str,
+    payload: SipAccountBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    secrets = SecretStore.from_settings(get_settings())
+    account = await one(db, SipAccount, account_id)
+    account.name = payload.name
+    account.sip_server = payload.sip_server
+    account.domain = payload.domain
+    account.login = payload.login
+    account.auth_username = payload.auth_username or payload.login
+    account.transport = payload.transport or "udp"
+    account.sip_proxy = payload.sip_proxy
+    account.display_name = payload.display_name or payload.name
+    account.caller_id = payload.caller_id
+    account.stun_server = payload.stun_server
+    account.public_ip = payload.public_ip
+    account.enabled = payload.enabled
+    account.register_on_startup = payload.register_on_startup
+    account.max_concurrent_calls = max(1, payload.max_concurrent_calls)
+    if payload.clear_password:
+        account.password_ciphertext = None
+    elif payload.password:
+        account.password_ciphertext = secrets.encrypt(payload.password)
+    await db.commit()
+    await db.refresh(account)
+    sip = getattr(request.app.state, "sip", None)
+    if sip is not None:
+        try:
+            if account.enabled and account.password_ciphertext:
+                await sip.register_account(account)
+            else:
+                await sip.unregister_account(account.id)
+        except Exception as exc:
+            await events.publish("sip.register_failed", {"account_id": account.id, "error": str(exc)})
+    return sip_json(account, request)
+
+
+@router.post("/sip/accounts/{account_id}/register", dependencies=auth)
+async def register_sip_account(
+    account_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    account = await one(db, SipAccount, account_id)
+    sip = getattr(request.app.state, "sip", None)
+    if sip is None:
+        raise HTTPException(status_code=503, detail="SIP gateway is not available")
+    try:
+        await sip.register_account(account)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"SIP register failed: {exc}") from exc
+    return sip_json(account, request)
+
+
+@router.delete("/sip/accounts/{account_id}", dependencies=auth, status_code=204)
+async def delete_sip_account(
+    account_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    account = await one(db, SipAccount, account_id)
+    sip = getattr(request.app.state, "sip", None)
+    if sip is not None:
+        try:
+            await sip.unregister_account(account.id)
+        except Exception:
+            pass
+    await db.delete(account)
+    await db.commit()
+    return Response(status_code=204)
+
+
+@router.get("/sip/calls", dependencies=auth)
+async def list_sip_calls(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(100, ge=1, le=500),
+    active_only: bool = False,
+) -> dict[str, Any]:
+    query = select(SipCall).order_by(SipCall.created_at.desc()).limit(limit)
+    if active_only:
+        query = query.where(SipCall.status.in_(["initiated", "dialing", "ringing", "answered", "early"]))
+    items = (await db.scalars(query)).all()
+    live = []
+    sip = getattr(request.app.state, "sip", None)
+    if sip is not None:
+        live = sip.list_active_calls()
+    return {"items": [sip_call_json(item) for item in items], "active": live, "total": len(items)}
+
+
+@router.post("/sip/calls", dependencies=auth, status_code=201)
+async def dial_sip_call(
+    payload: SipDialBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    agent = await one(db, Agent, payload.agent_id)
+    if not agent.enabled:
+        raise HTTPException(status_code=422, detail="Agent is disabled")
+    account_id = payload.sip_account_id if payload.sip_account_id is not None else agent.sip_account_id
+    if account_id is None:
+        raise HTTPException(status_code=422, detail="Agent has no SIP account")
+    account = await one(db, SipAccount, account_id)
+    if not account.enabled or not account.password_ciphertext:
+        raise HTTPException(status_code=422, detail="SIP account is not ready")
+    sip = getattr(request.app.state, "sip", None)
+    if sip is None:
+        raise HTTPException(status_code=503, detail="SIP gateway is not available")
+    try:
+        result = await sip.dial(account=account, agent=agent, number=payload.number)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Dial failed: {exc}") from exc
+    return result
+
+
+@router.post("/sip/calls/{call_id}/hangup", dependencies=auth)
+async def hangup_sip_call(call_id: str, request: Request) -> dict[str, Any]:
+    sip = getattr(request.app.state, "sip", None)
+    if sip is None:
+        raise HTTPException(status_code=503, detail="SIP gateway is not available")
+    try:
+        # accept db id or sip call-id
+        if call_id.isdigit():
+            await sip.hangup(db_id=int(call_id))
+        else:
+            await sip.hangup(sip_call_id=call_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@router.get("/sip/status", dependencies=auth)
+async def sip_status(request: Request) -> dict[str, Any]:
+    sip = getattr(request.app.state, "sip", None)
+    if sip is None:
+        return {"available": False, "accounts": {}, "active_calls": []}
+    data = await sip.status()
+    data["available"] = True
+    return data
 
 
 @router.get("/memory", dependencies=auth)

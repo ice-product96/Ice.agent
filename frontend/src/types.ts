@@ -18,12 +18,56 @@ export interface Agent {
   provider?: string
   llm_profile_id?: ID
   telegram_account_id?: ID
+  sip_account_id?: ID
   tools: string[]
   tool_permissions?: string[]
+  realtime_voice?: string
+  realtime_model?: string
   links: AgentLinkRef[]
   typing_enabled: boolean
   enabled: boolean
   status?: Status
+  created_at?: string
+  updated_at?: string
+}
+
+export interface SipAccount {
+  id: ID
+  name: string
+  sip_server: string
+  domain: string
+  login: string
+  auth_username?: string | null
+  has_password: boolean
+  transport: 'udp' | 'tcp' | string
+  sip_proxy?: string | null
+  display_name?: string
+  caller_id?: string | null
+  stun_server?: string | null
+  public_ip?: string | null
+  enabled: boolean
+  register_on_startup: boolean
+  max_concurrent_calls: number
+  registered?: boolean
+  registration_status?: string
+  status?: Status
+  created_at?: string
+  updated_at?: string
+}
+
+export interface SipCall {
+  id: ID
+  agent_id?: ID | null
+  sip_account_id?: ID | null
+  direction: 'inbound' | 'outbound' | string
+  remote_number: string
+  status: string
+  started_at?: string | null
+  answered_at?: string | null
+  ended_at?: string | null
+  hangup_cause?: string | null
+  transcript?: string
+  sip_call_id?: string
   created_at?: string
   updated_at?: string
 }
@@ -171,6 +215,7 @@ export interface ConnectionHealth {
 export interface Dashboard {
   agents?: { total: number; online: number; errors: number }
   telegram_accounts?: { total: number; connected: number }
+  sip_accounts?: { total: number; registered: number; active_calls?: number }
   tasks?: { running: number; queued: number; completed_today: number }
   memory_items?: number
   mcp_servers?: { total: number; online: number }
@@ -181,12 +226,14 @@ export interface Dashboard {
   active_conversations_count?: number
   agents_count?: number
   telegram_accounts_count?: number
+  sip_accounts_count?: number
   mcp_servers_count?: number
   counts?: {
     conversations?: number
     active_conversations?: number
     agents?: number
     telegram_accounts?: number
+    sip_accounts?: number
     mcp_servers?: number
     [key: string]: number | undefined
   }

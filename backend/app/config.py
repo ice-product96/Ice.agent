@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     admin_telegram_ids: str = ""
     session_dir: Path = Path("./data/sessions")
     backup_dir: Path = Path("./data/backups")
+    # SIP UA (pjsua2) — local bind + RTP pool for parallel calls
+    sip_bind_port: int = 5060
+    sip_rtp_port_min: int = 10000
+    sip_rtp_port_max: int = 10199
+    sip_stun_server: str = ""
+    sip_public_ip: str = ""
 
     @property
     def admin_ids(self) -> set[int]:

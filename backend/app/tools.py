@@ -23,6 +23,13 @@ TELEGRAM_OPERATIONAL_PERMISSIONS = {
     "telegram_escalate",
 }
 
+# Granted automatically when the agent has the `sip` tool enabled.
+SIP_OPERATIONAL_PERMISSIONS = {
+    "sip_dial",
+    "sip_hangup",
+    "sip_status",
+}
+
 
 def resolve_tool_permissions(agent_config: dict[str, Any] | None) -> set[str]:
     config = agent_config or {}
@@ -30,6 +37,8 @@ def resolve_tool_permissions(agent_config: dict[str, Any] | None) -> set[str]:
     tools = {str(item) for item in (config.get("tools") or [])}
     if "telegram" in tools:
         permissions |= TELEGRAM_OPERATIONAL_PERMISSIONS
+    if "sip" in tools:
+        permissions |= SIP_OPERATIONAL_PERMISSIONS
     return permissions
 
 
@@ -38,7 +47,7 @@ class ToolPolicy:
         "delete", "remove", "shell", "exec", "payment", "purchase", "transfer",
         "send_message", "send_file", "forward_message", "edit_message", "join_channel",
         "leave_channel", "reaction", "draft", "escalate", "ban", "kick",
-        "change_permissions", "schedule_self",
+        "change_permissions", "schedule_self", "sip_dial", "sip_hangup",
     }
 
     def check(self, tool_name: str, arguments: dict[str, Any], allowed: set[str] | None = None) -> None:

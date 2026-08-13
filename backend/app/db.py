@@ -66,6 +66,28 @@ class LlmProfile(TimestampMixin, Base):
     agents: Mapped[list["Agent"]] = relationship(back_populates="llm_profile")
 
 
+class SipAccount(TimestampMixin, Base):
+    __tablename__ = "sip_accounts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    sip_server: Mapped[str] = mapped_column(String(255), default="voice.telphin.com:5068")
+    domain: Mapped[str] = mapped_column(String(255), default="sip.telphin.com")
+    login: Mapped[str] = mapped_column(String(120), index=True)
+    auth_username: Mapped[str | None] = mapped_column(String(120))
+    password_ciphertext: Mapped[str | None] = mapped_column(Text)
+    transport: Mapped[str] = mapped_column(String(16), default="udp")
+    sip_proxy: Mapped[str | None] = mapped_column(String(255))
+    display_name: Mapped[str] = mapped_column(String(120), default="")
+    caller_id: Mapped[str | None] = mapped_column(String(64))
+    stun_server: Mapped[str | None] = mapped_column(String(255))
+    public_ip: Mapped[str | None] = mapped_column(String(64))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    register_on_startup: Mapped[bool] = mapped_column(Boolean, default=True)
+    max_concurrent_calls: Mapped[int] = mapped_column(Integer, default=1)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    agents: Mapped[list["Agent"]] = relationship(back_populates="sip_account")
+
+
 class Agent(TimestampMixin, Base):
     __tablename__ = "agents"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -78,10 +100,30 @@ class Agent(TimestampMixin, Base):
     )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     telegram_account_id: Mapped[int | None] = mapped_column(ForeignKey("telegram_accounts.id", ondelete="SET NULL"))
+    sip_account_id: Mapped[int | None] = mapped_column(ForeignKey("sip_accounts.id", ondelete="SET NULL"))
     config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     telegram_account: Mapped[TelegramAccount | None] = relationship(back_populates="agents")
+    sip_account: Mapped[SipAccount | None] = relationship(back_populates="agents")
     llm_profile: Mapped[LlmProfile | None] = relationship(back_populates="agents")
     mcp_servers: Mapped[list["McpServer"]] = relationship(secondary=agent_mcp_servers, back_populates="agents")
+
+
+class SipCall(TimestampMixin, Base):
+    __tablename__ = "sip_calls"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_id: Mapped[int | None] = mapped_column(ForeignKey("agents.id", ondelete="SET NULL"), index=True)
+    sip_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("sip_accounts.id", ondelete="SET NULL"), index=True
+    )
+    direction: Mapped[str] = mapped_column(String(16), default="outbound")  # inbound|outbound
+    remote_number: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(32), default="initiated", index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    hangup_cause: Mapped[str | None] = mapped_column(String(120))
+    transcript: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class AgentLink(TimestampMixin, Base):
@@ -258,6 +300,7 @@ async def create_schema() -> None:
             "ALTER TABLE mcp_servers ALTER COLUMN transport TYPE VARCHAR(32)",
             "ALTER TABLE runtime_settings ADD COLUMN IF NOT EXISTS tavily_api_key_ciphertext TEXT",
             "ALTER TABLE runtime_settings ADD COLUMN IF NOT EXISTS tavily_http_proxy VARCHAR(1024)",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS sip_account_id INTEGER",
         ):
             try:
                 async with connection.begin_nested():

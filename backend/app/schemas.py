@@ -40,6 +40,7 @@ class AgentIn(BaseModel):
     llm_profile_id: int | None = None
     enabled: bool = True
     telegram_account_id: int | None = None
+    sip_account_id: int | None = None
     config: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -51,7 +52,73 @@ class AgentPatch(BaseModel):
     llm_profile_id: int | None = None
     enabled: bool | None = None
     telegram_account_id: int | None = None
+    sip_account_id: int | None = None
     config: dict[str, Any] | None = None
+
+
+class SipAccountIn(BaseModel):
+    name: str
+    sip_server: str = "voice.telphin.com:5068"
+    domain: str = "sip.telphin.com"
+    login: str
+    auth_username: str | None = None
+    password: str = ""
+    clear_password: bool = False
+    transport: Literal["udp", "tcp"] = "udp"
+    sip_proxy: str | None = None
+    display_name: str = ""
+    caller_id: str | None = None
+    stun_server: str | None = None
+    public_ip: str | None = None
+    enabled: bool = True
+    register_on_startup: bool = True
+    max_concurrent_calls: int = Field(1, ge=1, le=32)
+
+
+class SipAccountOut(ORMModel):
+    id: int
+    name: str
+    sip_server: str
+    domain: str
+    login: str
+    auth_username: str | None
+    transport: str
+    sip_proxy: str | None
+    display_name: str
+    caller_id: str | None
+    stun_server: str | None
+    public_ip: str | None
+    enabled: bool
+    register_on_startup: bool
+    max_concurrent_calls: int
+    has_password: bool
+    registered: bool = False
+    registration_status: str = "unknown"
+    created_at: datetime
+    updated_at: datetime
+
+
+class SipCallOut(ORMModel):
+    id: int
+    agent_id: int | None
+    sip_account_id: int | None
+    direction: str
+    remote_number: str
+    status: str
+    started_at: datetime | None
+    answered_at: datetime | None
+    ended_at: datetime | None
+    hangup_cause: str | None
+    transcript: str
+    metadata_json: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class SipDialRequest(BaseModel):
+    agent_id: int | str
+    number: str
+    sip_account_id: int | str | None = None
 
 
 class AgentOut(ORMModel, AgentIn):

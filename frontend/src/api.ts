@@ -1,7 +1,7 @@
 import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
-  RuntimeSettings, TelegramAccount,
+  RuntimeSettings, SipAccount, SipCall, TelegramAccount,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api/v1'
@@ -101,6 +101,23 @@ export const api = {
     }) =>
       request<TelegramAccount>(`/telegram/accounts/${id}/proxy`, { method: 'PATCH', ...body(data) }),
     remove: (id: string) => request<void>(`/telegram/accounts/${id}`, { method: 'DELETE' }),
+  },
+  sip: {
+    list: () => request<SipAccount[]>('/sip/accounts'),
+    create: (data: Partial<SipAccount> & { name: string; login: string; password?: string }) =>
+      request<SipAccount>('/sip/accounts', { method: 'POST', ...body(data) }),
+    update: (id: string, data: Partial<SipAccount> & { password?: string; clear_password?: boolean }) =>
+      request<SipAccount>(`/sip/accounts/${id}`, { method: 'PATCH', ...body(data) }),
+    register: (id: string) => request<SipAccount>(`/sip/accounts/${id}/register`, { method: 'POST' }),
+    remove: (id: string) => request<void>(`/sip/accounts/${id}`, { method: 'DELETE' }),
+    calls: (activeOnly = false) =>
+      request<{ items: SipCall[]; active: Array<Record<string, unknown>>; total: number }>(
+        `/sip/calls${qs({ active_only: activeOnly ? 1 : undefined, limit: 100 })}`,
+      ),
+    dial: (data: { agent_id: string; number: string; sip_account_id?: string }) =>
+      request<Record<string, unknown>>('/sip/calls', { method: 'POST', ...body(data) }),
+    hangup: (id: string) => request<{ ok: boolean }>(`/sip/calls/${id}/hangup`, { method: 'POST' }),
+    status: () => request<Record<string, unknown>>('/sip/status'),
   },
   memory: {
     list: (search?: string, agentId?: string) =>
