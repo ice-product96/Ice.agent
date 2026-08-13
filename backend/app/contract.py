@@ -811,10 +811,27 @@ async def telegram_verify(payload: TelegramVerifyBody, request: Request, db: Asy
 def sip_json(account: SipAccount, request: Request | None = None) -> dict[str, Any]:
     registered = False
     registration_status = "offline"
+    last_error: str | None = None
     if request is not None and getattr(request.app.state, "sip", None) is not None:
         reg = request.app.state.sip.registration(account.id)
         registered = bool(reg.get("registered"))
         registration_status = str(reg.get("status") or ("registered" if registered else "offline"))
+        err = reg.get("error")
+        if isinstance(err, str) and err.strip():
+            last_error = err.strip()
+        elif registration_status.startswith("error:"):
+            last_error = registration_status[6:].strip() or registration_status
+    if not account.enabled:
+        ui_status = "offline"
+    elif registered:
+        ui_status = "online"
+    elif last_error or registration_status.startswith("error") or registration_status.startswith("failed"):
+        ui_status = "error"
+    elif not account.password_ciphertext:
+        ui_status = "error"
+        last_error = last_error or "Пароль не задан"
+    else:
+        ui_status = "pending"
     return {
         "id": account.id,
         "name": account.name,
@@ -835,7 +852,8 @@ def sip_json(account: SipAccount, request: Request | None = None) -> dict[str, A
         "max_concurrent_calls": account.max_concurrent_calls,
         "registered": registered,
         "registration_status": registration_status,
-        "status": "online" if registered else ("pending" if account.enabled else "offline"),
+        "last_error": last_error,
+        "status": ui_status,
         "created_at": iso(account.created_at),
         "updated_at": iso(account.updated_at),
     }

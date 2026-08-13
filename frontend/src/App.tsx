@@ -460,22 +460,54 @@ function SipScreen() {
   const [editing, setEditing] = useState<(Partial<SipAccount> & { password?: string }) | null>(null)
   const [deleting, setDeleting] = useState<SipAccount | null>(null)
   const [busyId, setBusyId] = useState<string>()
+  const [actionError, setActionError] = useState('')
   if (loading) return <Loading/>
+  function statusHint(account: SipAccount) {
+    if (account.registered) return 'REGISTER OK — аккаунт зарегистрирован в АТС'
+    if (account.last_error) return account.last_error
+    if (!account.has_password) return 'Пароль не задан — сохраните пароль и нажмите REGISTER'
+    if (account.registration_status && account.registration_status !== 'offline' && account.registration_status !== 'idle') {
+      return `Статус REGISTER: ${account.registration_status}`
+    }
+    return 'Ещё не зарегистрирован. Нажмите REGISTER — если ошибка, она появится здесь и в ответе API.'
+  }
   return <>
-    {error && <Alert message={error}/>}
-    <SectionHead title={`${data.length} SIP-аккаунтов`} text="Регистрация в АТС (Telphin и др.) для голосовых агентов" action={<button className="primary" onClick={() => setEditing(emptySip)}><Plus size={17}/>Добавить SIP</button>}/>
+    {(error || actionError) && <Alert message={error || actionError}/>}
+    <SectionHead
+      title={`${data.length} SIP-аккаунтов`}
+      text="«Ожидание» = включён, но REGISTER ещё не успешен. Смотрите статус и ошибку на карточке."
+      action={<div style={{ display: 'flex', gap: 8 }}>
+        <button className="secondary" onClick={() => { setActionError(''); void refresh() }}><RefreshCw size={16}/>Обновить</button>
+        <button className="primary" onClick={() => setEditing(emptySip)}><Plus size={17}/>Добавить SIP</button>
+      </div>}
+    />
     {data.length === 0 ? <Empty icon={Phone} title="Нет SIP-аккаунтов" text="Добавьте логин/пароль АТС, затем привяжите аккаунт к агенту."/> :
       <div className="card-grid">{data.map(account => <article className="entity-card" key={account.id}>
-        <div className="entity-top"><span className="entity-avatar"><Phone/></span><StatusDot status={account.registered ? 'online' : account.enabled ? 'pending' : 'paused'}/></div>
+        <div className="entity-top"><span className="entity-avatar"><Phone/></span><StatusDot status={(account.status || (account.registered ? 'online' : account.enabled ? 'pending' : 'paused')) as Status}/></div>
         <h3>{account.name}</h3>
         <p>{account.login}@{account.domain}</p>
-        <div className="chip-row"><span className="chip">{account.sip_server}</span><span className="chip">{account.transport}</span><span className="chip">{account.registration_status || 'offline'}</span></div>
+        <div className="chip-row">
+          <span className="chip">{account.sip_server}</span>
+          <span className="chip">{account.transport}</span>
+          <span className="chip">{account.registered ? 'registered' : (account.registration_status || 'offline')}</span>
+        </div>
         <div className={`secret-state ${account.has_password ? 'configured' : ''}`}><ShieldCheck size={14}/>{account.has_password ? 'Пароль настроен · ••••••••' : 'Пароль отсутствует'}</div>
+        <small className="inline-result" style={{ display: 'block', marginTop: 8, color: account.registered ? undefined : 'var(--danger, #c44)' }}>
+          {statusHint(account)}
+        </small>
         <div className="card-actions">
           <button className="secondary" disabled={busyId === account.id} onClick={async () => {
-            setBusyId(account.id)
-            try { const saved = await api.sip.register(account.id); setData(data.map(a => a.id === saved.id ? saved : a)) }
-            finally { setBusyId(undefined) }
+            setBusyId(account.id); setActionError('')
+            try {
+              const saved = await api.sip.register(account.id)
+              setData(data.map(a => a.id === saved.id ? saved : a))
+              if (!saved.registered) {
+                setActionError(saved.last_error || saved.registration_status || 'REGISTER не удался')
+              }
+            } catch (err) {
+              setActionError(err instanceof Error ? err.message : 'REGISTER не удался')
+              await refresh()
+            } finally { setBusyId(undefined) }
           }}>{busyId === account.id ? <LoaderCircle className="spin" size={15}/> : <Wifi size={15}/>}REGISTER</button>
           <button className="secondary" onClick={() => setEditing(account)}>Изменить</button>
           <button className="icon-button danger-ghost" onClick={() => setDeleting(account)}><Trash2 size={17}/></button>
@@ -487,11 +519,13 @@ function SipScreen() {
         : await api.sip.create(value as Partial<SipAccount> & { name: string; login: string; password?: string })
       setData(value.id ? data.map(a => a.id === saved.id ? saved : a) : [...data, saved])
       setEditing(null)
+      if (saved.enabled && !saved.registered) {
+        setActionError(saved.last_error || `После сохранения REGISTER не прошёл: ${saved.registration_status || 'ожидание'}`)
+      }
     }}/>}
     {deleting && <ConfirmDelete name={deleting.name} onClose={() => setDeleting(null)} onDelete={async () => {
       await api.sip.remove(deleting.id); setData(data.filter(a => a.id !== deleting.id))
     }}/>}
-    {error && <button className="secondary" onClick={refresh}><RefreshCw size={16}/>Повторить</button>}
   </>
 }
 

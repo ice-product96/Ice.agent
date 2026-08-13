@@ -50,6 +50,7 @@ export interface SipAccount {
   max_concurrent_calls: number
   registered?: boolean
   registration_status?: string
+  last_error?: string | null
   status?: Status
   created_at?: string
   updated_at?: string

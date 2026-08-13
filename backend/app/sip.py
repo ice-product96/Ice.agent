@@ -80,6 +80,11 @@ class SipGateway:
     async def register_account(self, account: SipAccount) -> None:
         password = self.secrets.decrypt(account.password_ciphertext)
         if not password:
+            self._reg_status[account.id] = {
+                "registered": False,
+                "status": "error:no_password",
+                "error": "SIP account has no password",
+            }
             raise RuntimeError("SIP account has no password")
         async with self._lock:
             existing = self._agents.pop(account.id, None)
@@ -111,12 +116,29 @@ class SipGateway:
                 on_reg_state=lambda ok, status, aid=account.id: self._on_reg(aid, ok, status),
                 on_call_state=lambda cid, payload, aid=account.id: self._on_call_state(aid, cid, payload),
             )
-            await ua.start()
-            await ua.register()
+            try:
+                await ua.start()
+                await ua.register()
+            except Exception as exc:
+                try:
+                    await ua.close()
+                except Exception:
+                    pass
+                self._reg_status[account.id] = {
+                    "registered": False,
+                    "status": f"error:{exc}",
+                    "error": str(exc),
+                }
+                await self.events.publish(
+                    "sip.register_failed",
+                    {"account_id": account.id, "error": str(exc)},
+                )
+                raise
             self._agents[account.id] = ua
             self._reg_status[account.id] = {
                 "registered": ua.registered,
                 "status": ua.registration_status,
+                "error": None,
             }
             await self.events.publish(
                 "sip.registered",
