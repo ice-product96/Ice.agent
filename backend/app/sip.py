@@ -375,12 +375,26 @@ class SipGateway:
         async def on_hangup(reason: str) -> None:
             sip_call_id = sip_call_id_ref[0] if sip_call_id_ref else None
             if not sip_call_id:
+                for key, value in self._realtime.items():
+                    if value is session:
+                        sip_call_id = key
+                        break
+            if not sip_call_id:
+                logger.error("Agent hangup skipped: no SIP Call-ID (reason=%s)", reason)
                 return
             logger.info("Agent hangup %s reason=%s", sip_call_id[:24], reason)
             for ua in self._agents.values():
                 if sip_call_id in ua.calls:
                     await ua.hangup(sip_call_id, cause="agent_hangup")
                     return
+            logger.error(
+                "Agent hangup: call %s not in UA map — forcing gateway hangup",
+                sip_call_id[:24],
+            )
+            try:
+                await self.hangup(sip_call_id=sip_call_id)
+            except Exception:
+                logger.exception("Gateway hangup after agent end_call failed")
 
         async def on_transcript(role: str, text: str) -> None:
             sip_call_id = sip_call_id_ref[0] if sip_call_id_ref else None

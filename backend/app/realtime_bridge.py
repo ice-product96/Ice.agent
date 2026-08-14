@@ -27,17 +27,21 @@ OnEvent = Callable[[dict[str, Any]], Awaitable[None]]
 OnHangup = Callable[[str], Awaitable[None]]  # reason
 
 DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
-END_CALL_TOOL_NAMES = {"end_call", "sip_hangup", "hangup"}
+END_CALL_TOOL_NAMES = {"end_call", "sip_hangup", "hangup", "endcall"}
 _HANGUP_MARKER_RE = re.compile(
-    r"\[{1,2}\s*SIP[_ ]?HANGUP\s*\]{1,2}|\bend_call\b|\bSIP_HANGUP\b",
+    r"\[{1,2}\s*SIP[_ ]?HANGUP\s*\]{1,2}"
+    r"|\bSIP[_ ]HANGUP\b"
+    r"|\bsip\.hangup\b"
+    r"|\bend[_\s-]?call\b",
     re.IGNORECASE,
 )
 HANGUP_INSTRUCTION = (
-    "Ты на телефонной линии. Когда разговор закончен (абонент попрощался, "
-    "задача выполнена, просят положить трубку, или продолжать не о чем) — "
-    "коротко попрощайся вслух и сразу вызови инструмент end_call. "
-    "Не клади трубку в начале звонка и не произноси имя инструмента. "
-    "Запасной маркер в конце фразы: [[SIP_HANGUP]]."
+    "Завершение звонка: сначала коротко попрощайся обычными словами "
+    "(«До свидания», «Всего доброго»). "
+    "Потом молча вызови инструмент end_call — без слов вслух. "
+    "Никогда не произноси sip_hangup, end_call, SIP_HANGUP и похожие служебные слова. "
+    "Если инструмент недоступен, в самый конец реплики добавь маркер [[SIP_HANGUP]] "
+    "и не читай его. Пока разговор может продолжаться — трубку не клади."
 )
 END_CALL_TOOL = {
     "type": "function",
@@ -51,7 +55,28 @@ END_CALL_TOOL = {
     },
 }
 
-DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
+def _tool_name(blob: Any) -> str:
+    if not isinstance(blob, dict):
+        return ""
+    nested = blob.get("function") if isinstance(blob.get("function"), dict) else {}
+    raw = blob.get("name") or nested.get("name") or ""
+    return str(raw).strip().lower().replace("functions.", "").replace(" ", "_")
+
+
+def _event_hangup_tool(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Find an end_call/sip_hangup function call anywhere in a Realtime event."""
+    stack: list[Any] = [event]
+    seen = 0
+    while stack and seen < 40:
+        cur = stack.pop()
+        seen += 1
+        if isinstance(cur, dict):
+            if _tool_name(cur) in END_CALL_TOOL_NAMES:
+                return cur
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
 
 
 def _normalize_realtime_model(model: str | None) -> str:
@@ -582,10 +607,25 @@ class RealtimeSession:
             self._session_ready.set()
             self._session_updated.set()
 
-        if etype in {"response.function_call_arguments.done", "response.output_item.done"}:
-            item = event.get("item") if isinstance(event.get("item"), dict) else event
-            if str(item.get("type") or etype) in {"function_call", "response.function_call_arguments.done"} or item.get("name"):
-                await self._handle_tool_call(item if isinstance(item, dict) else event)
+        if etype not in {
+            "response.output_audio.delta",
+            "response.audio.delta",
+            "response.output_audio_transcript.delta",
+            "response.audio_transcript.delta",
+        }:
+            logger.info("Realtime event %s", etype)
+
+        hangup_item = _event_hangup_tool(event) if "function" in etype or etype in {
+            "response.done",
+            "response.output_item.added",
+            "response.output_item.done",
+            "conversation.item.added",
+            "conversation.item.created",
+            "response.function_call_arguments.done",
+            "response.function_call_arguments.delta",
+        } else None
+        if hangup_item is not None:
+            await self._handle_tool_call(hangup_item)
 
         if self.on_event:
             try:
@@ -626,17 +666,20 @@ class RealtimeSession:
             "response.audio_transcript.delta",
         }:
             text = event.get("transcript") or event.get("delta") or ""
-            if text and etype.endswith("done"):
-                self._assistant_parts.append(str(text))
-                if _HANGUP_MARKER_RE.search(str(text)):
-                    self.request_hangup("transcript_marker")
-                if self.on_transcript:
-                    await self.on_transcript("assistant", str(text))
-            elif text and etype.endswith("delta"):
+            if text and etype.endswith("delta"):
                 if self._assistant_parts and not self._assistant_parts[-1].endswith(" "):
                     self._assistant_parts[-1] = self._assistant_parts[-1] + str(text)
                 else:
                     self._assistant_parts.append(str(text))
+            elif text and etype.endswith("done"):
+                self._assistant_parts.append(str(text))
+                if self.on_transcript:
+                    await self.on_transcript("assistant", str(text))
+            combined = " ".join(self._assistant_parts[-3:])
+            if text and _HANGUP_MARKER_RE.search(str(text) + " " + combined):
+                # Cut unplayed tail so "sip hangup" is not spoken (Mtz bug).
+                self.playback.clear()
+                self.request_hangup("transcript_marker")
             return
 
         if etype == "response.done":
@@ -658,26 +701,27 @@ class RealtimeSession:
     def request_hangup(self, reason: str = "agent_hangup") -> None:
         if self._hangup_reason is not None or self.closed:
             return
-        if asyncio.get_running_loop().time() < self._greeting_until:
-            logger.info("Ignoring hangup during inbound greeting (%s)", reason)
-            return
         self._hangup_reason = reason
-        logger.info("Realtime hangup requested (%s) — waiting for playback to drain", reason)
+        logger.info("Realtime hangup requested (%s) playback=%s", reason, self.playback.pending())
         self._hangup_task = asyncio.create_task(self._drain_then_hangup(reason), name="rt-hangup")
 
     async def _drain_then_hangup(self, reason: str) -> None:
         idle = 0
-        for _ in range(100):
+        needed = 2 if self.playback.pending() == 0 else 6
+        for _ in range(80):
             if self.closed:
                 return
             if self.playback.pending() > 0:
                 idle = 0
             else:
                 idle += 1
-                if idle >= 8:
+                if idle >= needed:
                     break
             await asyncio.sleep(0.1)
-        if self.closed or self.on_hangup is None:
+        if self.closed:
+            return
+        if self.on_hangup is None:
+            logger.error("Realtime hangup: on_hangup callback is missing")
             return
         try:
             await self.on_hangup(reason)
@@ -685,9 +729,14 @@ class RealtimeSession:
             logger.exception("Realtime on_hangup failed")
 
     async def _handle_tool_call(self, item: dict[str, Any]) -> None:
-        name = str(item.get("name") or "").strip().lower()
+        name = _tool_name(item)
+        if name not in END_CALL_TOOL_NAMES:
+            nested = item.get("item") if isinstance(item.get("item"), dict) else {}
+            name = _tool_name(nested)
+            item = nested or item
         if name not in END_CALL_TOOL_NAMES:
             return
+        logger.info("Realtime end_call tool name=%s", name)
         call_id = str(item.get("call_id") or item.get("id") or "")
         reason = "agent_hangup"
         raw_args = item.get("arguments")
