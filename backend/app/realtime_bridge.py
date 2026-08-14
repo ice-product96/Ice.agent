@@ -44,16 +44,57 @@ def _realtime_ws_url(base_url: str | None, *, model: str | None = None) -> str:
     return url
 
 
-def _tcp_via_http_connect(proxy_url: str, target_host: str, target_port: int, timeout: float = 20.0) -> socket.socket:
+def _redact_proxy(proxy_url: str) -> str:
+    pu = urlparse(proxy_url.strip())
+    host = pu.hostname or "?"
+    port = pu.port or ("443" if pu.scheme == "https" else "80")
+    auth = "***@" if pu.username else ""
+    return f"{pu.scheme or 'http'}://{auth}{host}:{port}"
+
+
+def _rewrite_loopback_proxy(proxy_url: str) -> str:
+    """127.0.0.1 inside Docker is the container, not the host proxy."""
+    from pathlib import Path
+
+    if not Path("/.dockerenv").exists():
+        return proxy_url
+    pu = urlparse(proxy_url.strip())
+    host = (pu.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return proxy_url
+    rewritten = (
+        proxy_url.replace("://127.0.0.1", "://host.docker.internal", 1)
+        .replace("://localhost", "://host.docker.internal", 1)
+        .replace("://[::1]", "://host.docker.internal", 1)
+    )
+    logger.warning(
+        "Realtime proxy %s is loopback inside Docker — using %s (add extra_hosts host-gateway)",
+        _redact_proxy(proxy_url),
+        _redact_proxy(rewritten),
+    )
+    return rewritten
+
+
+def _tcp_via_http_connect(proxy_url: str, target_host: str, target_port: int, timeout: float = 45.0) -> socket.socket:
     """HTTP CONNECT tunnel — same approach as MtzVersion openai_wss_proxy."""
+    proxy_url = _rewrite_loopback_proxy(proxy_url)
     pu = urlparse(proxy_url.strip())
     if not pu.hostname:
         raise RuntimeError("HTTP proxy URL has no host")
     phost = pu.hostname
-    pport = int(pu.port or (443 if pu.scheme == "https" else 80))
-    sock = socket.create_connection((phost, pport), timeout=timeout)
+    scheme = (pu.scheme or "http").lower()
+    pport = int(pu.port or (443 if scheme == "https" else 80))
+    target = f"{target_host}:{int(target_port)}"
+    logger.info("Realtime WSS CONNECT %s via %s", target, _redact_proxy(proxy_url))
     try:
-        target = f"{target_host}:{int(target_port)}"
+        sock = socket.create_connection((phost, pport), timeout=timeout)
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"TCP to HTTP proxy {phost}:{pport} timed out — from Docker use host LAN IP or host.docker.internal, not 127.0.0.1"
+        ) from exc
+    try:
+        if scheme == "https":
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=phost)
         lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
         if pu.username:
             token = base64.b64encode(f"{pu.username}:{pu.password or ''}".encode()).decode("ascii")
@@ -63,7 +104,13 @@ def _tcp_via_http_connect(proxy_url: str, target_host: str, target_port: int, ti
         sock.sendall("\r\n".join(lines).encode("ascii"))
         buf = b""
         while b"\r\n\r\n" not in buf:
-            chunk = sock.recv(16384)
+            try:
+                chunk = sock.recv(16384)
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"HTTP CONNECT {target} via {phost}:{pport} got no reply — "
+                    "this proxy does not tunnel WSS. Need CONNECT to port 443, or socks5h://user:pass@host:1080"
+                ) from exc
             if not chunk:
                 raise OSError("proxy closed before CONNECT response")
             buf += chunk
@@ -71,9 +118,11 @@ def _tcp_via_http_connect(proxy_url: str, target_host: str, target_port: int, ti
                 raise OSError("CONNECT response too large")
         status = buf.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
         if " 200" not in status:
-            raise OSError(f"CONNECT rejected: {status!r}")
+            raise OSError(
+                f"CONNECT rejected: {status!r} — proxy must allow CONNECT to {target} (not just HTTP GET/POST)"
+            )
         sock.settimeout(None)
-        logger.info("Realtime WSS HTTP CONNECT %s via %s:%s", target, phost, pport)
+        logger.info("Realtime WSS HTTP CONNECT ok %s via %s:%s", target, phost, pport)
         return sock
     except Exception:
         try:
@@ -84,19 +133,28 @@ def _tcp_via_http_connect(proxy_url: str, target_host: str, target_port: int, ti
 
 
 async def _open_proxied_socket(ws_url: str, http_proxy: str):
-    """TCP to Realtime host via HTTP CONNECT (preferred) or SOCKS."""
+    """TCP to Realtime host via HTTP CONNECT or SOCKS5/SOCKS5h."""
     parsed = urlparse(ws_url)
     host = parsed.hostname
     if not host:
         raise RuntimeError(f"Invalid Realtime WebSocket URL: {ws_url}")
     port = parsed.port or (443 if parsed.scheme == "wss" else 80)
-    scheme = (urlparse(http_proxy.strip()).scheme or "http").lower()
+    proxy_url = _rewrite_loopback_proxy(http_proxy)
+    scheme = (urlparse(proxy_url.strip()).scheme or "http").lower()
     if scheme in {"http", "https", ""}:
-        return await asyncio.to_thread(_tcp_via_http_connect, http_proxy, host, port, 20.0)
+        return await asyncio.to_thread(_tcp_via_http_connect, proxy_url, host, port, 45.0)
+    if scheme not in {"socks5", "socks5h", "socks4", "socks4a"}:
+        raise RuntimeError(
+            f"Unsupported proxy scheme {scheme!r}. Use http:// (CONNECT) or socks5h://host:1080"
+        )
     from python_socks.async_.asyncio import Proxy
 
-    proxy = Proxy.from_url(http_proxy.strip())
-    return await asyncio.wait_for(proxy.connect(dest_host=host, dest_port=port), timeout=20.0)
+    try:
+        proxy = Proxy.from_url(proxy_url.strip(), rdns=scheme.endswith("h"))
+    except TypeError:
+        proxy = Proxy.from_url(proxy_url.strip())
+    logger.info("Realtime WSS SOCKS %s via %s", f"{host}:{port}", _redact_proxy(proxy_url))
+    return await asyncio.wait_for(proxy.connect(dest_host=host, dest_port=port), timeout=45.0)
 
 
 def build_client_secret_session(*, model: str) -> dict[str, Any]:
@@ -218,7 +276,7 @@ class RealtimeSession:
         self.instructions = instructions
         self.voice = voice
         self.model = (model or DEFAULT_REALTIME_MODEL).strip() or DEFAULT_REALTIME_MODEL
-        self.http_proxy = (http_proxy or "").strip() or None
+        self.http_proxy = _rewrite_loopback_proxy((http_proxy or "").strip()) if (http_proxy or "").strip() else None
         self.on_transcript = on_transcript
         self.on_event = on_event
         self.playback = PlaybackBuffer()
@@ -310,7 +368,7 @@ class RealtimeSession:
                 "Realtime connecting model=%s url=%s proxy=%s",
                 self.model,
                 direct_url,
-                self.http_proxy or "-",
+                self.http_proxy and _redact_proxy(self.http_proxy) or "-",
             )
             await self._handshake(direct_url, self.api_key, session)
             logger.info("Realtime connected (API key) model=%s", self.model)
@@ -319,6 +377,9 @@ class RealtimeSession:
             errors.append(f"direct: {direct_exc}")
             logger.warning("Realtime direct WS failed: %s — trying client_secrets", direct_exc)
             await self._close_socket()
+            # Same TCP CONNECT is required for the ephemeral-key WebSocket — retrying it only burns the call.
+            if "CONNECT" in str(direct_exc) or "TCP to HTTP proxy" in str(direct_exc):
+                raise RuntimeError(" | ".join(errors)) from direct_exc
 
         try:
             secret = await create_client_secret(
