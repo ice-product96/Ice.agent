@@ -204,3 +204,31 @@ def test_reflective_tool_schema() -> None:
     assert schema["name"] == "add"
     assert schema["parameters"]["properties"]["a"]["type"] == "integer"
     assert schema["parameters"]["required"] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_gpt56_chat_tools_set_reasoning_effort_none() -> None:
+    from types import SimpleNamespace
+
+    from app.integrations import LLMClient
+
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs: object) -> object:
+            captured.update(kwargs)
+            message = SimpleNamespace(
+                content="ok",
+                tool_calls=None,
+                model_dump=lambda exclude_none=True: {"role": "assistant", "content": "ok"},
+            )
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    client = LLMClient(api_key="k", base_url=None, model="gpt-5.6-luna", max_rounds=1)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    registry = ToolRegistry()
+    registry.register(lambda q: "hit", "web_search")
+    result = await client.complete([{"role": "user", "content": "hi"}], registry, set())
+    assert result == "ok"
+    assert captured["reasoning_effort"] == "none"
+    assert captured["tools"]

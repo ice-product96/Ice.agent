@@ -7,10 +7,20 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
-from openai import AsyncOpenAI
+from openai import APIStatusError, AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .tools import ToolRegistry
+
+
+def _chat_tools_need_no_reasoning(model: str) -> bool:
+    """gpt-5.6-* rejects tools + reasoning_effort on /v1/chat/completions."""
+    return "gpt-5.6" in (model or "").strip().lower()
+
+
+def _is_tools_reasoning_conflict(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "reasoning_effort" in text and "function tools" in text
 
 
 class LLMClient:
@@ -53,11 +63,13 @@ class LLMClient:
         permissions: set[str] | None = None,
     ) -> str:
         conversation = list(messages)
+        tool_schemas = tools.schemas() or None
+        reasoning_effort: str | None = "none" if tool_schemas and _chat_tools_need_no_reasoning(self.model) else None
         for _ in range(self.max_rounds):
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=conversation,
-                tools=tools.schemas() or None,
+            response = await self._chat_complete(
+                conversation,
+                tool_schemas,
+                reasoning_effort=reasoning_effort,
             )
             message = response.choices[0].message
             conversation.append(message.model_dump(exclude_none=True))
@@ -72,6 +84,28 @@ class LLMClient:
                     content = json.dumps({"error": str(exc)})
                 conversation.append({"role": "tool", "tool_call_id": call.id, "content": content})
         raise RuntimeError("Maximum tool-call rounds exceeded")
+
+    async def _chat_complete(
+        self,
+        conversation: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]] | None,
+        *,
+        reasoning_effort: str | None,
+    ) -> Any:
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": conversation,
+            "tools": tool_schemas,
+        }
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
+        try:
+            return await self.client.chat.completions.create(**kwargs)
+        except APIStatusError as exc:
+            if tool_schemas and reasoning_effort != "none" and _is_tools_reasoning_conflict(exc):
+                kwargs["reasoning_effort"] = "none"
+                return await self.client.chat.completions.create(**kwargs)
+            raise
 
 
 class MemoryStore:
