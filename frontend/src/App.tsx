@@ -561,8 +561,7 @@ function SipAccountForm({ value, onClose, onSave }: {
         <Field label="STUN"><input value={form.stun_server || ''} onChange={e => patch({ stun_server: e.target.value })}/></Field>
         <Field label="Макс. параллельных звонков"><input type="number" min={1} max={32} value={form.max_concurrent_calls ?? 1} onChange={e => patch({ max_concurrent_calls: Number(e.target.value) || 1 })}/></Field>
         <Field label="Гудок до ответа, сек" hint="Сколько секунд абонент слышит гудок (180 Ringing), прежде чем агент возьмёт трубку. 0 — сразу."><input type="number" min={0} max={30} step={0.5} value={form.ring_delay_seconds ?? 4} onChange={e => patch({ ring_delay_seconds: Number(e.target.value) })}/></Field>
-        <div className="toggle-box"><Toggle label="Включён" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div>
-        <div className="toggle-box"><Toggle label="REGISTER при старте" checked={form.register_on_startup ?? true} onChange={v => patch({ register_on_startup: v })}/></div>
+        <div className="toggle-box"><Toggle label="Включён — REGISTER и входящие автоматически" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div>
       </div>
       <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Отмена</button><button className="primary" disabled={busy}>{busy && <LoaderCircle className="spin" size={16}/>}Сохранить</button></div>
     </form>

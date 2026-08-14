@@ -61,6 +61,8 @@ class SipGateway:
         self._call_map: dict[str, int] = {}  # sip call-id -> sip_calls.id
         self._realtime: dict[str, RealtimeSession] = {}  # sip call-id -> session
         self._pending_realtime: dict[str, asyncio.Task[RealtimeSession]] = {}
+        self._desired: dict[int, SipAccount] = {}
+        self._keeper_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -92,14 +94,15 @@ class SipGateway:
     async def restore(self, accounts: list[SipAccount]) -> dict[int, str]:
         results: dict[int, str] = {}
         for account in accounts:
-            if not account.enabled or not account.register_on_startup:
+            if not account.enabled:
                 results[account.id] = "skipped"
                 continue
+            self._desired[account.id] = account
             try:
                 await self.register_account(account)
                 results[account.id] = "registered"
             except Exception as exc:
-                logger.exception("SIP restore failed for %s", account.login)
+                logger.warning("SIP initial REGISTER failed for %s: %s — keeper will retry", account.login, exc)
                 detail = exception_text(exc)
                 results[account.id] = f"error:{detail}"
                 self._reg_status[account.id] = {
@@ -111,7 +114,36 @@ class SipGateway:
                     "sip.register_failed",
                     {"account_id": account.id, "error": detail},
                 )
+        if self._keeper_task is None or self._keeper_task.done():
+            self._keeper_task = asyncio.create_task(self._registration_keeper(), name="sip-keeper")
         return results
+
+    async def _registration_keeper(self) -> None:
+        """Keep enabled SIP accounts registered across restarts, NAT drops, and calls."""
+        while True:
+            await asyncio.sleep(8)
+            for account_id, account in list(self._desired.items()):
+                if not account.enabled:
+                    continue
+                ua = self._agents.get(account_id)
+                if ua is not None and ua.registered:
+                    continue
+                logger.info("SIP keeper: registering %s", account.login)
+                try:
+                    if ua is not None:
+                        try:
+                            await ua.register()
+                            self._reg_status[account_id] = {
+                                "registered": ua.registered,
+                                "status": ua.registration_status,
+                                "error": None,
+                            }
+                            continue
+                        except Exception:
+                            logger.warning("SIP keeper: in-place REGISTER failed for %s — rebuilding UA", account.login)
+                    await self.register_account(account)
+                except Exception as exc:
+                    logger.warning("SIP keeper retry failed for %s: %s", account.login, exc)
 
     async def register_account(self, account: SipAccount) -> None:
         password = self.secrets.decrypt(account.password_ciphertext)
@@ -122,6 +154,10 @@ class SipGateway:
                 "error": "SIP account has no password",
             }
             raise RuntimeError("SIP account has no password")
+        if account.enabled:
+            self._desired[account.id] = account
+            if self._keeper_task is None or self._keeper_task.done():
+                self._keeper_task = asyncio.create_task(self._registration_keeper(), name="sip-keeper")
         async with self._lock:
             existing = self._agents.pop(account.id, None)
             if existing:
@@ -180,6 +216,8 @@ class SipGateway:
                 )
                 raise
             self._agents[account.id] = ua
+            if account.enabled:
+                self._desired[account.id] = account
             self._reg_status[account.id] = {
                 "registered": ua.registered,
                 "status": ua.registration_status,
@@ -191,6 +229,7 @@ class SipGateway:
             )
 
     async def unregister_account(self, account_id: int) -> None:
+        self._desired.pop(account_id, None)
         async with self._lock:
             ua = self._agents.pop(account_id, None)
             if ua:
@@ -198,6 +237,14 @@ class SipGateway:
             self._reg_status[account_id] = {"registered": False, "status": "offline"}
 
     async def close(self) -> None:
+        if self._keeper_task:
+            self._keeper_task.cancel()
+            try:
+                await self._keeper_task
+            except asyncio.CancelledError:
+                pass
+            self._keeper_task = None
+        self._desired.clear()
         async with self._lock:
             agents = list(self._agents.items())
             self._agents.clear()
@@ -621,9 +668,10 @@ class SipGateway:
                 "hangup_cause": cause,
                 "transcript": transcript,
             }
-            # Refresh REGISTER so NAT binding / Contact stays alive after a call.
+            # NAT mapping is kept by OPTIONS keepalive; a full REGISTER here
+            # used to get 481/401 and drop inbound until the user clicked Register.
             ua = self._agents.get(account_id)
-            if ua is not None and ua.registered:
+            if ua is not None and not ua.registered:
                 asyncio.create_task(self._refresh_register(account_id), name=f"sip-refresh-{account_id}")
         if fields:
             await self._update_db_call(sip_call_id, **fields)

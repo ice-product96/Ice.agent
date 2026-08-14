@@ -928,7 +928,7 @@ async def create_sip_account(
     db.add(account)
     await db.commit()
     await db.refresh(account)
-    if account.enabled and account.register_on_startup and getattr(request.app.state, "sip", None):
+    if account.enabled and getattr(request.app.state, "sip", None):
         try:
             await request.app.state.sip.register_account(account)
         except Exception as exc:

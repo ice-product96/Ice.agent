@@ -378,9 +378,11 @@ class SipUserAgent:
         self._proxy_ip = self._proxy_host
         self._resolved: dict[str, str] = {}
         self._cseq = 1
-        self._call_id_reg = f"{random.randint(10**10, 10**12)}@{self.local_ip}"
+        self._reg_cseq = 1
+        self._call_id_reg = f"{random.randint(10**10, 10**12)}@ice-reg"
         self._from_tag = f"{random.randint(10**6, 10**9)}"
         self._reg_task: asyncio.Task[None] | None = None
+        self._keep_task: asyncio.Task[None] | None = None
         self._pending: dict[str, asyncio.Future[tuple[int, dict[str, str], str]]] = {}
         self.calls: dict[str, ActiveCall] = {}
         self._rtp_ports = set(range(config.rtp_port_min, config.rtp_port_max + 1, 2))
@@ -466,12 +468,15 @@ class SipUserAgent:
 
     async def close(self) -> None:
         self._closed = True
-        if self._reg_task:
-            self._reg_task.cancel()
-            try:
-                await self._reg_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._reg_task, self._keep_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._reg_task = None
+        self._keep_task = None
         for call in list(self.calls.values()):
             await self.hangup(call.call_id, cause="shutdown")
         if self.registered:
@@ -622,21 +627,29 @@ class SipUserAgent:
                     f"(header={challenge_raw[:180]!r})"
                 )
             headers[auth_hdr] = self._auth_header(method, request_uri, challenge)
-            self._cseq += 1
-            headers["CSeq"] = f"{self._cseq} {method}"
+            parts = str(headers.get("CSeq") or f"1 {method}").split()
+            try:
+                num = int(parts[0]) + 1
+            except ValueError:
+                num = self._cseq + 1
+            headers["CSeq"] = f"{num} {method}"
+            if method == "REGISTER":
+                self._reg_cseq = num
+            else:
+                self._cseq = num
             headers.pop("Via", None)
             return await self._request(method, request_uri, headers, body, addr, auth_retry=False)
         return status, resp_headers, resp_body
 
-    async def register(self, expires: int = 600) -> None:
+    async def register(self, expires: int = 600, *, recover_dialog: bool = True) -> None:
         self.registration_status = "registering"
         request_uri = f"sip:{self.config.domain}"
-        self._cseq += 1
+        self._reg_cseq += 1
         headers = {
             "From": self._from(),
             "To": f"<{_sip_uri(self.config.login, self.config.domain)}>",
             "Call-ID": self._call_id_reg,
-            "CSeq": f"{self._cseq} REGISTER",
+            "CSeq": f"{self._reg_cseq} REGISTER",
             "Contact": self._contact(),
             "Expires": str(expires),
             "Allow": "INVITE, ACK, CANCEL, BYE, OPTIONS, INFO",
@@ -650,6 +663,14 @@ class SipUserAgent:
             if self.on_reg_state:
                 await self.on_reg_state(False, self.registration_status)
             raise RuntimeError(detail) from exc
+        if status in {401, 407} and recover_dialog:
+            # Auth retry in _request should have consumed 401; leftover 401 means nonce/dialog is stale.
+            self._new_register_dialog()
+            return await self.register(expires, recover_dialog=False)
+        if status == 481 and recover_dialog:
+            logger.warning("SIP REGISTER 481 Unknown Dialog — new Call-ID for %s", self.config.login)
+            self._new_register_dialog()
+            return await self.register(expires, recover_dialog=False)
         if status in {200, 202}:
             self.registered = True
             self.registration_status = "registered"
@@ -657,6 +678,8 @@ class SipUserAgent:
                 await self.on_reg_state(True, "registered")
             if self._reg_task is None or self._reg_task.done():
                 self._reg_task = asyncio.create_task(self._reregister_loop(expires), name=f"sip-reg-{self.config.account_id}")
+            if self._keep_task is None or self._keep_task.done():
+                self._keep_task = asyncio.create_task(self._keepalive_loop(), name=f"sip-keep-{self.config.account_id}")
             return
         self.registered = False
         reason = (resp_headers.get("Reason-Phrase") or "").strip()
@@ -670,14 +693,19 @@ class SipUserAgent:
             await self.on_reg_state(False, detail)
         raise RuntimeError(detail)
 
+    def _new_register_dialog(self) -> None:
+        self._call_id_reg = f"{random.randint(10**10, 10**12)}@ice-reg"
+        self._from_tag = f"{random.randint(10**6, 10**9)}"
+        self._reg_cseq = 1
+
     async def unregister(self) -> None:
         request_uri = f"sip:{self.config.domain}"
-        self._cseq += 1
+        self._reg_cseq += 1
         headers = {
             "From": self._from(),
             "To": f"<{_sip_uri(self.config.login, self.config.domain)}>",
             "Call-ID": self._call_id_reg,
-            "CSeq": f"{self._cseq} REGISTER",
+            "CSeq": f"{self._reg_cseq} REGISTER",
             "Contact": self._contact(),
             "Expires": "0",
         }
@@ -686,14 +714,40 @@ class SipUserAgent:
         self.registration_status = "unregistered"
 
     async def _reregister_loop(self, expires: int) -> None:
+        interval = max(30, int(expires) - 30)
         while not self._closed:
-            await asyncio.sleep(max(30, expires - 30))
+            await asyncio.sleep(interval)
+            if self._closed:
+                return
             try:
                 await self.register(expires)
+                interval = max(30, int(expires) - 30)
             except Exception as exc:
                 logger.warning("SIP re-REGISTER failed for %s: %s", self.config.login, exc)
                 self.registered = False
                 self.registration_status = f"error:{exc}"
+                interval = 15
+
+    async def _keepalive_loop(self) -> None:
+        """UDP NAT hole-punch: OPTIONS to the proxy while registered."""
+        while not self._closed:
+            await asyncio.sleep(20)
+            if self._closed or not self.registered:
+                continue
+            try:
+                self._cseq += 1
+                await self._request(
+                    "OPTIONS",
+                    f"sip:{self.config.domain}",
+                    {
+                        "From": self._from(),
+                        "To": f"<{_sip_uri(self.config.login, self.config.domain)}>",
+                        "Call-ID": f"{random.randint(10**10, 10**12)}@ice-opt",
+                        "CSeq": f"{self._cseq} OPTIONS",
+                    },
+                )
+            except Exception as exc:
+                logger.info("SIP OPTIONS keepalive failed for %s: %s", self.config.login, exc)
 
     def _parse_message(self, text: str) -> tuple[str, dict[str, str], str]:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -719,15 +773,10 @@ class SipUserAgent:
     def _complete_pending(self, branch: str, result: tuple[int, dict[str, str], str]) -> None:
         fut = self._pending.get(branch)
         if fut is None or fut.done():
-            pending = [item for item in self._pending.values() if not item.done()]
-            if len(pending) == 1:
-                fut = pending[0]
-            else:
-                if branch:
-                    logger.debug("SIP unmatched response branch=%s pending=%s", branch, list(self._pending))
-                return
-        if not fut.done():
-            fut.set_result(result)
+            if branch:
+                logger.debug("SIP unmatched response branch=%s pending=%s", branch, list(self._pending))
+            return
+        fut.set_result(result)
 
     async def handle_message(self, text: str, addr: tuple[str, int]) -> None:
         start, headers, body = self._parse_message(text)
