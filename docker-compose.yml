@@ -85,7 +85,8 @@ services:
     ports:
       # LAN + localhost; 8000 внутри контейнера не конфликтует с pokerclub (у них без host publish)
       - "8040:8000"
-      # SIP UA (signaling + RTP). Host firewall must allow UDP if NAT/public АТС.
+      # SIP UA (signaling + RTP). Like MtzVersion, early-media RTP punches NAT even
+      # without host networking; publishing ports + ICE_SIP_PUBLIC_IP still helps.
       - "5060:5060/udp"
       - "10000-10199:10000-10199/udp"
     environment:

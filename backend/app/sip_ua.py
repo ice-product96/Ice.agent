@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import random
 import re
 import socket
@@ -18,6 +19,7 @@ from .sip_audio import (
     OPENAI_FRAME_SAMPLES,
     SIP_FRAME_SAMPLES,
     Codec,
+    g711_encode,
     openai_to_sip,
     sip_to_openai,
 )
@@ -238,6 +240,25 @@ def _rtp_header(pt: int, seq: int, ts: int, ssrc: int, marker: int = 0) -> bytes
     b0 = 0x80
     b1 = ((1 if marker else 0) << 7) | (pt & 0x7F)
     return struct.pack("!BBHII", b0, b1, seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc & 0xFFFFFFFF)
+
+
+def _ringback_pcm8k_frame(sample_index: int) -> bytes:
+    """Russian-style ringback ~425 Hz, 1s tone / 2.5s silence — same idea as MtzVersion."""
+    n = SIP_FRAME_SAMPLES
+    tone_hz = 425.0
+    tone_ms = 1000.0
+    cycle_ms = 3500.0
+    out = bytearray(n * 2)
+    view = memoryview(out).cast("h")
+    for i in range(n):
+        idx = sample_index + i
+        t_ms = (idx / 8000.0) * 1000.0
+        in_tone = (t_ms % cycle_ms) < tone_ms
+        if in_tone:
+            view[i] = int(0.22 * 32767.0 * math.sin(2.0 * math.pi * tone_hz * idx / 8000.0))
+        else:
+            view[i] = 0
+    return bytes(out)
 
 
 class RtpProtocol(asyncio.DatagramProtocol):
@@ -809,7 +830,7 @@ class SipUserAgent:
             "a=sendrecv\r\n"
         )
 
-    async def _setup_rtp(self, call: ActiveCall) -> None:
+    async def _setup_rtp(self, call: ActiveCall, *, start_loop: bool = True) -> None:
         loop = asyncio.get_running_loop()
         transport, protocol = await loop.create_datagram_endpoint(
             lambda: RtpProtocol(call),
@@ -817,11 +838,11 @@ class SipUserAgent:
         )
         call.rtp_transport = transport
         call.rtp_protocol = protocol
-        # Send RTP immediately (silence) so NAT hole opens — Mtz runs on host;
-        # in Docker/NAT we must TX first or remote never reaches us.
-        call.media_tx_enabled = True
         call.rtp_marker_next = True
-        call.media_task = asyncio.create_task(self._media_loop(call), name=f"rtp-tx-{call.call_id}")
+        if start_loop:
+            # Send RTP immediately (silence) so NAT hole opens.
+            call.media_tx_enabled = True
+            call.media_task = asyncio.create_task(self._media_loop(call), name=f"rtp-tx-{call.call_id}")
 
     async def _media_loop(self, call: ActiveCall) -> None:
         try:
@@ -1002,7 +1023,23 @@ class SipUserAgent:
     ) -> None:
         if call.state == "ringing":
             self._reply(100, "Trying", headers, addr, extra={"To": call.to_header})
-            self._reply(180, "Ringing", headers, addr, extra={"To": call.to_header})
+            # Prefer 183+SDP retransmit once early media is up (Mtz-style).
+            if call.rtp_protocol is not None:
+                sdp = self._local_sdp(call.local_rtp_port, call.codec)
+                self._reply(
+                    183,
+                    "Session Progress",
+                    headers,
+                    addr,
+                    extra={
+                        "To": call.to_header,
+                        "Content-Type": "application/sdp",
+                        "Content-Length": str(len(sdp.encode("utf-8"))),
+                    },
+                    body=sdp,
+                )
+            else:
+                self._reply(180, "Ringing", headers, addr, extra={"To": call.to_header})
             return
         if call.state == "answered":
             sdp = self._local_sdp(call.local_rtp_port, call.codec)
@@ -1019,6 +1056,43 @@ class SipUserAgent:
                 body=sdp,
             )
 
+    async def _stream_early_ringback(self, call: ActiveCall, duration: float) -> None:
+        """183 early-media ringback — punches Docker/NAT UDP mapping like MtzVersion."""
+        if duration <= 0 or call.rtp_protocol is None:
+            return
+        pt = 0 if call.codec == "pcmu" else 8
+        sample_idx = 0
+        deadline = time.time() + duration
+        logger.info(
+            "SIP early media ringback %.1fs -> %s:%s call=%s",
+            duration,
+            call.remote_rtp_host,
+            call.remote_rtp_port,
+            call.call_id[:24],
+        )
+        while time.time() < deadline:
+            if call.cancelled is not None and call.cancelled.is_set():
+                return
+            if call.call_id not in self.calls or call.state not in {"ringing", "early"}:
+                return
+            pcm8 = _ringback_pcm8k_frame(sample_idx)
+            sample_idx += SIP_FRAME_SAMPLES
+            payload = g711_encode(pcm8, call.codec)
+            # Bypass media_tx gate — early media must always TX.
+            if call.rtp_protocol and call.remote_rtp_host and call.remote_rtp_port:
+                marker = 1 if sample_idx == SIP_FRAME_SAMPLES else 0
+                pkt = _rtp_header(pt, call.seq, call.timestamp, call.ssrc, marker)
+                call.seq = (call.seq + 1) & 0xFFFF
+                call.timestamp = (call.timestamp + SIP_FRAME_SAMPLES) & 0xFFFFFFFF
+                try:
+                    assert call.rtp_transport is not None
+                    call.rtp_transport.sendto(pkt + payload, (call.remote_rtp_host, call.remote_rtp_port))
+                    call.rtp_packets_tx += 1
+                except OSError as exc:
+                    logger.warning("early media RTP send failed: %s", exc)
+                    return
+            await asyncio.sleep(0.02)
+
     async def _answer_after_ring(self, call: ActiveCall) -> None:
         try:
             await self._answer_after_ring_inner(call)
@@ -1027,21 +1101,58 @@ class SipUserAgent:
 
     async def _answer_after_ring_inner(self, call: ActiveCall) -> None:
         delay = max(0.0, float(self.config.ring_delay_seconds if self.config.ring_delay_seconds is not None else 0))
-        if delay > 0 and call.cancelled is not None:
-            try:
-                await asyncio.wait_for(call.cancelled.wait(), timeout=delay)
-            except TimeoutError:
-                pass
-            else:
-                return
-        if call.call_id not in self.calls or call.state != "ringing":
-            return
-        if call.cancelled is not None and call.cancelled.is_set():
-            return
         headers = call.invite_headers
         addr = call.invite_addr
         if not headers or addr is None:
             return
+
+        # MtzVersion Docker trick: 183 + SDP + RTP ringback BEFORE 200 OK.
+        # Outbound RTP creates NAT mapping so media works without publishing every port
+        # and without a perfect Public IP in SDP.
+        if delay > 0:
+            sdp = self._local_sdp(call.local_rtp_port, call.codec)
+            self._reply(
+                183,
+                "Session Progress",
+                headers,
+                addr,
+                extra={
+                    "To": call.to_header,
+                    "Content-Type": "application/sdp",
+                    "Content-Length": str(len(sdp.encode("utf-8"))),
+                },
+                body=sdp,
+            )
+            call.state = "early"
+            await self._setup_rtp(call, start_loop=False)
+            call.media_tx_enabled = False
+            ring_task = asyncio.create_task(
+                self._stream_early_ringback(call, delay),
+                name=f"sip-early-{call.call_id[:16]}",
+            )
+            if call.cancelled is not None:
+                try:
+                    await asyncio.wait_for(call.cancelled.wait(), timeout=delay)
+                    ring_task.cancel()
+                    try:
+                        await ring_task
+                    except asyncio.CancelledError:
+                        pass
+                    return
+                except TimeoutError:
+                    pass
+            else:
+                await ring_task
+            if call.call_id not in self.calls:
+                return
+            if call.cancelled is not None and call.cancelled.is_set():
+                return
+
+        if call.call_id not in self.calls or call.state not in {"ringing", "early"}:
+            return
+        if call.cancelled is not None and call.cancelled.is_set():
+            return
+
         sdp = self._local_sdp(call.local_rtp_port, call.codec)
         self._reply(
             200,
@@ -1055,11 +1166,19 @@ class SipUserAgent:
             },
             body=sdp,
         )
-        await self._setup_rtp(call)
+        if call.rtp_protocol is None:
+            await self._setup_rtp(call)
+        else:
+            # Resume normal media loop after early media.
+            call.media_tx_enabled = True
+            call.rtp_marker_next = True
+            if call.media_task is None or call.media_task.done():
+                call.media_task = asyncio.create_task(
+                    self._media_loop(call),
+                    name=f"rtp-tx-{call.call_id}",
+                )
         call.state = "answered"
         call.answered_at = time.time()
-        # Bind Realtime / media without blocking SIP ACKs longer than needed:
-        # fire callback as task if it is slow (OpenAI connect).
         if self.on_incoming:
             asyncio.create_task(self._safe_on_incoming(call), name=f"sip-in-{call.call_id[:16]}")
         if self.on_call_state:
