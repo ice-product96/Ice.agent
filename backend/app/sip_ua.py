@@ -30,6 +30,18 @@ OnRtpPcm24 = Callable[[bytes], Awaitable[None]]
 OnCallState = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
+def _header_sip_uri(value: str) -> str:
+    match = re.search(r"(sip:[^\s;>]+)", value or "", re.I)
+    return match.group(1).strip() if match else ""
+
+
+def _header_cseq_num(headers: dict[str, str]) -> int:
+    try:
+        return int((headers.get("CSeq") or "1").split()[0])
+    except (IndexError, ValueError):
+        return 1
+
+
 def _md5(*parts: str) -> str:
     return hashlib.md5(":".join(parts).encode("utf-8")).hexdigest()
 
@@ -1047,6 +1059,7 @@ class SipUserAgent:
             local_rtp_port=rtp_port,
             codec=codec,
             state="ringing",
+            cseq=_header_cseq_num(headers),
             from_header=headers.get("From", ""),
             to_header=to_header,
             contact=headers.get("Contact", ""),
@@ -1383,6 +1396,11 @@ class SipUserAgent:
             call.remote_rtp_host,
             call.remote_rtp_port,
         )
+        if send_bye:
+            try:
+                self._send_bye(call)
+            except Exception:
+                logger.exception("SIP BYE failed for %s", call_id[:24])
         if call.media_task:
             call.media_task.cancel()
             try:
@@ -1392,21 +1410,49 @@ class SipUserAgent:
         if call.rtp_transport:
             call.rtp_transport.close()
         self._release_rtp_port(call.local_rtp_port)
-        if send_bye and call.direction and call.remote_host:
-            self._cseq += 1
-            request_uri = f"sip:{call.remote_number}@{self.config.domain}"
-            bye = (
-                f"BYE {request_uri} SIP/2.0\r\n"
-                f"Via: SIP/2.0/UDP {self.local_ip}:{self.config.local_sip_port};rport;branch=z9hG4bK{random.randint(10**8, 10**12)}\r\n"
-                f"From: {call.from_header}\r\n"
-                f"To: {call.to_header}\r\n"
-                f"Call-ID: {call.call_id}\r\n"
-                f"CSeq: {self._cseq} BYE\r\n"
-                f"Content-Length: 0\r\n\r\n"
-            )
-            try:
-                self._send(bye, (call.remote_host, call.remote_port))
-            except Exception:
-                pass
         if self.on_call_state:
             await self.on_call_state(call_id, {"status": "ended", "cause": cause})
+
+    def _send_bye(self, call: ActiveCall) -> None:
+        dest = call.invite_addr
+        if dest is None and call.remote_host:
+            dest = (call.remote_host, call.remote_port)
+        if dest is None:
+            logger.warning("SIP BYE skipped: no destination for %s", call.call_id[:24])
+            return
+        call.cseq += 1
+        if call.direction == "inbound":
+            request_uri = (
+                _header_sip_uri(call.contact)
+                or _header_sip_uri(call.from_header)
+                or f"sip:{call.remote_number}@{self.config.domain}"
+            )
+            from_line = call.to_header
+            to_line = call.from_header
+        else:
+            request_uri = f"sip:{call.remote_number}@{self.config.domain}"
+            from_line = call.from_header
+            to_line = call.to_header
+        route = (call.invite_headers or {}).get("Record-Route", "")
+        route_line = f"Route: {route}\r\n" if route else ""
+        bye = (
+            f"BYE {request_uri} SIP/2.0\r\n"
+            f"Via: SIP/2.0/UDP {self.local_ip}:{self.config.local_sip_port};rport;branch=z9hG4bK{random.randint(10**8, 10**12)}\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"From: {from_line}\r\n"
+            f"To: {to_line}\r\n"
+            f"Call-ID: {call.call_id}\r\n"
+            f"CSeq: {call.cseq} BYE\r\n"
+            f"{route_line}"
+            f"Content-Length: 0\r\n\r\n"
+        )
+        logger.info(
+            "SIP TX BYE uri=%s from=%s to=%s dest=%s:%s dir=%s",
+            request_uri,
+            from_line[:80],
+            to_line[:80],
+            dest[0],
+            dest[1],
+            call.direction,
+        )
+        self._send(bye, dest)

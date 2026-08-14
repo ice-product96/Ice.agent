@@ -35,6 +35,16 @@ _HANGUP_MARKER_RE = re.compile(
     r"|\bend[_\s-]?call\b",
     re.IGNORECASE,
 )
+_FAREWELL_RE = re.compile(
+    r"до\s+свидан|всего\s+добр|до\s+связи|хорошего\s+(дня|вечера)|"
+    r"\bgoodbye\b|\bbye-?bye\b|\bhang\s*up\b",
+    re.IGNORECASE,
+)
+_USER_BYE_RE = re.compile(
+    r"до\s+свидан|(?<![А-Яа-яЁё])пока(?![А-Яа-яЁё])|клади\s+трубк|"
+    r"заверш[аи].{0,16}звон|\bgoodbye\b|\bhang\s*up\b|(?<![A-Za-z])bye(?![A-Za-z])",
+    re.IGNORECASE,
+)
 HANGUP_INSTRUCTION = (
     "Завершение звонка: сначала коротко попрощайся обычными словами "
     "(«До свидания», «Всего доброго»). "
@@ -71,7 +81,13 @@ def _event_hangup_tool(event: dict[str, Any]) -> dict[str, Any] | None:
         cur = stack.pop()
         seen += 1
         if isinstance(cur, dict):
-            if _tool_name(cur) in END_CALL_TOOL_NAMES:
+            item_type = str(cur.get("type") or "")
+            if item_type in {"function", "session"}:
+                continue
+            name = _tool_name(cur)
+            if item_type == "function_call" and (not name or name in END_CALL_TOOL_NAMES):
+                return cur
+            if name in END_CALL_TOOL_NAMES:
                 return cur
             stack.extend(cur.values())
         elif isinstance(cur, list):
@@ -366,6 +382,8 @@ class RealtimeSession:
         self._audio_chunks = 0
         self._user_parts: list[str] = []
         self._assistant_parts: list[str] = []
+        self._response_count = 0
+        self._user_wants_hangup = False
 
     @property
     def closed(self) -> bool:
@@ -655,6 +673,9 @@ class RealtimeSession:
             text = event.get("transcript") or event.get("delta") or ""
             if text and etype.endswith("completed"):
                 self._user_parts.append(str(text))
+                if _USER_BYE_RE.search(str(text)):
+                    self._user_wants_hangup = True
+                    logger.info("Realtime user asked to hang up: %s", str(text)[:80])
                 if self.on_transcript:
                     await self.on_transcript("user", str(text))
             return
@@ -695,8 +716,19 @@ class RealtimeSession:
                 self.last_error = f"response.{status}: {details}"
             output = (event.get("response") or {}).get("output") or []
             for item in output:
-                if isinstance(item, dict) and str(item.get("type") or "") == "function_call":
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "") == "function_call" or _tool_name(item) in END_CALL_TOOL_NAMES:
                     await self._handle_tool_call(item)
+            self._response_count += 1
+            last = " ".join(self._assistant_parts[-3:])
+            if self._hangup_reason is None and self._response_count >= 2:
+                if _FAREWELL_RE.search(last):
+                    logger.info("Realtime farewell detected — hanging up")
+                    self.request_hangup("farewell")
+                elif self._user_wants_hangup:
+                    logger.info("Realtime hangup after user goodbye")
+                    self.request_hangup("user_goodbye")
 
     def request_hangup(self, reason: str = "agent_hangup") -> None:
         if self._hangup_reason is not None or self.closed:
@@ -734,9 +766,9 @@ class RealtimeSession:
             nested = item.get("item") if isinstance(item.get("item"), dict) else {}
             name = _tool_name(nested)
             item = nested or item
-        if name not in END_CALL_TOOL_NAMES:
+        if name not in END_CALL_TOOL_NAMES and str(item.get("type") or "") != "function_call":
             return
-        logger.info("Realtime end_call tool name=%s", name)
+        logger.info("Realtime end_call tool name=%s", name or item.get("type"))
         call_id = str(item.get("call_id") or item.get("id") or "")
         reason = "agent_hangup"
         raw_args = item.get("arguments")
