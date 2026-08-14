@@ -39,17 +39,22 @@ def pcm16_upsample_8k_to_24k(pcm8: bytes) -> bytes:
 
 
 def pcm16_downsample_24k_to_8k(pcm24: bytes) -> bytes:
-    """Decimate PCM16LE 24 kHz -> 8 kHz (take every 3rd sample)."""
+    """PCM16LE 24 kHz -> 8 kHz via audioop.ratecv (same idea as softphone pipelines)."""
     if not pcm24:
         return b""
-    samples = memoryview(pcm24).cast("h")
-    out = bytearray((len(samples) // 3) * 2)
-    view = memoryview(out).cast("h")
-    j = 0
-    for i in range(0, len(samples) - 2, 3):
-        view[j] = samples[i]
-        j += 1
-    return bytes(out)
+    # Prefer proper resampler; fall back to decimation.
+    try:
+        converted, _ = audioop.ratecv(pcm24, 2, 1, OPENAI_RATE, SIP_RATE, None)
+        return converted
+    except Exception:
+        samples = memoryview(pcm24).cast("h")
+        out = bytearray((len(samples) // 3) * 2)
+        view = memoryview(out).cast("h")
+        j = 0
+        for i in range(0, len(samples) - 2, 3):
+            view[j] = (int(samples[i]) + int(samples[i + 1]) + int(samples[i + 2])) // 3
+            j += 1
+        return bytes(out)
 
 
 def g711_encode(pcm8: bytes, codec: Codec = "pcmu") -> bytes:
@@ -98,10 +103,12 @@ class PlaybackBuffer:
             chunk = bytes(self._buf[:nbytes])
             del self._buf[:nbytes]
             return chunk
-        # pad with silence
         available = bytes(self._buf)
         self._buf.clear()
-        return available + b"\x00" * (nbytes - len(available))
+        return available
+
+    def pending(self) -> int:
+        return len(self._buf)
 
 
 class JitterBuffer:

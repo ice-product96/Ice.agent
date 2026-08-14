@@ -8,6 +8,7 @@ import logging
 import random
 import re
 import socket
+import struct
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -207,9 +208,36 @@ class ActiveCall:
     rtp_packets_tx: int = 0
     rtp_learned: asyncio.Event = field(default_factory=asyncio.Event)
     media_tx_enabled: bool = False
+    rtp_marker_next: bool = True
     seq: int = field(default_factory=lambda: random.randint(1, 0xFFFF))
     timestamp: int = field(default_factory=lambda: random.randint(1, 0xFFFFFFFF))
-    ssrc: int = field(default_factory=lambda: random.randint(1, 0xFFFFFFFF))
+    ssrc: int = field(default_factory=lambda: random.randint(1, 0x7FFFFFFF))
+
+
+def _parse_rtp_packet(data: bytes) -> tuple[int, bytes] | None:
+    """Return (payload_type, payload) — same parsing as MtzVersion."""
+    if len(data) < 12:
+        return None
+    cc = data[0] & 0x0F
+    hlen = 12 + cc * 4
+    if len(data) < hlen:
+        return None
+    # Skip header extension if present (X bit)
+    if data[0] & 0x10:
+        if len(data) < hlen + 4:
+            return None
+        ext_words = int.from_bytes(data[hlen + 2 : hlen + 4], "big")
+        hlen += 4 + ext_words * 4
+        if len(data) < hlen:
+            return None
+    pt = data[1] & 0x7F
+    return pt, data[hlen:]
+
+
+def _rtp_header(pt: int, seq: int, ts: int, ssrc: int, marker: int = 0) -> bytes:
+    b0 = 0x80
+    b1 = ((1 if marker else 0) << 7) | (pt & 0x7F)
+    return struct.pack("!BBHII", b0, b1, seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc & 0xFFFFFFFF)
 
 
 class RtpProtocol(asyncio.DatagramProtocol):
@@ -221,7 +249,8 @@ class RtpProtocol(asyncio.DatagramProtocol):
         self.transport = transport  # type: ignore[assignment]
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        if len(data) < 12:
+        parsed = _parse_rtp_packet(data)
+        if parsed is None:
             return
         # Symmetric RTP: Telphin/NAT often sends media from a different IP:port than SDP.
         host, port = addr[0], int(addr[1])
@@ -243,12 +272,16 @@ class RtpProtocol(asyncio.DatagramProtocol):
         if not self.call.rtp_learned.is_set():
             self.call.rtp_learned.set()
             logger.info(
-                "SIP wait_first_rtp: got media from %s:%s (call %s)",
+                "SIP first RTP from %s:%s (call %s)",
                 host,
                 port,
                 self.call.call_id[:24],
             )
-        payload = data[12:]
+        pt, payload = parsed
+        if pt == 8:
+            self.call.codec = "pcma"
+        elif pt == 0:
+            self.call.codec = "pcmu"
         if not payload or self.call.on_rtp is None:
             return
         try:
@@ -264,29 +297,23 @@ class RtpProtocol(asyncio.DatagramProtocol):
         except Exception:
             logger.exception("RTP on_rtp failed")
 
-    def send_payload(self, payload: bytes) -> None:
+    def send_payload(self, payload: bytes, *, marker: bool | None = None) -> None:
         if not self.transport or not self.call.remote_rtp_host or not self.call.remote_rtp_port:
             return
-        header = bytearray(12)
-        header[0] = 0x80
-        header[1] = 0x00 if self.call.codec == "pcmu" else 0x08  # PT 0 / 8
-        header[2] = (self.call.seq >> 8) & 0xFF
-        header[3] = self.call.seq & 0xFF
-        header[4] = (self.call.timestamp >> 24) & 0xFF
-        header[5] = (self.call.timestamp >> 16) & 0xFF
-        header[6] = (self.call.timestamp >> 8) & 0xFF
-        header[7] = self.call.timestamp & 0xFF
-        header[8] = (self.call.ssrc >> 24) & 0xFF
-        header[9] = (self.call.ssrc >> 16) & 0xFF
-        header[10] = (self.call.ssrc >> 8) & 0xFF
-        header[11] = self.call.ssrc & 0xFF
+        pt = 0 if self.call.codec == "pcmu" else 8
+        use_marker = self.call.rtp_marker_next if marker is None else marker
+        pkt = _rtp_header(pt, self.call.seq, self.call.timestamp, self.call.ssrc, 1 if use_marker else 0)
+        self.call.rtp_marker_next = False
         self.call.seq = (self.call.seq + 1) & 0xFFFF
         self.call.timestamp = (self.call.timestamp + SIP_FRAME_SAMPLES) & 0xFFFFFFFF
         dest = self.call.remote_rtp_host
         if not _is_ipv4(dest):
             return
-        self.transport.sendto(bytes(header) + payload, (dest, self.call.remote_rtp_port))
-        self.call.rtp_packets_tx += 1
+        try:
+            self.transport.sendto(pkt + payload, (dest, self.call.remote_rtp_port))
+            self.call.rtp_packets_tx += 1
+        except OSError as exc:
+            logger.warning("RTP sendto failed: %s", exc)
 
 
 class SipProtocol(asyncio.DatagramProtocol):
@@ -790,6 +817,10 @@ class SipUserAgent:
         )
         call.rtp_transport = transport
         call.rtp_protocol = protocol
+        # Send RTP immediately (silence) so NAT hole opens — Mtz runs on host;
+        # in Docker/NAT we must TX first or remote never reaches us.
+        call.media_tx_enabled = True
+        call.rtp_marker_next = True
         call.media_task = asyncio.create_task(self._media_loop(call), name=f"rtp-tx-{call.call_id}")
 
     async def _media_loop(self, call: ActiveCall) -> None:
@@ -797,7 +828,6 @@ class SipUserAgent:
             while call.state in {"ringing", "answered", "early"} and call.rtp_protocol:
                 now = time.time()
                 if call.state == "answered" and call.answered_at is not None:
-                    # Stuck call without BYE would block the next inbound (Busy Here).
                     if call.last_rtp_at is None and (now - call.answered_at) > 25:
                         logger.warning(
                             "SIP call %s: no RTP for 25s after answer — hanging up",
@@ -812,8 +842,6 @@ class SipUserAgent:
                         )
                         asyncio.create_task(self.hangup(call.call_id, cause="rtp_timeout"))
                         return
-                # Like MtzVersion: do not TX speech until symmetric RTP peer is known
-                # (or wait_first_rtp timed out and media_tx_enabled was set).
                 if not call.media_tx_enabled:
                     await asyncio.sleep(0.02)
                     continue
@@ -823,7 +851,10 @@ class SipUserAgent:
                         pcm24 = call.playback_provider() or b""
                     except Exception:
                         pcm24 = b""
+                had_audio = len(pcm24) > 0
                 if len(pcm24) < OPENAI_FRAME_SAMPLES * 2:
+                    if not had_audio:
+                        call.rtp_marker_next = True
                     pcm24 = pcm24 + b"\x00" * (OPENAI_FRAME_SAMPLES * 2 - len(pcm24))
                 payload = openai_to_sip(pcm24[: OPENAI_FRAME_SAMPLES * 2], call.codec)
                 call.rtp_protocol.send_payload(payload)
@@ -834,9 +865,14 @@ class SipUserAgent:
             logger.exception("media loop failed for %s", call.call_id)
 
     async def wait_first_rtp(self, call: ActiveCall, timeout: float | None = None) -> bool:
-        """Block until remote RTP arrives (symmetric NAT) or timeout — then enable TX."""
+        """Wait until remote RTP arrives (symmetric NAT) or timeout.
+
+        TX is already enabled (silence) for NAT hole-punching; this only
+        synchronizes the greeting like MtzVersion's wait_first_rtp_seconds.
+        """
         wait_s = self.config.wait_first_rtp_seconds if timeout is None else timeout
         wait_s = max(0.0, float(wait_s))
+        call.media_tx_enabled = True
         learned = call.rtp_learned.is_set()
         if not learned and wait_s > 0:
             try:
@@ -845,18 +881,19 @@ class SipUserAgent:
             except TimeoutError:
                 learned = call.rtp_learned.is_set()
                 logger.warning(
-                    "SIP wait_first_rtp timed out (%.1fs) — using SDP dest %s:%s call=%s",
+                    "SIP wait_first_rtp timed out (%.1fs) — greeting uses SDP dest %s:%s call=%s",
                     wait_s,
                     call.remote_rtp_host,
                     call.remote_rtp_port,
                     call.call_id[:24],
                 )
-        call.media_tx_enabled = True
         logger.info(
-            "SIP media TX enabled learned=%s peer=%s:%s call=%s",
+            "SIP ready for speech learned=%s peer=%s:%s tx=%s rx=%s call=%s",
             learned,
             call.remote_rtp_host,
             call.remote_rtp_port,
+            call.rtp_packets_tx,
+            call.rtp_packets_rx,
             call.call_id[:24],
         )
         return learned

@@ -16,7 +16,7 @@ import httpx
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from .sip_audio import OPENAI_FRAME_SAMPLES, OPENAI_RATE, PlaybackBuffer, silence_pcm16
+from .sip_audio import OPENAI_FRAME_SAMPLES, OPENAI_RATE, PlaybackBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -61,31 +61,27 @@ def build_session_config(
     instructions: str,
     voice: str = "marin",
     model: str = DEFAULT_REALTIME_MODEL,
+    reasoning_effort: str = "low",
 ) -> dict[str, Any]:
-    """GA Realtime session shape (matches OpenAI docs / user's client_secrets curl)."""
+    """GA Realtime session — matches working MtzVersion sip_realtime_bridge."""
+    effort = reasoning_effort if reasoning_effort in {"minimal", "low", "medium", "high", "xhigh"} else "low"
     return {
         "type": "realtime",
         "model": model,
         "instructions": instructions,
         "output_modalities": ["audio"],
-        "tools": [],
         "audio": {
             "input": {
                 "format": {"type": "audio/pcm", "rate": 24000},
-                "transcription": {"model": "gpt-realtime-whisper"},
+                "turn_detection": {"type": "semantic_vad"},
                 "noise_reduction": {"type": "far_field"},
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500,
-                },
             },
             "output": {
                 "format": {"type": "audio/pcm", "rate": 24000},
                 "voice": voice,
             },
         },
+        "reasoning": {"effort": effort},
     }
 
 
@@ -227,7 +223,7 @@ class RealtimeSession:
         logger.info("Realtime connected model=%s", self.model)
 
     async def request_response(self, instructions: str | None = None) -> None:
-        """Force the model to speak (inbound greeting)."""
+        """Force the model to speak (inbound greeting) — same as MtzVersion conn.response.create()."""
         if self._ws is None or self.closed:
             return
         if not self._session_ready.is_set():
@@ -238,39 +234,23 @@ class RealtimeSession:
                 logger.warning("Realtime not ready for greeting")
                 return
 
-        self._greeting_until = asyncio.get_running_loop().time() + 6.0
-        prompt = (instructions or "").strip() or "Скажи коротко: Ало! Чем могу помочь?"
-
-        # Explicit user turn is more reliable than response.create(instructions) alone.
-        await self._ws.send(
-            json.dumps(
-                {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": (
-                                    "Телефонный звонок только что соединился. "
-                                    f"Сразу поздоровайся голосом. {prompt}"
-                                ),
-                            }
-                        ],
-                    },
-                }
+        self._greeting_until = asyncio.get_running_loop().time() + 8.0
+        # Optional one-shot instructions for this response (Mtz relies on session instructions).
+        if instructions and instructions.strip():
+            await self._ws.send(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "response": {
+                            "output_modalities": ["audio"],
+                            "instructions": instructions.strip(),
+                        },
+                    }
+                )
             )
-        )
-        await self._ws.send(
-            json.dumps(
-                {
-                    "type": "response.create",
-                    "response": {"output_modalities": ["audio"]},
-                }
-            )
-        )
-        logger.info("Realtime greeting requested: %s", prompt[:120])
+        else:
+            await self._ws.send(json.dumps({"type": "response.create"}))
+        logger.info("Realtime response.create (greeting) sent")
 
     def inject_beep(self, duration_ms: int = 350) -> None:
         """Put a local tone into the SIP playback buffer (RTP path check)."""
@@ -305,10 +285,8 @@ class RealtimeSession:
             await self._ws.send(json.dumps(event))
 
     def read_playback_frame(self, samples: int = OPENAI_FRAME_SAMPLES) -> bytes:
-        data = self.playback.read(samples * 2)
-        if len(data) < samples * 2:
-            data += silence_pcm16(samples - len(data) // 2)
-        return data
+        # Do not pad here — media loop pads and uses empty=end-of-talkspurt for RTP marker.
+        return self.playback.read(samples * 2)
 
     def transcript_text(self) -> str:
         lines: list[str] = []

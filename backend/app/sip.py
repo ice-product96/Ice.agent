@@ -399,21 +399,28 @@ class SipGateway:
             session = await self._build_realtime_session(agent, sip_ref, inbound=inbound)
             await session.connect()
         self._realtime[call.call_id] = session
-        # Attach mic path immediately; hold TX until first RTP (symmetric NAT).
+        # Mic path immediately; enable silence TX (NAT), wait briefly for peer, then greet.
         call.on_rtp = session.send_pcm24
-        await self._wait_call_rtp(account_id=None, call=call)
         call.playback_provider = session.read_playback_frame
+        call.media_tx_enabled = True
+        await self._wait_call_rtp(account_id=None, call=call)
         if inbound:
             greeting = str((agent.config or {}).get("inbound_greeting") or "").strip()
             await session.request_response(greeting or DEFAULT_INBOUND_GREETING)
+            # Wait until first audio chunk or error (Mtz plays as soon as deltas arrive).
+            for _ in range(40):
+                if session._audio_chunks > 0 or session.last_error or session.closed:
+                    break
+                await asyncio.sleep(0.1)
             if session._audio_chunks == 0:
-                await asyncio.sleep(1.5)
-                if session._audio_chunks == 0 and session.last_error:
-                    logger.error("Realtime greeting produced no audio: %s", session.last_error)
-                    await self._update_db_call(
-                        call.call_id,
-                        hangup_cause=f"realtime_silent:{session.last_error}"[:120],
-                    )
+                logger.error(
+                    "Realtime greeting produced no audio chunks (err=%s)",
+                    session.last_error,
+                )
+                await self._update_db_call(
+                    call.call_id,
+                    hangup_cause=f"realtime_silent:{session.last_error or 'no_audio'}"[:120],
+                )
         return session
 
     async def _wait_call_rtp(self, *, account_id: int | None, call: ActiveCall) -> None:
