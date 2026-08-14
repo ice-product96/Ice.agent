@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import math
+import socket
 import ssl
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -43,17 +44,59 @@ def _realtime_ws_url(base_url: str | None, *, model: str | None = None) -> str:
     return url
 
 
-async def _open_proxied_socket(ws_url: str, http_proxy: str):
-    """Open a TCP socket to the Realtime host via HTTP(S)/SOCKS proxy (python-socks)."""
-    from python_socks.async_.asyncio import Proxy
+def _tcp_via_http_connect(proxy_url: str, target_host: str, target_port: int, timeout: float = 20.0) -> socket.socket:
+    """HTTP CONNECT tunnel — same approach as MtzVersion openai_wss_proxy."""
+    pu = urlparse(proxy_url.strip())
+    if not pu.hostname:
+        raise RuntimeError("HTTP proxy URL has no host")
+    phost = pu.hostname
+    pport = int(pu.port or (443 if pu.scheme == "https" else 80))
+    sock = socket.create_connection((phost, pport), timeout=timeout)
+    try:
+        target = f"{target_host}:{int(target_port)}"
+        lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
+        if pu.username:
+            token = base64.b64encode(f"{pu.username}:{pu.password or ''}".encode()).decode("ascii")
+            lines.append(f"Proxy-Authorization: Basic {token}")
+        lines.append("Proxy-Connection: keep-alive")
+        lines.append("")
+        sock.sendall("\r\n".join(lines).encode("ascii"))
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(16384)
+            if not chunk:
+                raise OSError("proxy closed before CONNECT response")
+            buf += chunk
+            if len(buf) > 262144:
+                raise OSError("CONNECT response too large")
+        status = buf.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
+        if " 200" not in status:
+            raise OSError(f"CONNECT rejected: {status!r}")
+        sock.settimeout(None)
+        logger.info("Realtime WSS HTTP CONNECT %s via %s:%s", target, phost, pport)
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
 
+
+async def _open_proxied_socket(ws_url: str, http_proxy: str):
+    """TCP to Realtime host via HTTP CONNECT (preferred) or SOCKS."""
     parsed = urlparse(ws_url)
     host = parsed.hostname
     if not host:
         raise RuntimeError(f"Invalid Realtime WebSocket URL: {ws_url}")
     port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+    scheme = (urlparse(http_proxy.strip()).scheme or "http").lower()
+    if scheme in {"http", "https", ""}:
+        return await asyncio.to_thread(_tcp_via_http_connect, http_proxy, host, port, 20.0)
+    from python_socks.async_.asyncio import Proxy
+
     proxy = Proxy.from_url(http_proxy.strip())
-    return await proxy.connect(dest_host=host, dest_port=port)
+    return await asyncio.wait_for(proxy.connect(dest_host=host, dest_port=port), timeout=20.0)
 
 
 def build_session_config(
@@ -175,6 +218,7 @@ class RealtimeSession:
             "additional_headers": {"Authorization": f"Bearer {token}"},
             "max_size": 8 * 1024 * 1024,
             "ping_interval": 20,
+            "open_timeout": 20,
         }
         if self.http_proxy:
             parsed_ws = urlparse(ws_url)
@@ -184,43 +228,83 @@ class RealtimeSession:
                 connect_kwargs["server_hostname"] = parsed_ws.hostname
         return await websockets.connect(ws_url, **connect_kwargs)
 
+    async def _close_socket(self) -> None:
+        if self._reader:
+            self._reader.cancel()
+            try:
+                await self._reader
+            except asyncio.CancelledError:
+                pass
+            self._reader = None
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+    async def _handshake(self, ws_url: str, token: str, session: dict[str, Any]) -> None:
+        self._session_ready = asyncio.Event()
+        self._session_updated = asyncio.Event()
+        self.last_error = None
+        self._ws = await self._ws_connect(ws_url, token)
+        self._reader = asyncio.create_task(self._read_loop(), name="realtime-reader")
+        try:
+            await asyncio.wait_for(self._session_ready.wait(), timeout=12)
+        except TimeoutError as exc:
+            extra = f"; err={self.last_error}" if self.last_error else ""
+            raise RuntimeError(
+                f"session.created timeout proxy={bool(self.http_proxy)}{extra}"
+            ) from exc
+        if self.last_error:
+            raise RuntimeError(f"Realtime handshake error: {self.last_error}")
+        assert self._ws is not None
+        await self._ws.send(json.dumps({"type": "session.update", "session": session}))
+        try:
+            await asyncio.wait_for(self._session_updated.wait(), timeout=8)
+        except TimeoutError:
+            logger.warning("Realtime session.updated timed out — continuing")
+        if self.last_error:
+            raise RuntimeError(f"Realtime session.update error: {self.last_error}")
+
     async def connect(self) -> None:
-        """Server-to-server: API key WebSocket + session.update (preferred)."""
+        """API-key WebSocket first (Mtz path); client_secrets if that fails."""
         session = build_session_config(
             instructions=self.instructions,
             voice=self.voice,
             model=self.model,
         )
-        # 1) Direct API-key WebSocket (documented server path)
-        ws_url = _realtime_ws_url(self.base_url, model=self.model)
+        direct_url = _realtime_ws_url(self.base_url, model=self.model)
+        errors: list[str] = []
         try:
-            logger.info("Realtime connecting model=%s url=%s proxy=%s", self.model, ws_url, bool(self.http_proxy))
-            self._ws = await self._ws_connect(ws_url, self.api_key)
+            logger.info(
+                "Realtime connecting model=%s url=%s proxy=%s",
+                self.model,
+                direct_url,
+                self.http_proxy or "-",
+            )
+            await self._handshake(direct_url, self.api_key, session)
+            logger.info("Realtime connected (API key) model=%s", self.model)
+            return
         except Exception as direct_exc:
-            logger.warning("Realtime direct WS failed (%s) — trying client_secrets", direct_exc)
+            errors.append(f"direct: {direct_exc}")
+            logger.warning("Realtime direct WS failed: %s — trying client_secrets", direct_exc)
+            await self._close_socket()
+
+        try:
             secret = await create_client_secret(
                 api_key=self.api_key,
                 base_url=self.base_url,
                 session=session,
                 http_proxy=self.http_proxy,
             )
-            # Ephemeral token usually does not need ?model=
-            self._ws = await self._ws_connect(_realtime_ws_url(self.base_url), secret)
-
-        self._reader = asyncio.create_task(self._read_loop(), name="realtime-reader")
-        try:
-            await asyncio.wait_for(self._session_ready.wait(), timeout=10)
-        except TimeoutError as exc:
-            self.last_error = "session.created timeout"
-            raise RuntimeError("Realtime session.created timed out") from exc
-
-        # Configure session (voice/instructions/audio) then wait for ack.
-        await self._ws.send(json.dumps({"type": "session.update", "session": session}))
-        try:
-            await asyncio.wait_for(self._session_updated.wait(), timeout=8)
-        except TimeoutError:
-            logger.warning("Realtime session.updated timed out — continuing")
-        logger.info("Realtime connected model=%s", self.model)
+            secret_url = _realtime_ws_url(self.base_url, model=self.model)
+            await self._handshake(secret_url, secret, session)
+            logger.info("Realtime connected (client_secrets) model=%s", self.model)
+        except Exception as secret_exc:
+            errors.append(f"client_secrets: {secret_exc}")
+            await self._close_socket()
+            raise RuntimeError(" | ".join(errors)) from secret_exc
 
     async def request_response(self, instructions: str | None = None) -> None:
         """Force the model to speak (inbound greeting) — same as MtzVersion conn.response.create()."""
@@ -314,6 +398,12 @@ class RealtimeSession:
             logger.warning("Realtime WebSocket ended: %s", exc)
         finally:
             self._closed.set()
+            if not self._session_ready.is_set():
+                if not self.last_error:
+                    self.last_error = "websocket closed before session.created"
+                self._session_ready.set()
+            if not self._session_updated.is_set():
+                self._session_updated.set()
 
     async def _handle_event(self, event: dict[str, Any]) -> None:
         etype = str(event.get("type") or "")
@@ -328,6 +418,8 @@ class RealtimeSession:
             err = event.get("error") or event
             self.last_error = json.dumps(err, ensure_ascii=False)[:500]
             logger.error("Realtime error: %s", self.last_error)
+            self._session_ready.set()
+            self._session_updated.set()
 
         if self.on_event:
             try:

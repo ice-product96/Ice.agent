@@ -122,7 +122,7 @@ class SipCall(TimestampMixin, Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    hangup_cause: Mapped[str | None] = mapped_column(String(120))
+    hangup_cause: Mapped[str | None] = mapped_column(String(500))
     transcript: Mapped[str] = mapped_column(Text, default="")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
@@ -303,6 +303,7 @@ async def create_schema() -> None:
             "ALTER TABLE runtime_settings ADD COLUMN IF NOT EXISTS tavily_http_proxy VARCHAR(1024)",
             "ALTER TABLE agents ADD COLUMN IF NOT EXISTS sip_account_id INTEGER",
             "ALTER TABLE sip_accounts ADD COLUMN IF NOT EXISTS ring_delay_seconds FLOAT",
+            "ALTER TABLE sip_calls ALTER COLUMN hangup_cause TYPE VARCHAR(500)",
         ):
             try:
                 async with connection.begin_nested():

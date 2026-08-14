@@ -250,6 +250,8 @@ class SipGateway:
             if row is None:
                 return
             for key, value in fields.items():
+                if key == "hangup_cause" and value is not None:
+                    value = str(value).replace("\n", " ").strip()[:500]
                 setattr(row, key, value)
             await db.commit()
 
@@ -392,7 +394,8 @@ class SipGateway:
         if pending is not None:
             try:
                 session = await pending
-            except Exception:
+            except Exception as prefetch_exc:
+                logger.warning("Realtime prefetch failed (%s) — reconnecting", prefetch_exc)
                 session = await self._build_realtime_session(agent, sip_ref, inbound=inbound)
                 await session.connect()
         else:
@@ -419,7 +422,7 @@ class SipGateway:
                 )
                 await self._update_db_call(
                     call.call_id,
-                    hangup_cause=f"realtime_silent:{session.last_error or 'no_audio'}"[:120],
+                    hangup_cause=f"realtime_silent:{session.last_error or 'no_audio'}",
                 )
         return session
 
@@ -519,10 +522,11 @@ class SipGateway:
         except Exception as exc:
             logger.exception("Realtime start failed for inbound call")
             await self._cancel_prefetch(call.call_id)
-            await self._update_db_call(call.call_id, status="failed", hangup_cause=str(exc))
+            detail = exception_text(exc)
+            await self._update_db_call(call.call_id, status="failed", hangup_cause=detail)
             ua = self._agents.get(account_id)
             if ua:
-                await ua.hangup(call.call_id, cause="realtime_failed")
+                await ua.hangup(call.call_id, cause=detail)
 
     async def _on_call_state(self, account_id: int, sip_call_id: str, payload: dict[str, Any]) -> None:
         status = str(payload.get("status") or "")
@@ -553,10 +557,12 @@ class SipGateway:
             if session:
                 transcript = session.transcript_text()
                 await session.close()
+            cause = str(payload.get("cause") or "ended")
+            normal_causes = {"local_hangup", "remote_bye", "cancelled", "rtp_timeout", "ended", "busy"}
             fields = {
-                "status": "ended",
+                "status": "ended" if cause in normal_causes else "failed",
                 "ended_at": utcnow(),
-                "hangup_cause": str(payload.get("cause") or "ended"),
+                "hangup_cause": cause,
                 "transcript": transcript,
             }
             # Refresh REGISTER so NAT binding / Contact stays alive after a call.
