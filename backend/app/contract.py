@@ -496,7 +496,7 @@ def apply_agent(agent: Agent, payload: AgentBody) -> None:
     if payload.realtime_voice is not None:
         config["realtime_voice"] = payload.realtime_voice
     if payload.realtime_model is not None:
-        config["realtime_model"] = payload.realtime_model
+        config["realtime_model"] = payload.realtime_model.strip().lower()
     if payload.inbound_greeting is not None:
         config["inbound_greeting"] = payload.inbound_greeting
     agent.config = config

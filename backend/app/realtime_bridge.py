@@ -27,6 +27,12 @@ OnEvent = Callable[[dict[str, Any]], Awaitable[None]]
 DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
 
 
+def _normalize_realtime_model(model: str | None) -> str:
+    """OpenAI realtime model ids are lowercase; UI/presets sometimes send GPT-Realtime-2."""
+    name = (model or "").strip() or DEFAULT_REALTIME_MODEL
+    return name.lower()
+
+
 def _realtime_http_base(base_url: str | None) -> str:
     raw = (base_url or "https://api.openai.com/v1").rstrip("/")
     if raw.endswith("/v1"):
@@ -287,7 +293,7 @@ class RealtimeSession:
         self.base_url = base_url
         self.instructions = instructions
         self.voice = voice
-        self.model = (model or DEFAULT_REALTIME_MODEL).strip() or DEFAULT_REALTIME_MODEL
+        self.model = _normalize_realtime_model(model)
         self.http_proxy = _rewrite_loopback_proxy((http_proxy or "").strip()) if (http_proxy or "").strip() else None
         self.on_transcript = on_transcript
         self.on_event = on_event
