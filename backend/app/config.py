@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     sip_public_ip: str = ""
     sip_ring_delay_seconds: float = 4.0
     sip_wait_first_rtp_seconds: float = 5.0
+    # Fallback HTTP(S) proxy for OpenAI Realtime WSS when LLM profile has no http_proxy
+    openai_http_proxy: str = ""
 
     @property
     def admin_ids(self) -> set[int]:

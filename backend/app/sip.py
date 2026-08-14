@@ -8,6 +8,8 @@ from typing import Any
 
 from sqlalchemy import select
 
+import os
+
 from .config import Settings
 from .db import Agent, LlmProfile, SessionLocal, SipAccount, SipCall, utcnow
 from .events import EventHub
@@ -32,6 +34,21 @@ def _ring_delay_seconds(account_value: Any, fallback: float | None) -> float:
     if fallback is not None:
         return max(0.0, float(fallback))
     return 4.0
+
+
+def _resolve_openai_http_proxy(profile_proxy: str | None, settings: Settings) -> str | None:
+    for candidate in (
+        profile_proxy,
+        settings.openai_http_proxy,
+        os.environ.get("ICE_OPENAI_HTTP_PROXY"),
+        os.environ.get("HTTPS_PROXY"),
+        os.environ.get("https_proxy"),
+        os.environ.get("HTTP_PROXY"),
+        os.environ.get("http_proxy"),
+    ):
+        if candidate and str(candidate).strip():
+            return str(candidate).strip()
+    return None
 
 
 class SipGateway:
@@ -337,7 +354,12 @@ class SipGateway:
             if not api_key:
                 raise RuntimeError("LLM profile has no API key")
             base_url = profile.base_url
-            http_proxy = profile.http_proxy
+            http_proxy = _resolve_openai_http_proxy(profile.http_proxy, self.settings)
+        if not http_proxy:
+            logger.warning(
+                "Agent %s LLM profile has no HTTP proxy — OpenAI Realtime WSS may timeout outside US/EU",
+                agent.id,
+            )
         config = agent.config or {}
         voice = str(config.get("realtime_voice") or "marin")
         model = str(config.get("realtime_model") or DEFAULT_REALTIME_MODEL).strip() or DEFAULT_REALTIME_MODEL

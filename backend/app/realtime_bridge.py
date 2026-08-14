@@ -99,6 +99,30 @@ async def _open_proxied_socket(ws_url: str, http_proxy: str):
     return await asyncio.wait_for(proxy.connect(dest_host=host, dest_port=port), timeout=20.0)
 
 
+def build_client_secret_session(*, model: str) -> dict[str, Any]:
+    """Minimal GA session for POST /realtime/client_secrets (full config via session.update after connect)."""
+    return {
+        "type": "realtime",
+        "model": model,
+    }
+
+
+def _http_error_detail(response: httpx.Response) -> str:
+    text = (response.text or "").strip()
+    try:
+        payload = response.json()
+        err = payload.get("error")
+        if isinstance(err, dict):
+            parts = [str(err.get("message") or err.get("code") or "invalid_request_error")]
+            param = err.get("param")
+            if param:
+                parts.append(f"param={param}")
+            return f"HTTP {response.status_code}: {'; '.join(parts)}"
+    except Exception:
+        pass
+    return f"HTTP {response.status_code}: {text[:400]}"
+
+
 def build_session_config(
     *,
     instructions: str,
@@ -147,7 +171,7 @@ async def create_client_secret(
     *,
     api_key: str,
     base_url: str | None,
-    session: dict[str, Any],
+    model: str,
     http_proxy: str | None = None,
 ) -> str:
     url = f"{_realtime_http_base(base_url)}/realtime/client_secrets"
@@ -155,14 +179,14 @@ async def create_client_secret(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    session = build_client_secret_session(model=model)
     client_kwargs: dict[str, Any] = {"timeout": 30.0}
     if http_proxy:
         client_kwargs["proxy"] = http_proxy.strip()
     async with httpx.AsyncClient(**client_kwargs) as client:
         response = await client.post(url, headers=headers, json={"session": session})
         if response.status_code >= 400:
-            detail = response.text[:500]
-            raise RuntimeError(f"client_secrets HTTP {response.status_code}: {detail}")
+            raise RuntimeError(_http_error_detail(response))
         payload = response.json()
     if isinstance(payload.get("value"), str):
         return payload["value"]
@@ -276,6 +300,11 @@ class RealtimeSession:
         )
         direct_url = _realtime_ws_url(self.base_url, model=self.model)
         errors: list[str] = []
+        if not self.http_proxy:
+            logger.warning(
+                "Realtime proxy not set (LLM profile / ICE_OPENAI_HTTP_PROXY / HTTP_PROXY) — "
+                "direct WSS to OpenAI often times out from Docker/RU"
+            )
         try:
             logger.info(
                 "Realtime connecting model=%s url=%s proxy=%s",
@@ -295,10 +324,11 @@ class RealtimeSession:
             secret = await create_client_secret(
                 api_key=self.api_key,
                 base_url=self.base_url,
-                session=session,
+                model=self.model,
                 http_proxy=self.http_proxy,
             )
-            secret_url = _realtime_ws_url(self.base_url, model=self.model)
+            # Ephemeral token: connect without ?model= (config comes from client_secrets + session.update).
+            secret_url = _realtime_ws_url(self.base_url)
             await self._handshake(secret_url, secret, session)
             logger.info("Realtime connected (client_secrets) model=%s", self.model)
         except Exception as secret_exc:
