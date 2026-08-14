@@ -423,7 +423,7 @@ async def agent_json(db: AsyncSession, agent: Agent) -> dict[str, Any]:
         "tools": config.get("tools", []),
         "tool_permissions": config.get("tool_permissions", []),
         "realtime_voice": config.get("realtime_voice", "marin"),
-        "realtime_model": config.get("realtime_model", "gpt-realtime"),
+        "realtime_model": config.get("realtime_model", "gpt-realtime-2"),
         "inbound_greeting": config.get("inbound_greeting", ""),
         "links": [
             {

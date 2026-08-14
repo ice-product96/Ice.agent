@@ -12,7 +12,7 @@ from .config import Settings
 from .db import Agent, LlmProfile, SessionLocal, SipAccount, SipCall, utcnow
 from .events import EventHub
 from .integrations import exception_text
-from .realtime_bridge import RealtimeSession
+from .realtime_bridge import DEFAULT_REALTIME_MODEL, RealtimeSession
 from .secrets import SecretStore
 from .sip_ua import ActiveCall, SipEndpointConfig, SipUserAgent
 
@@ -20,9 +20,10 @@ logger = logging.getLogger(__name__)
 
 INBOUND_GREETING_INSTRUCTION = (
     "Это входящий телефонный звонок. Сразу после соединения коротко поздоровайся "
-    "и представься, не жди, пока абонент заговорит первым."
+    "голосом (например «Ало!» или «Здравствуйте»), представься и спроси, чем помочь. "
+    "Не жди, пока абонент заговорит первым."
 )
-DEFAULT_INBOUND_GREETING = "Поздоровайся коротко и представься."
+DEFAULT_INBOUND_GREETING = "Скажи коротко: Ало! Чем могу помочь?"
 
 
 def _ring_delay_seconds(account_value: Any, fallback: float | None) -> float:
@@ -126,6 +127,10 @@ class SipGateway:
                 ring_delay_seconds=_ring_delay_seconds(
                     getattr(account, "ring_delay_seconds", None),
                     self.settings.sip_ring_delay_seconds,
+                ),
+                wait_first_rtp_seconds=max(
+                    0.0,
+                    float(getattr(self.settings, "sip_wait_first_rtp_seconds", 5.0) or 5.0),
                 ),
                 local_sip_port=local_port,
                 rtp_port_min=self.settings.sip_rtp_port_min,
@@ -268,13 +273,17 @@ class SipGateway:
             call = await ua.dial(
                 number,
                 on_rtp=session.send_pcm24,
-                playback_provider=session.read_playback_frame,
+                playback_provider=None,
             )
         except Exception:
             await session.close()
             raise
 
         self._realtime[call.call_id] = session
+        # MtzVersion pattern: learn symmetric RTP before speaking.
+        await ua.wait_first_rtp(call)
+        call.on_rtp = session.send_pcm24
+        call.playback_provider = session.read_playback_frame
         db_id = await self._create_db_call(
             agent_id=agent.id,
             sip_account_id=account.id,
@@ -329,7 +338,7 @@ class SipGateway:
             http_proxy = profile.http_proxy
         config = agent.config or {}
         voice = str(config.get("realtime_voice") or "marin")
-        model = str(config.get("realtime_model") or "gpt-realtime")
+        model = str(config.get("realtime_model") or DEFAULT_REALTIME_MODEL).strip() or DEFAULT_REALTIME_MODEL
         instructions = agent.prompt or "You are a helpful voice agent on a phone call."
         if inbound:
             extra = str(config.get("inbound_greeting") or "").strip()
@@ -390,12 +399,36 @@ class SipGateway:
             session = await self._build_realtime_session(agent, sip_ref, inbound=inbound)
             await session.connect()
         self._realtime[call.call_id] = session
+        # Attach mic path immediately; hold TX until first RTP (symmetric NAT).
         call.on_rtp = session.send_pcm24
+        await self._wait_call_rtp(account_id=None, call=call)
         call.playback_provider = session.read_playback_frame
         if inbound:
             greeting = str((agent.config or {}).get("inbound_greeting") or "").strip()
             await session.request_response(greeting or DEFAULT_INBOUND_GREETING)
+            if session._audio_chunks == 0:
+                await asyncio.sleep(1.5)
+                if session._audio_chunks == 0 and session.last_error:
+                    logger.error("Realtime greeting produced no audio: %s", session.last_error)
+                    await self._update_db_call(
+                        call.call_id,
+                        hangup_cause=f"realtime_silent:{session.last_error}"[:120],
+                    )
         return session
+
+    async def _wait_call_rtp(self, *, account_id: int | None, call: ActiveCall) -> None:
+        ua: SipUserAgent | None = None
+        if account_id is not None:
+            ua = self._agents.get(account_id)
+        if ua is None:
+            for candidate in self._agents.values():
+                if call.call_id in candidate.calls:
+                    ua = candidate
+                    break
+        if ua is None:
+            call.media_tx_enabled = True
+            return
+        await ua.wait_first_rtp(call)
 
     async def _prefetch_realtime(self, account_id: int, sip_call_id: str) -> None:
         if sip_call_id in self._pending_realtime or sip_call_id in self._realtime:

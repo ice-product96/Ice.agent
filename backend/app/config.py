@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     sip_stun_server: str = ""
     sip_public_ip: str = ""
     sip_ring_delay_seconds: float = 4.0
+    sip_wait_first_rtp_seconds: float = 5.0
 
     @property
     def admin_ids(self) -> set[int]:

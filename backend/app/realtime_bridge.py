@@ -1,4 +1,4 @@
-"""OpenAI Realtime bridge: client_secrets + WebSocket PCM 24 kHz audio."""
+"""OpenAI Realtime bridge: server WebSocket PCM 24 kHz (+ optional client_secrets)."""
 
 from __future__ import annotations
 
@@ -6,21 +6,24 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import ssl
 from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import httpx
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from .sip_audio import OPENAI_FRAME_SAMPLES, PlaybackBuffer, silence_pcm16
+from .sip_audio import OPENAI_FRAME_SAMPLES, OPENAI_RATE, PlaybackBuffer, silence_pcm16
 
 logger = logging.getLogger(__name__)
 
 OnTranscript = Callable[[str, str], Awaitable[None]]  # role, text
 OnEvent = Callable[[dict[str, Any]], Awaitable[None]]
+
+DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
 
 
 def _realtime_http_base(base_url: str | None) -> str:
@@ -30,18 +33,18 @@ def _realtime_http_base(base_url: str | None) -> str:
     return f"{raw}/v1"
 
 
-def _realtime_ws_url(base_url: str | None) -> str:
+def _realtime_ws_url(base_url: str | None, *, model: str | None = None) -> str:
     http_base = _realtime_http_base(base_url)
     parsed = urlparse(http_base)
     scheme = "wss" if parsed.scheme != "http" else "ws"
-    return f"{scheme}://{parsed.netloc}{parsed.path}/realtime"
+    url = f"{scheme}://{parsed.netloc}{parsed.path}/realtime"
+    if model:
+        url = f"{url}?{urlencode({'model': model})}"
+    return url
 
 
 async def _open_proxied_socket(ws_url: str, http_proxy: str):
-    """Open a TCP socket to the Realtime host via HTTP(S)/SOCKS proxy (python-socks).
-
-    SSL for wss:// is applied by websockets.connect(ssl=...).
-    """
+    """Open a TCP socket to the Realtime host via HTTP(S)/SOCKS proxy (python-socks)."""
     from python_socks.async_.asyncio import Proxy
 
     parsed = urlparse(ws_url)
@@ -57,12 +60,15 @@ def build_session_config(
     *,
     instructions: str,
     voice: str = "marin",
-    model: str = "gpt-realtime",
+    model: str = DEFAULT_REALTIME_MODEL,
 ) -> dict[str, Any]:
+    """GA Realtime session shape (matches OpenAI docs / user's client_secrets curl)."""
     return {
         "type": "realtime",
         "model": model,
         "instructions": instructions,
+        "output_modalities": ["audio"],
+        "tools": [],
         "audio": {
             "input": {
                 "format": {"type": "audio/pcm", "rate": 24000},
@@ -73,7 +79,6 @@ def build_session_config(
                     "threshold": 0.5,
                     "prefix_padding_ms": 300,
                     "silence_duration_ms": 500,
-                    "idle_timeout_ms": None,
                 },
             },
             "output": {
@@ -81,11 +86,22 @@ def build_session_config(
                 "voice": voice,
             },
         },
-        "output_modalities": ["audio"],
-        "tools": [],
-        "max_output_tokens": "inf",
-        "reasoning": {"effort": "low"},
     }
+
+
+def beep_pcm24(duration_ms: int = 400, freq_hz: float = 880.0, amplitude: float = 0.22) -> bytes:
+    """Short PCM16LE 24 kHz tone to verify SIP RTP path independently of OpenAI."""
+    samples = max(1, OPENAI_RATE * duration_ms // 1000)
+    out = bytearray(samples * 2)
+    view = memoryview(out).cast("h")
+    for i in range(samples):
+        # soft attack/release so it is not clipped harshly
+        env = 1.0
+        attack = min(i, 240) / 240.0
+        release = min(samples - 1 - i, 240) / 240.0
+        env = min(attack, release, 1.0)
+        view[i] = int(amplitude * env * 32767.0 * math.sin(2.0 * math.pi * freq_hz * i / OPENAI_RATE))
+    return bytes(out)
 
 
 async def create_client_secret(
@@ -105,9 +121,10 @@ async def create_client_secret(
         client_kwargs["proxy"] = http_proxy.strip()
     async with httpx.AsyncClient(**client_kwargs) as client:
         response = await client.post(url, headers=headers, json={"session": session})
-        response.raise_for_status()
+        if response.status_code >= 400:
+            detail = response.text[:500]
+            raise RuntimeError(f"client_secrets HTTP {response.status_code}: {detail}")
         payload = response.json()
-    # GA responses expose value under client_secret / value / secret
     if isinstance(payload.get("value"), str):
         return payload["value"]
     secret = payload.get("client_secret")
@@ -128,7 +145,7 @@ class RealtimeSession:
         base_url: str | None,
         instructions: str,
         voice: str = "marin",
-        model: str = "gpt-realtime",
+        model: str = DEFAULT_REALTIME_MODEL,
         http_proxy: str | None = None,
         on_transcript: OnTranscript | None = None,
         on_event: OnEvent | None = None,
@@ -137,15 +154,17 @@ class RealtimeSession:
         self.base_url = base_url
         self.instructions = instructions
         self.voice = voice
-        self.model = model
+        self.model = (model or DEFAULT_REALTIME_MODEL).strip() or DEFAULT_REALTIME_MODEL
         self.http_proxy = (http_proxy or "").strip() or None
         self.on_transcript = on_transcript
         self.on_event = on_event
         self.playback = PlaybackBuffer()
+        self.last_error: str | None = None
         self._ws: ClientConnection | None = None
         self._reader: asyncio.Task[None] | None = None
         self._closed = asyncio.Event()
         self._session_ready = asyncio.Event()
+        self._session_updated = asyncio.Event()
         self._greeting_until = 0.0
         self._audio_chunks = 0
         self._user_parts: list[str] = []
@@ -155,22 +174,9 @@ class RealtimeSession:
     def closed(self) -> bool:
         return self._closed.is_set()
 
-    async def connect(self) -> None:
-        session = build_session_config(
-            instructions=self.instructions,
-            voice=self.voice,
-            model=self.model,
-        )
-        secret = await create_client_secret(
-            api_key=self.api_key,
-            base_url=self.base_url,
-            session=session,
-            http_proxy=self.http_proxy,
-        )
-        ws_url = _realtime_ws_url(self.base_url)
-        extra_headers = {"Authorization": f"Bearer {secret}"}
+    async def _ws_connect(self, ws_url: str, token: str) -> ClientConnection:
         connect_kwargs: dict[str, Any] = {
-            "additional_headers": extra_headers,
+            "additional_headers": {"Authorization": f"Bearer {token}"},
             "max_size": 8 * 1024 * 1024,
             "ping_interval": 20,
         }
@@ -180,35 +186,95 @@ class RealtimeSession:
             if parsed_ws.scheme == "wss":
                 connect_kwargs["ssl"] = ssl.create_default_context()
                 connect_kwargs["server_hostname"] = parsed_ws.hostname
-        self._ws = await websockets.connect(ws_url, **connect_kwargs)
+        return await websockets.connect(ws_url, **connect_kwargs)
+
+    async def connect(self) -> None:
+        """Server-to-server: API key WebSocket + session.update (preferred)."""
+        session = build_session_config(
+            instructions=self.instructions,
+            voice=self.voice,
+            model=self.model,
+        )
+        # 1) Direct API-key WebSocket (documented server path)
+        ws_url = _realtime_ws_url(self.base_url, model=self.model)
+        try:
+            logger.info("Realtime connecting model=%s url=%s proxy=%s", self.model, ws_url, bool(self.http_proxy))
+            self._ws = await self._ws_connect(ws_url, self.api_key)
+        except Exception as direct_exc:
+            logger.warning("Realtime direct WS failed (%s) — trying client_secrets", direct_exc)
+            secret = await create_client_secret(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                session=session,
+                http_proxy=self.http_proxy,
+            )
+            # Ephemeral token usually does not need ?model=
+            self._ws = await self._ws_connect(_realtime_ws_url(self.base_url), secret)
+
         self._reader = asyncio.create_task(self._read_loop(), name="realtime-reader")
         try:
-            await asyncio.wait_for(self._session_ready.wait(), timeout=8)
+            await asyncio.wait_for(self._session_ready.wait(), timeout=10)
+        except TimeoutError as exc:
+            self.last_error = "session.created timeout"
+            raise RuntimeError("Realtime session.created timed out") from exc
+
+        # Configure session (voice/instructions/audio) then wait for ack.
+        await self._ws.send(json.dumps({"type": "session.update", "session": session}))
+        try:
+            await asyncio.wait_for(self._session_updated.wait(), timeout=8)
         except TimeoutError:
-            logger.warning("Realtime session.created timed out, greeting may fail")
+            logger.warning("Realtime session.updated timed out — continuing")
+        logger.info("Realtime connected model=%s", self.model)
 
     async def request_response(self, instructions: str | None = None) -> None:
-        """Ask the model to speak immediately (incoming-call greeting)."""
+        """Force the model to speak (inbound greeting)."""
         if self._ws is None or self.closed:
             return
         if not self._session_ready.is_set():
             try:
                 await asyncio.wait_for(self._session_ready.wait(), timeout=5)
             except TimeoutError:
-                logger.warning("Realtime not ready for response.create")
+                self.last_error = "not ready for greeting"
+                logger.warning("Realtime not ready for greeting")
                 return
-        # Protect greeting from barge-in for a few seconds.
-        self._greeting_until = asyncio.get_running_loop().time() + 4.0
-        event: dict[str, Any] = {
-            "type": "response.create",
-            "response": {
-                "output_modalities": ["audio"],
-            },
-        }
-        if instructions:
-            event["response"]["instructions"] = instructions
-        await self._ws.send(json.dumps(event))
-        logger.info("Realtime response.create sent (greeting)")
+
+        self._greeting_until = asyncio.get_running_loop().time() + 6.0
+        prompt = (instructions or "").strip() or "Скажи коротко: Ало! Чем могу помочь?"
+
+        # Explicit user turn is more reliable than response.create(instructions) alone.
+        await self._ws.send(
+            json.dumps(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "Телефонный звонок только что соединился. "
+                                    f"Сразу поздоровайся голосом. {prompt}"
+                                ),
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        await self._ws.send(
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {"output_modalities": ["audio"]},
+                }
+            )
+        )
+        logger.info("Realtime greeting requested: %s", prompt[:120])
+
+    def inject_beep(self, duration_ms: int = 350) -> None:
+        """Put a local tone into the SIP playback buffer (RTP path check)."""
+        self.playback.append(beep_pcm24(duration_ms=duration_ms))
 
     async def close(self) -> None:
         self._closed.set()
@@ -229,7 +295,6 @@ class RealtimeSession:
     async def send_pcm24(self, pcm24: bytes) -> None:
         if self._ws is None or self.closed or not pcm24:
             return
-        # Stream in ~100 ms chunks max to stay under event size limits
         chunk = 24000 * 2 // 10  # 100 ms
         for offset in range(0, len(pcm24), chunk):
             piece = pcm24[offset : offset + chunk]
@@ -267,17 +332,25 @@ class RealtimeSession:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self.last_error = str(exc)
             logger.warning("Realtime WebSocket ended: %s", exc)
         finally:
             self._closed.set()
 
     async def _handle_event(self, event: dict[str, Any]) -> None:
         etype = str(event.get("type") or "")
-        if etype in {"session.created", "session.updated"}:
+        if etype == "session.created":
             self._session_ready.set()
-            logger.info("Realtime %s", etype)
-        if etype == "error":
-            logger.error("Realtime error event: %s", event)
+            logger.info("Realtime session.created")
+        elif etype == "session.updated":
+            self._session_ready.set()
+            self._session_updated.set()
+            logger.info("Realtime session.updated")
+        elif etype == "error":
+            err = event.get("error") or event
+            self.last_error = json.dumps(err, ensure_ascii=False)[:500]
+            logger.error("Realtime error: %s", self.last_error)
+
         if self.on_event:
             try:
                 await self.on_event(event)
@@ -294,7 +367,6 @@ class RealtimeSession:
             return
 
         if etype == "input_audio_buffer.speech_started":
-            # Do not wipe greeting while the agent is still saying hello.
             if asyncio.get_running_loop().time() < self._greeting_until:
                 return
             self.playback.clear()
@@ -323,7 +395,6 @@ class RealtimeSession:
                 if self.on_transcript:
                     await self.on_transcript("assistant", str(text))
             elif text and etype.endswith("delta"):
-                # accumulate deltas lightly
                 if self._assistant_parts and not self._assistant_parts[-1].endswith(" "):
                     self._assistant_parts[-1] = self._assistant_parts[-1] + str(text)
                 else:
@@ -332,4 +403,12 @@ class RealtimeSession:
 
         if etype == "response.done":
             status = (event.get("response") or {}).get("status")
-            logger.info("Realtime response.done status=%s audio_chunks=%s", status, self._audio_chunks)
+            details = (event.get("response") or {}).get("status_details")
+            logger.info(
+                "Realtime response.done status=%s audio_chunks=%s details=%s",
+                status,
+                self._audio_chunks,
+                details,
+            )
+            if status and status != "completed":
+                self.last_error = f"response.{status}: {details}"

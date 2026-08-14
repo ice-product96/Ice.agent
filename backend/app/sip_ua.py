@@ -119,6 +119,39 @@ def _is_ipv4(host: str) -> bool:
         return False
 
 
+def _is_private_ipv4(host: str) -> bool:
+    if not _is_ipv4(host):
+        return False
+    parts = [int(p) for p in host.split(".")]
+    if parts[0] == 10 or parts[0] == 127:
+        return True
+    if parts[0] == 192 and parts[1] == 168:
+        return True
+    if parts[0] == 172 and 16 <= parts[1] <= 31:
+        return True
+    return False
+
+
+def _local_ipv4(toward: str | None = None) -> str:
+    """Outbound interface IP (same idea as softphone / MtzVersion)."""
+    targets: list[tuple[str, int]] = []
+    if toward and _is_ipv4(toward):
+        targets.append((toward, 80))
+    targets.append(("8.8.8.8", 80))
+    for host, port in targets:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect((host, port))
+            ip = sock.getsockname()[0]
+            if ip and ip != "0.0.0.0":
+                return str(ip)
+        except OSError:
+            continue
+        finally:
+            sock.close()
+    return "127.0.0.1"
+
+
 @dataclass
 class SipEndpointConfig:
     account_id: int
@@ -135,6 +168,7 @@ class SipEndpointConfig:
     public_ip: str | None = None
     max_concurrent_calls: int = 1
     ring_delay_seconds: float = 4.0
+    wait_first_rtp_seconds: float = 5.0
     local_sip_port: int = 5060
     rtp_port_min: int = 10000
     rtp_port_max: int = 10199
@@ -171,6 +205,8 @@ class ActiveCall:
     last_rtp_at: float | None = None
     rtp_packets_rx: int = 0
     rtp_packets_tx: int = 0
+    rtp_learned: asyncio.Event = field(default_factory=asyncio.Event)
+    media_tx_enabled: bool = False
     seq: int = field(default_factory=lambda: random.randint(1, 0xFFFF))
     timestamp: int = field(default_factory=lambda: random.randint(1, 0xFFFFFFFF))
     ssrc: int = field(default_factory=lambda: random.randint(1, 0xFFFFFFFF))
@@ -204,6 +240,14 @@ class RtpProtocol(asyncio.DatagramProtocol):
             self.call.remote_rtp_port = port
         self.call.last_rtp_at = time.time()
         self.call.rtp_packets_rx += 1
+        if not self.call.rtp_learned.is_set():
+            self.call.rtp_learned.set()
+            logger.info(
+                "SIP wait_first_rtp: got media from %s:%s (call %s)",
+                host,
+                port,
+                self.call.call_id[:24],
+            )
         payload = data[12:]
         if not payload or self.call.on_rtp is None:
             return
@@ -337,15 +381,11 @@ class SipUserAgent:
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
         self._proxy_ip = await self._resolve_ipv4(self._proxy_host)
-        # Discover outbound IP toward SIP server
-        if not self.config.public_ip:
-            try:
-                probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                probe.connect((self._proxy_ip, self._proxy_port))
-                self.local_ip = probe.getsockname()[0]
-                probe.close()
-            except Exception:
-                self.local_ip = "127.0.0.1"
+        # Public IP only if explicitly set; otherwise discover like a softphone / MtzVersion.
+        if self.config.public_ip:
+            self.local_ip = self.config.public_ip.strip()
+        else:
+            self.local_ip = await loop.run_in_executor(None, _local_ipv4, self._proxy_ip)
         try:
             self._transport, self._protocol = await loop.create_datagram_endpoint(
                 lambda: SipProtocol(self),
@@ -359,21 +399,20 @@ class SipUserAgent:
             )
             sockname = self._transport.get_extra_info("sockname")
             self.config.local_sip_port = int(sockname[1])
-        if self.config.public_ip:
-            self.local_ip = self.config.public_ip
         logger.info(
-            "SIP UA started login=%s contact=%s:%s advertises=%s -> %s:%s",
+            "SIP UA started login=%s contact=%s:%s -> %s:%s (public_ip_override=%s)",
             self.config.login,
             self.local_ip,
             self.config.local_sip_port,
-            self.local_ip,
             self._proxy_ip,
             self._proxy_port,
+            bool(self.config.public_ip),
         )
-        if self.local_ip.startswith(("10.", "172.", "192.168.", "127.")):
+        if _is_private_ipv4(self.local_ip) and not self.config.public_ip:
             logger.warning(
-                "SIP Contact/SDP IP %s looks private — set ICE_SIP_PUBLIC_IP or account Public IP "
-                "or remote party may hear silence / miss inbound after NAT",
+                "SIP advertises private IP %s (typical in Docker). "
+                "If remote hears silence, set account Public IP / ICE_SIP_PUBLIC_IP "
+                "to the host LAN or public address, and publish UDP RTP ports.",
                 self.local_ip,
             )
 
@@ -773,6 +812,11 @@ class SipUserAgent:
                         )
                         asyncio.create_task(self.hangup(call.call_id, cause="rtp_timeout"))
                         return
+                # Like MtzVersion: do not TX speech until symmetric RTP peer is known
+                # (or wait_first_rtp timed out and media_tx_enabled was set).
+                if not call.media_tx_enabled:
+                    await asyncio.sleep(0.02)
+                    continue
                 pcm24 = b""
                 if call.playback_provider:
                     try:
@@ -788,6 +832,34 @@ class SipUserAgent:
             raise
         except Exception:
             logger.exception("media loop failed for %s", call.call_id)
+
+    async def wait_first_rtp(self, call: ActiveCall, timeout: float | None = None) -> bool:
+        """Block until remote RTP arrives (symmetric NAT) or timeout — then enable TX."""
+        wait_s = self.config.wait_first_rtp_seconds if timeout is None else timeout
+        wait_s = max(0.0, float(wait_s))
+        learned = call.rtp_learned.is_set()
+        if not learned and wait_s > 0:
+            try:
+                await asyncio.wait_for(call.rtp_learned.wait(), timeout=wait_s)
+                learned = True
+            except TimeoutError:
+                learned = call.rtp_learned.is_set()
+                logger.warning(
+                    "SIP wait_first_rtp timed out (%.1fs) — using SDP dest %s:%s call=%s",
+                    wait_s,
+                    call.remote_rtp_host,
+                    call.remote_rtp_port,
+                    call.call_id[:24],
+                )
+        call.media_tx_enabled = True
+        logger.info(
+            "SIP media TX enabled learned=%s peer=%s:%s call=%s",
+            learned,
+            call.remote_rtp_host,
+            call.remote_rtp_port,
+            call.call_id[:24],
+        )
+        return learned
 
     def _active_calls(self) -> list[ActiveCall]:
         return [c for c in self.calls.values() if c.state in {"ringing", "answered", "early", "dialing"}]
@@ -843,6 +915,12 @@ class SipUserAgent:
         remote_rtp_host, remote_rtp_port, codec = self._parse_sdp_media(body)
         if remote_rtp_host and not _is_ipv4(remote_rtp_host):
             remote_rtp_host = await self._resolve_ipv4(remote_rtp_host)
+        # If SDP has no usable media IP, fall back to the SIP source (common behind PBX).
+        if not remote_rtp_host or remote_rtp_host in {"0.0.0.0", "127.0.0.1"}:
+            remote_rtp_host = addr[0]
+            logger.info("SDP media IP missing — using SIP source %s for RTP", remote_rtp_host)
+        if not remote_rtp_port:
+            logger.warning("SDP has no audio port for inbound call")
         local_tag = f"{random.randint(10**6, 10**9)}"
         to_header = headers.get("To", "")
         if ";tag=" not in to_header:
@@ -1015,6 +1093,7 @@ class SipUserAgent:
             if call.rtp_protocol is None:
                 await self._setup_rtp(call)
             call.state = "answered"
+            call.answered_at = time.time()
             if self.on_call_state:
                 await self.on_call_state(call.call_id, {"status": "answered"})
             return
