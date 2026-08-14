@@ -93,6 +93,8 @@ services:
       ICE_DATABASE_URL: postgresql+asyncpg://ice:ice@postgres:5432/ice_agent
       ICE_SESSION_DIR: /app/data/sessions
       ICE_BACKUP_DIR: /app/data/backups
+      HF_HOME: /app/data/hf
+      FASTEMBED_CACHE_PATH: /app/data/hf/fastembed
       ICE_SIP_BIND_PORT: "5060"
       ICE_SIP_RTP_PORT_MIN: "10000"
       ICE_SIP_RTP_PORT_MAX: "10199"

@@ -84,12 +84,24 @@ async def lifespan(app: FastAPI):
                     "api_key": memory_key,
                     "base_url": memory_profile.base_url,
                     "model": memory_profile.default_model,
+                    "provider": memory_profile.provider,
+                    "http_proxy": (memory_profile.http_proxy or "").strip() or None,
                 }
-        await memory.reconfigure(
-            runtime_settings,
-            secrets.decrypt(runtime_settings.mem0_api_key_ciphertext),
-            memory_llm,
-        )
+
+        async def start_memory() -> None:
+            try:
+                await memory.reconfigure(
+                    runtime_settings,
+                    secrets.decrypt(runtime_settings.mem0_api_key_ciphertext),
+                    memory_llm,
+                )
+                if memory.last_error:
+                    await events.publish("memory.startup_failed", {"error": memory.last_error})
+            except Exception as exc:
+                await events.publish("memory.startup_failed", {"error": str(exc)})
+
+        # Fastembed may download HuggingFace weights; never block /health on that.
+        asyncio.create_task(start_memory(), name="memory-startup")
     except Exception as exc:
         await events.publish("memory.startup_failed", {"error": str(exc)})
     try:

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -141,19 +143,83 @@ class MemoryStore:
             config["openai_base_url"] = llm["base_url"]
         return {"provider": "openai", "config": config}
 
+    @staticmethod
+    def _fastembed_cache_dir() -> Path:
+        raw = (os.environ.get("FASTEMBED_CACHE_PATH") or "").strip()
+        if raw:
+            path = Path(raw)
+        elif Path("/app/data").is_dir():
+            path = Path("/app/data/hf/fastembed")
+        else:
+            path = Path.home() / ".cache" / "ice-agent" / "fastembed"
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ["FASTEMBED_CACHE_PATH"] = str(path)
+        os.environ.setdefault("HF_HOME", str(path.parent))
+        return path
+
+    @classmethod
+    def _patch_fastembed_cache(cls) -> Path:
+        cache_dir = cls._fastembed_cache_dir()
+        try:
+            from fastembed import TextEmbedding
+        except ImportError:
+            return cache_dir
+        if getattr(TextEmbedding, "_ice_cache_patched", False):
+            return cache_dir
+        original = TextEmbedding.__init__
+        local_only = any(cache_dir.rglob("*.onnx"))
+
+        def wrapped(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            kwargs.setdefault("cache_dir", str(cache_dir))
+            if local_only:
+                kwargs.setdefault("local_files_only", True)
+            try:
+                return original(self, *args, **kwargs)
+            except TypeError:
+                kwargs.pop("local_files_only", None)
+                try:
+                    return original(self, *args, **kwargs)
+                except TypeError:
+                    kwargs.pop("cache_dir", None)
+                    return original(self, *args, **kwargs)
+
+        TextEmbedding.__init__ = wrapped  # type: ignore[method-assign]
+        TextEmbedding._ice_cache_patched = True
+        return cache_dir
+
+    @staticmethod
+    def _uses_openai_embeddings(llm: dict[str, Any]) -> bool:
+        provider = str(llm.get("provider") or "").strip().lower()
+        base = str(llm.get("base_url") or "").strip().lower()
+        if "deepseek" in provider or "deepseek" in base:
+            return False
+        return "openai.com" in base or provider in {"openai", "custom-openai-compatible", ""}
+
     @classmethod
     def _local_mem0_config(cls, settings: Any, llm: dict[str, Any] | None) -> dict[str, Any]:
-        embed_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-        dims = 384
-        config: dict[str, Any] = {
-            "vector_store": cls._qdrant_config(settings.qdrant_url, dims),
-            "embedder": {
+        if llm and cls._uses_openai_embeddings(llm):
+            dims = 1536
+            embedder_cfg: dict[str, Any] = {
+                "api_key": llm["api_key"],
+                "model": "text-embedding-3-small",
+                "openai_base_url": llm.get("base_url") or "https://api.openai.com/v1",
+            }
+            if llm.get("http_proxy"):
+                embedder_cfg["http_client_proxies"] = llm["http_proxy"]
+            embedder = {"provider": "openai", "config": embedder_cfg}
+        else:
+            dims = 384
+            cls._patch_fastembed_cache()
+            embedder = {
                 "provider": "fastembed",
                 "config": {
-                    "model": embed_model,
+                    "model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
                     "embedding_dims": dims,
                 },
-            },
+            }
+        config: dict[str, Any] = {
+            "vector_store": cls._qdrant_config(settings.qdrant_url, dims),
+            "embedder": embedder,
         }
         if llm:
             config["llm"] = cls._openai_compatible(llm, model=str(llm["model"]))
@@ -185,7 +251,17 @@ class MemoryStore:
                     qdrant_url = (settings.qdrant_url or "").strip() or "http://qdrant:6333"
                     settings.qdrant_url = qdrant_url
                     config = self._local_mem0_config(settings, llm)
-                    self._client = Memory.from_config(config)
+
+                    def _from_config() -> Any:
+                        proxy = str((llm or {}).get("http_proxy") or "").strip()
+                        if proxy:
+                            os.environ.setdefault("HTTPS_PROXY", proxy)
+                            os.environ.setdefault("HTTP_PROXY", proxy)
+                        if config.get("embedder", {}).get("provider") == "fastembed":
+                            self._patch_fastembed_cache()
+                        return Memory.from_config(config)
+
+                    self._client = await asyncio.to_thread(_from_config)
             except Exception as exc:
                 self.last_error = exception_text(exc)
                 self._client = None

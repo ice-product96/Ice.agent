@@ -81,6 +81,23 @@ def test_local_memory_uses_multilingual_fastembed() -> None:
     assert config["llm"]["config"]["model"] == "deepseek-v4-flash"
 
 
+def test_local_memory_uses_openai_embeddings_for_openai_profile() -> None:
+    config = MemoryStore._local_mem0_config(
+        SimpleNamespace(qdrant_url="http://qdrant:6333"),
+        {
+            "api_key": "secret",
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-5.6-luna",
+            "provider": "openai",
+            "http_proxy": "http://proxy:8080",
+        },
+    )
+    assert config["embedder"]["provider"] == "openai"
+    assert config["embedder"]["config"]["model"] == "text-embedding-3-small"
+    assert config["embedder"]["config"]["http_client_proxies"] == "http://proxy:8080"
+    assert config["vector_store"]["config"]["embedding_model_dims"] == 1536
+
+
 class FakeDB:
     def __init__(self) -> None:
         self.added: list[Any] = []

@@ -1608,6 +1608,8 @@ async def update_runtime_configuration(
                     "api_key": profile_key,
                     "base_url": profile.base_url,
                     "model": profile.default_model,
+                    "provider": profile.provider,
+                    "http_proxy": (profile.http_proxy or "").strip() or None,
                 }
     request.app.state.search.configure(
         settings.search_provider,
