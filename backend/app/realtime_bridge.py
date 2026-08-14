@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import math
+import re
 import socket
 import ssl
 from collections.abc import Awaitable, Callable
@@ -23,6 +24,32 @@ logger = logging.getLogger(__name__)
 
 OnTranscript = Callable[[str, str], Awaitable[None]]  # role, text
 OnEvent = Callable[[dict[str, Any]], Awaitable[None]]
+OnHangup = Callable[[str], Awaitable[None]]  # reason
+
+DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
+END_CALL_TOOL_NAMES = {"end_call", "sip_hangup", "hangup"}
+_HANGUP_MARKER_RE = re.compile(
+    r"\[{1,2}\s*SIP[_ ]?HANGUP\s*\]{1,2}|\bend_call\b|\bSIP_HANGUP\b",
+    re.IGNORECASE,
+)
+HANGUP_INSTRUCTION = (
+    "Ты на телефонной линии. Когда разговор закончен (абонент попрощался, "
+    "задача выполнена, просят положить трубку, или продолжать не о чем) — "
+    "коротко попрощайся вслух и сразу вызови инструмент end_call. "
+    "Не клади трубку в начале звонка и не произноси имя инструмента. "
+    "Запасной маркер в конце фразы: [[SIP_HANGUP]]."
+)
+END_CALL_TOOL = {
+    "type": "function",
+    "name": "end_call",
+    "description": "Hang up the phone after you have said goodbye. Use only when the call should end.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reason": {"type": "string", "description": "Short reason for hanging up"},
+        },
+    },
+}
 
 DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
 
@@ -225,6 +252,8 @@ def build_session_config(
             },
         },
         "reasoning": {"effort": effort},
+        "tools": [END_CALL_TOOL],
+        "tool_choice": "auto",
     }
 
 
@@ -288,6 +317,7 @@ class RealtimeSession:
         http_proxy: str | None = None,
         on_transcript: OnTranscript | None = None,
         on_event: OnEvent | None = None,
+        on_hangup: OnHangup | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url
@@ -297,10 +327,13 @@ class RealtimeSession:
         self.http_proxy = _rewrite_loopback_proxy((http_proxy or "").strip()) if (http_proxy or "").strip() else None
         self.on_transcript = on_transcript
         self.on_event = on_event
+        self.on_hangup = on_hangup
         self.playback = PlaybackBuffer()
         self.last_error: str | None = None
         self._ws: ClientConnection | None = None
         self._reader: asyncio.Task[None] | None = None
+        self._hangup_task: asyncio.Task[None] | None = None
+        self._hangup_reason: str | None = None
         self._closed = asyncio.Event()
         self._session_ready = asyncio.Event()
         self._session_updated = asyncio.Event()
@@ -359,11 +392,23 @@ class RealtimeSession:
         if self.last_error:
             raise RuntimeError(f"Realtime handshake error: {self.last_error}")
         assert self._ws is not None
+        self._session_updated = asyncio.Event()
+        self.last_error = None
         await self._ws.send(json.dumps({"type": "session.update", "session": session}))
         try:
             await asyncio.wait_for(self._session_updated.wait(), timeout=8)
         except TimeoutError:
             logger.warning("Realtime session.updated timed out — continuing")
+        if self.last_error and "tool" in self.last_error.lower():
+            logger.warning("Realtime tools rejected (%s) — continuing without end_call tool", self.last_error)
+            self.last_error = None
+            stripped = {key: value for key, value in session.items() if key not in {"tools", "tool_choice"}}
+            self._session_updated = asyncio.Event()
+            await self._ws.send(json.dumps({"type": "session.update", "session": stripped}))
+            try:
+                await asyncio.wait_for(self._session_updated.wait(), timeout=8)
+            except TimeoutError:
+                logger.warning("Realtime session.updated (no tools) timed out — continuing")
         if self.last_error:
             raise RuntimeError(f"Realtime session.update error: {self.last_error}")
 
@@ -451,6 +496,13 @@ class RealtimeSession:
 
     async def close(self) -> None:
         self._closed.set()
+        if self._hangup_task:
+            self._hangup_task.cancel()
+            try:
+                await self._hangup_task
+            except asyncio.CancelledError:
+                pass
+            self._hangup_task = None
         if self._reader:
             self._reader.cancel()
             try:
@@ -530,6 +582,11 @@ class RealtimeSession:
             self._session_ready.set()
             self._session_updated.set()
 
+        if etype in {"response.function_call_arguments.done", "response.output_item.done"}:
+            item = event.get("item") if isinstance(event.get("item"), dict) else event
+            if str(item.get("type") or etype) in {"function_call", "response.function_call_arguments.done"} or item.get("name"):
+                await self._handle_tool_call(item if isinstance(item, dict) else event)
+
         if self.on_event:
             try:
                 await self.on_event(event)
@@ -571,6 +628,8 @@ class RealtimeSession:
             text = event.get("transcript") or event.get("delta") or ""
             if text and etype.endswith("done"):
                 self._assistant_parts.append(str(text))
+                if _HANGUP_MARKER_RE.search(str(text)):
+                    self.request_hangup("transcript_marker")
                 if self.on_transcript:
                     await self.on_transcript("assistant", str(text))
             elif text and etype.endswith("delta"):
@@ -591,3 +650,68 @@ class RealtimeSession:
             )
             if status and status != "completed":
                 self.last_error = f"response.{status}: {details}"
+            output = (event.get("response") or {}).get("output") or []
+            for item in output:
+                if isinstance(item, dict) and str(item.get("type") or "") == "function_call":
+                    await self._handle_tool_call(item)
+
+    def request_hangup(self, reason: str = "agent_hangup") -> None:
+        if self._hangup_reason is not None or self.closed:
+            return
+        if asyncio.get_running_loop().time() < self._greeting_until:
+            logger.info("Ignoring hangup during inbound greeting (%s)", reason)
+            return
+        self._hangup_reason = reason
+        logger.info("Realtime hangup requested (%s) — waiting for playback to drain", reason)
+        self._hangup_task = asyncio.create_task(self._drain_then_hangup(reason), name="rt-hangup")
+
+    async def _drain_then_hangup(self, reason: str) -> None:
+        idle = 0
+        for _ in range(100):
+            if self.closed:
+                return
+            if self.playback.pending() > 0:
+                idle = 0
+            else:
+                idle += 1
+                if idle >= 8:
+                    break
+            await asyncio.sleep(0.1)
+        if self.closed or self.on_hangup is None:
+            return
+        try:
+            await self.on_hangup(reason)
+        except Exception:
+            logger.exception("Realtime on_hangup failed")
+
+    async def _handle_tool_call(self, item: dict[str, Any]) -> None:
+        name = str(item.get("name") or "").strip().lower()
+        if name not in END_CALL_TOOL_NAMES:
+            return
+        call_id = str(item.get("call_id") or item.get("id") or "")
+        reason = "agent_hangup"
+        raw_args = item.get("arguments")
+        if isinstance(raw_args, str) and raw_args.strip():
+            try:
+                parsed = json.loads(raw_args)
+                if isinstance(parsed, dict) and parsed.get("reason"):
+                    reason = str(parsed["reason"])[:80]
+            except json.JSONDecodeError:
+                pass
+        if self._ws is not None and call_id:
+            try:
+                await self._ws.send(
+                    json.dumps(
+                        {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": json.dumps({"ok": True, "hangup": True}),
+                            },
+                        }
+                    )
+                )
+            except Exception:
+                logger.warning("Failed to ack end_call tool")
+        self.request_hangup(reason)

@@ -14,7 +14,7 @@ from .config import Settings
 from .db import Agent, LlmProfile, SessionLocal, SipAccount, SipCall, utcnow
 from .events import EventHub
 from .integrations import exception_text
-from .realtime_bridge import DEFAULT_REALTIME_MODEL, RealtimeSession
+from .realtime_bridge import DEFAULT_REALTIME_MODEL, HANGUP_INSTRUCTION, RealtimeSession
 from .secrets import SecretStore
 from .sip_ua import ActiveCall, SipEndpointConfig, SipUserAgent
 
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 INBOUND_GREETING_INSTRUCTION = (
     "Это входящий телефонный звонок. Сразу после соединения коротко поздоровайся "
     "голосом (например «Ало!» или «Здравствуйте»), представься и спроси, чем помочь. "
-    "Не жди, пока абонент заговорит первым."
+    "Не жди, пока абонент заговорит первым. После приветствия трубку не клади."
 )
 DEFAULT_INBOUND_GREETING = "Скажи коротко: Ало! Чем могу помочь?"
 
@@ -364,12 +364,23 @@ class SipGateway:
         voice = str(config.get("realtime_voice") or "marin")
         model = str(config.get("realtime_model") or DEFAULT_REALTIME_MODEL).strip() or DEFAULT_REALTIME_MODEL
         instructions = agent.prompt or "You are a helpful voice agent on a phone call."
+        instructions = f"{instructions}\n\n{HANGUP_INSTRUCTION}"
         if inbound:
             extra = str(config.get("inbound_greeting") or "").strip()
             instructions = (
                 f"{instructions}\n\n{INBOUND_GREETING_INSTRUCTION}"
                 + (f"\nФормулировка приветствия: {extra}" if extra else "")
             )
+
+        async def on_hangup(reason: str) -> None:
+            sip_call_id = sip_call_id_ref[0] if sip_call_id_ref else None
+            if not sip_call_id:
+                return
+            logger.info("Agent hangup %s reason=%s", sip_call_id[:24], reason)
+            for ua in self._agents.values():
+                if sip_call_id in ua.calls:
+                    await ua.hangup(sip_call_id, cause="agent_hangup")
+                    return
 
         async def on_transcript(role: str, text: str) -> None:
             sip_call_id = sip_call_id_ref[0] if sip_call_id_ref else None
@@ -401,6 +412,7 @@ class SipGateway:
             model=model,
             http_proxy=http_proxy,
             on_transcript=on_transcript,
+            on_hangup=on_hangup,
         )
         return session
 
@@ -580,7 +592,15 @@ class SipGateway:
                 transcript = session.transcript_text()
                 await session.close()
             cause = str(payload.get("cause") or "ended")
-            normal_causes = {"local_hangup", "remote_bye", "cancelled", "rtp_timeout", "ended", "busy"}
+            normal_causes = {
+                "local_hangup",
+                "remote_bye",
+                "cancelled",
+                "rtp_timeout",
+                "ended",
+                "busy",
+                "agent_hangup",
+            }
             fields = {
                 "status": "ended" if cause in normal_causes else "failed",
                 "ended_at": utcnow(),
