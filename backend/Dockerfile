@@ -4,11 +4,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     FASTEMBED_CACHE_PATH=/app/data/hf/fastembed \
     HF_HUB_DISABLE_TELEMETRY=1
 WORKDIR /app
-COPY pyproject.toml .
-COPY app ./app
-COPY alembic ./alembic
-COPY alembic.ini ./alembic.ini
-COPY entrypoint.sh /entrypoint.sh
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
@@ -19,15 +14,28 @@ ENV HTTP_PROXY=${HTTP_PROXY} \
     NO_PROXY=${NO_PROXY} \
     no_proxy=${NO_PROXY} \
     PIP_DEFAULT_TIMEOUT=120
+
 RUN apt-get update \
   && apt-get install -y --no-install-recommends gosu \
   && rm -rf /var/lib/apt/lists/* \
-  && pip install --no-cache-dir ".[mem0]" \
   && useradd --create-home --uid 10001 ice \
-  && mkdir -p /app/data/sessions /app/data/backups \
-  && chown -R ice:ice /app \
-  && sed -i 's/\r$//' /entrypoint.sh \
-  && chmod 755 /entrypoint.sh
+  && mkdir -p /app/data/sessions /app/data/backups /app/data/hf/fastembed
+
+# Install Python deps from pyproject only — code copies below must not bust this layer.
+COPY pyproject.toml .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    mkdir -p app && printf '"""install stub"""\n' > app/__init__.py \
+  && pip install ".[mem0]" \
+  && rm -rf app
+
+COPY app ./app
+COPY alembic ./alembic
+COPY alembic.ini ./alembic.ini
+COPY entrypoint.sh /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh \
+  && chmod 755 /entrypoint.sh \
+  && chown -R ice:ice /app
+
 # Start as root so entrypoint can chown the mounted volume, then gosu -> ice
 USER root
 EXPOSE 8000

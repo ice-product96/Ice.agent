@@ -149,11 +149,23 @@ async def _open_proxied_socket(ws_url: str, http_proxy: str):
         )
     from python_socks.async_.asyncio import Proxy
 
+    # python_socks only accepts socks5/socks4/http — socks5h means SOCKS5 + remote DNS.
+    socks_url = proxy_url.strip()
+    rdns = scheme in {"socks5h", "socks4a"}
+    if scheme == "socks5h":
+        socks_url = "socks5://" + socks_url.split("://", 1)[-1]
+    elif scheme == "socks4a":
+        socks_url = "socks4://" + socks_url.split("://", 1)[-1]
     try:
-        proxy = Proxy.from_url(proxy_url.strip(), rdns=scheme.endswith("h"))
+        proxy = Proxy.from_url(socks_url, rdns=rdns)
     except TypeError:
-        proxy = Proxy.from_url(proxy_url.strip())
-    logger.info("Realtime WSS SOCKS %s via %s", f"{host}:{port}", _redact_proxy(proxy_url))
+        proxy = Proxy.from_url(socks_url)
+    logger.info(
+        "Realtime WSS SOCKS %s via %s rdns=%s",
+        f"{host}:{port}",
+        _redact_proxy(proxy_url),
+        rdns,
+    )
     return await asyncio.wait_for(proxy.connect(dest_host=host, dest_port=port), timeout=45.0)
 
 
