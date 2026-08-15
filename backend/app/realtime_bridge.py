@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 OnTranscript = Callable[[str, str], Awaitable[None]]  # role, text
 OnEvent = Callable[[dict[str, Any]], Awaitable[None]]
 OnHangup = Callable[[str], Awaitable[None]]  # reason
+OnTool = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
 DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
 END_CALL_TOOL_NAMES = {"end_call", "sip_hangup", "hangup", "endcall"}
@@ -64,6 +65,60 @@ END_CALL_TOOL = {
         },
     },
 }
+MEMORY_SEARCH_TOOL = {
+    "type": "function",
+    "name": "memory_search",
+    "description": (
+        "Search long-term memory about this caller. "
+        "Use when they ask about past facts, names, agreements, or previous conversations."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to look up"},
+        },
+        "required": ["query"],
+    },
+}
+MEMORY_ADD_TOOL = {
+    "type": "function",
+    "name": "memory_add",
+    "description": "Save an important fact about this caller for future calls. Do not announce this.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "Fact to remember"},
+        },
+        "required": ["text"],
+    },
+}
+CALL_HISTORY_TOOL = {
+    "type": "function",
+    "name": "call_history",
+    "description": (
+        "Get transcripts of previous phone calls with this number. "
+        "Use when the caller asks what you discussed last time."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "How many past calls to return (1-5)"},
+        },
+    },
+}
+MEMORY_VOICE_INSTRUCTION = (
+    "Память и история звонков: блок ниже — служебный контекст, не зачитывай его целиком. "
+    "Если абонент спрашивает о прошлых разговорах, договорённостях или фактах, "
+    "молча вызови memory_search или call_history и ответь своими словами. "
+    "Важные новые факты сохрани через memory_add. "
+    "Никогда не произноси имена инструментов и не читай JSON вслух."
+)
+_TOOL_EVENT_TYPES = {
+    "response.done",
+    "response.output_item.done",
+    "conversation.item.created",
+    "response.function_call_arguments.done",
+}
 
 def _tool_name(blob: Any) -> str:
     if not isinstance(blob, dict):
@@ -73,22 +128,53 @@ def _tool_name(blob: Any) -> str:
     return str(raw).strip().lower().replace("functions.", "").replace(" ", "_")
 
 
-def _event_hangup_tool(event: dict[str, Any]) -> dict[str, Any] | None:
-    """Find an end_call/sip_hangup function call anywhere in a Realtime event."""
+def _tool_arguments(item: dict[str, Any]) -> dict[str, Any]:
+    raw = item.get("arguments")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _as_function_call(blob: dict[str, Any]) -> dict[str, Any] | None:
+    nested = blob.get("item") if isinstance(blob.get("item"), dict) else {}
+    cur = nested or blob
+    item_type = str(cur.get("type") or blob.get("type") or "")
+    name = _tool_name(cur) or _tool_name(blob)
+    if not name:
+        return None
+    is_call = item_type in {"function_call", "response.function_call_arguments.done"}
+    if not is_call:
+        return None
+    return {
+        "type": "function_call",
+        "name": name,
+        "call_id": str(cur.get("call_id") or blob.get("call_id") or cur.get("id") or blob.get("id") or ""),
+        "arguments": cur.get("arguments") if cur.get("arguments") is not None else blob.get("arguments") or "{}",
+    }
+
+
+def _event_function_call(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Find a named function call in a Realtime event (hangup or memory/history)."""
+    found = _as_function_call(event)
+    if found is not None:
+        return found
     stack: list[Any] = [event]
     seen = 0
     while stack and seen < 40:
         cur = stack.pop()
         seen += 1
         if isinstance(cur, dict):
-            item_type = str(cur.get("type") or "")
-            if item_type in {"function", "session"}:
+            if str(cur.get("type") or "") in {"function", "session"}:
                 continue
-            name = _tool_name(cur)
-            if item_type == "function_call" and (not name or name in END_CALL_TOOL_NAMES):
-                return cur
-            if name in END_CALL_TOOL_NAMES:
-                return cur
+            found = _as_function_call(cur)
+            if found is not None:
+                return found
             stack.extend(cur.values())
         elif isinstance(cur, list):
             stack.extend(cur)
@@ -273,9 +359,11 @@ def build_session_config(
     voice: str = "marin",
     model: str = DEFAULT_REALTIME_MODEL,
     reasoning_effort: str = "low",
+    extra_tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """GA Realtime session — matches working MtzVersion sip_realtime_bridge."""
     effort = reasoning_effort if reasoning_effort in {"minimal", "low", "medium", "high", "xhigh"} else "low"
+    tools = [END_CALL_TOOL, *(extra_tools or [])]
     return {
         "type": "realtime",
         "model": model,
@@ -293,7 +381,7 @@ def build_session_config(
             },
         },
         "reasoning": {"effort": effort},
-        "tools": [END_CALL_TOOL],
+        "tools": tools,
         "tool_choice": "auto",
     }
 
@@ -359,6 +447,8 @@ class RealtimeSession:
         on_transcript: OnTranscript | None = None,
         on_event: OnEvent | None = None,
         on_hangup: OnHangup | None = None,
+        on_tool: OnTool | None = None,
+        extra_tools: list[dict[str, Any]] | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url
@@ -369,6 +459,8 @@ class RealtimeSession:
         self.on_transcript = on_transcript
         self.on_event = on_event
         self.on_hangup = on_hangup
+        self.on_tool = on_tool
+        self.extra_tools = list(extra_tools or [])
         self.playback = PlaybackBuffer()
         self.last_error: str | None = None
         self._ws: ClientConnection | None = None
@@ -384,6 +476,7 @@ class RealtimeSession:
         self._assistant_parts: list[str] = []
         self._response_count = 0
         self._user_wants_hangup = False
+        self._handled_tool_ids: set[str] = set()
 
     @property
     def closed(self) -> bool:
@@ -443,7 +536,19 @@ class RealtimeSession:
         except TimeoutError:
             logger.warning("Realtime session.updated timed out — continuing")
         if self.last_error and "tool" in self.last_error.lower():
-            logger.warning("Realtime tools rejected (%s) — continuing without end_call tool", self.last_error)
+            logger.warning("Realtime tools rejected (%s) — retrying hangup-only", self.last_error)
+            self.last_error = None
+            hangup_only = dict(session)
+            hangup_only["tools"] = [END_CALL_TOOL]
+            hangup_only["tool_choice"] = "auto"
+            self._session_updated = asyncio.Event()
+            await self._ws.send(json.dumps({"type": "session.update", "session": hangup_only}))
+            try:
+                await asyncio.wait_for(self._session_updated.wait(), timeout=8)
+            except TimeoutError:
+                logger.warning("Realtime session.updated (hangup-only) timed out — continuing")
+        if self.last_error and "tool" in self.last_error.lower():
+            logger.warning("Realtime hangup tool rejected (%s) — continuing without tools", self.last_error)
             self.last_error = None
             stripped = {key: value for key, value in session.items() if key not in {"tools", "tool_choice"}}
             self._session_updated = asyncio.Event()
@@ -461,6 +566,7 @@ class RealtimeSession:
             instructions=self.instructions,
             voice=self.voice,
             model=self.model,
+            extra_tools=self.extra_tools,
         )
         direct_url = _realtime_ws_url(self.base_url, model=self.model)
         errors: list[str] = []
@@ -633,17 +739,9 @@ class RealtimeSession:
         }:
             logger.info("Realtime event %s", etype)
 
-        hangup_item = _event_hangup_tool(event) if "function" in etype or etype in {
-            "response.done",
-            "response.output_item.added",
-            "response.output_item.done",
-            "conversation.item.added",
-            "conversation.item.created",
-            "response.function_call_arguments.done",
-            "response.function_call_arguments.delta",
-        } else None
-        if hangup_item is not None:
-            await self._handle_tool_call(hangup_item)
+        tool_item = _event_function_call(event) if etype in _TOOL_EVENT_TYPES else None
+        if tool_item is not None:
+            await self._handle_tool_call(tool_item)
 
         if self.on_event:
             try:
@@ -715,11 +813,17 @@ class RealtimeSession:
             if status and status != "completed":
                 self.last_error = f"response.{status}: {details}"
             output = (event.get("response") or {}).get("output") or []
+            had_tool = False
             for item in output:
                 if not isinstance(item, dict):
                     continue
-                if str(item.get("type") or "") == "function_call" or _tool_name(item) in END_CALL_TOOL_NAMES:
-                    await self._handle_tool_call(item)
+                call_item = _as_function_call(item)
+                if call_item is None:
+                    continue
+                had_tool = True
+                await self._handle_tool_call(call_item)
+            if had_tool:
+                return
             self._response_count += 1
             last = " ".join(self._assistant_parts[-3:])
             if self._hangup_reason is None and self._response_count >= 2:
@@ -760,39 +864,67 @@ class RealtimeSession:
         except Exception:
             logger.exception("Realtime on_hangup failed")
 
+    async def _send_tool_output(self, call_id: str, payload: Any) -> None:
+        if self._ws is None or self.closed or not call_id:
+            return
+        try:
+            await self._ws.send(
+                json.dumps(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": json.dumps(payload, ensure_ascii=False, default=str),
+                        },
+                    }
+                )
+            )
+        except Exception:
+            logger.warning("Failed to send Realtime tool output for %s", call_id)
+
+    async def _continue_after_tool(self) -> None:
+        if self._ws is None or self.closed or self._hangup_reason is not None:
+            return
+        try:
+            await self._ws.send(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "response": {"output_modalities": ["audio"]},
+                    }
+                )
+            )
+        except Exception:
+            logger.warning("Failed to continue Realtime after tool")
+
     async def _handle_tool_call(self, item: dict[str, Any]) -> None:
         name = _tool_name(item)
-        if name not in END_CALL_TOOL_NAMES:
+        if not name:
             nested = item.get("item") if isinstance(item.get("item"), dict) else {}
             name = _tool_name(nested)
             item = nested or item
-        if name not in END_CALL_TOOL_NAMES and str(item.get("type") or "") != "function_call":
-            return
-        logger.info("Realtime end_call tool name=%s", name or item.get("type"))
         call_id = str(item.get("call_id") or item.get("id") or "")
-        reason = "agent_hangup"
-        raw_args = item.get("arguments")
-        if isinstance(raw_args, str) and raw_args.strip():
+        if call_id and call_id in self._handled_tool_ids:
+            return
+        if call_id:
+            self._handled_tool_ids.add(call_id)
+        args = _tool_arguments(item)
+        if name in END_CALL_TOOL_NAMES:
+            logger.info("Realtime end_call tool name=%s", name)
+            reason = str(args.get("reason") or "agent_hangup")[:80]
+            await self._send_tool_output(call_id, {"ok": True, "hangup": True})
+            self.request_hangup(reason)
+            return
+        if not name:
+            return
+        logger.info("Realtime tool %s args=%s", name, json.dumps(args, ensure_ascii=False)[:200])
+        result: Any = {"error": f"unknown tool {name}"}
+        if self.on_tool is not None:
             try:
-                parsed = json.loads(raw_args)
-                if isinstance(parsed, dict) and parsed.get("reason"):
-                    reason = str(parsed["reason"])[:80]
-            except json.JSONDecodeError:
-                pass
-        if self._ws is not None and call_id:
-            try:
-                await self._ws.send(
-                    json.dumps(
-                        {
-                            "type": "conversation.item.create",
-                            "item": {
-                                "type": "function_call_output",
-                                "call_id": call_id,
-                                "output": json.dumps({"ok": True, "hangup": True}),
-                            },
-                        }
-                    )
-                )
-            except Exception:
-                logger.warning("Failed to ack end_call tool")
-        self.request_hangup(reason)
+                result = await self.on_tool(name, args)
+            except Exception as exc:
+                logger.exception("Realtime tool %s failed", name)
+                result = {"error": str(exc)[:300]}
+        await self._send_tool_output(call_id, result)
+        await self._continue_after_tool()

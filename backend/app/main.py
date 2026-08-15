@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     await create_schema()
     memory = MemoryStore()
     telegram = TelegramGateway(settings)
-    sip = SipGateway(settings, events)
+    sip = SipGateway(settings, events, memory)
     mcp = McpManager()
     search = WebSearch()
     runtime = AgentRuntime(settings, memory, search, events, telegram, mcp, sip=sip)

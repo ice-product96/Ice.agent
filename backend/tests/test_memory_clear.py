@@ -2,7 +2,7 @@ import asyncio
 
 from app.config import Settings
 from app.integrations import MemoryStore
-from app.memory_clear import clear_agent_memory
+from app.memory_clear import clear_agent_memory, clear_all_memory
 
 
 def test_clear_agent_memory_keeps_other_agents() -> None:
@@ -19,5 +19,18 @@ def test_clear_agent_memory_keeps_other_agents() -> None:
 
         await memory.reset()
         assert await memory.get_all() == []
+
+    asyncio.run(run())
+
+
+def test_clear_all_memory_wipes_every_agent() -> None:
+    async def run() -> None:
+        memory = MemoryStore(Settings(mem0_enabled=False))
+        await memory.add("alpha fact", "user-1", "agent-1")
+        await memory.add("other agent", "user-1", "agent-2")
+        result = await clear_all_memory(memory)
+        assert result["memory_remaining"] == 0
+        assert await memory.get_all() == []
+        assert await memory.get_all(agent_id="agent-1") == []
 
     asyncio.run(run())

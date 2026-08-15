@@ -182,6 +182,42 @@ function ConfirmDelete({ name, onClose, onDelete }: { name: string; onClose: () 
   </Modal>
 }
 
+function ConfirmClearJournals({
+  agentId,
+  agentName,
+  onClose,
+  onCleared,
+}: {
+  agentId?: string
+  agentName?: string
+  onClose: () => void
+  onCleared: () => void | Promise<void>
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const title = agentName ? `Очистить журналы «${agentName}»?` : 'Удалить все журналы?'
+  const subtitle = agentName
+    ? 'Память, история звонков и диалоги этого агента будут удалены. Активные звонки не трогаем.'
+    : 'Память, история звонков и все диалоги будут удалены. Активные звонки не трогаем. Это необратимо.'
+  return <Modal title={title} subtitle={subtitle} onClose={onClose}>
+    {error && <Alert message={error}/>}
+    <div className="modal-actions">
+      <button className="secondary" onClick={onClose}>Отмена</button>
+      <button className="danger" disabled={busy} onClick={async () => {
+        setBusy(true); setError('')
+        try {
+          await api.journals.clear(agentId)
+          await onCleared()
+          onClose()
+        } catch (err) {
+          setError(err instanceof Error ? err.message : 'Не удалось очистить журналы')
+          setBusy(false)
+        }
+      }}>{busy ? <LoaderCircle className="spin" size={16}/> : <Trash2 size={16}/>}Удалить всё</button>
+    </div>
+  </Modal>
+}
+
 function healthItems(data: Dashboard) {
   const source = data.connections || data.readiness
   if (!source) return []
@@ -272,6 +308,7 @@ function AgentsScreen() {
   const sip = useLoad(api.sip.list, [])
   const [editing, setEditing] = useState<Partial<Agent> | null>(null)
   const [deleting, setDeleting] = useState<Agent | null>(null)
+  const [clearing, setClearing] = useState<Agent | null>(null)
   if (loading || profiles.loading || telegram.loading || sip.loading) return <Loading/>
   const profileName = (id?: string) => profiles.data?.find(p => String(p.id) === String(id))?.name || (id ? 'Неизвестный профиль LLM' : 'Без профиля LLM')
   const telegramName = (id?: string) => telegram.data?.find(a => String(a.id) === String(id))?.name || (id ? 'Неизвестный аккаунт Telegram' : 'Без аккаунта Telegram')
@@ -286,7 +323,7 @@ function AgentsScreen() {
         <div className="binding-list"><span><KeyRound size={13}/>{profileName(agent.llm_profile_id)}</span><span><MessageCircle size={13}/>{telegramName(agent.telegram_account_id)}</span><span><Phone size={13}/>{sipName(agent.sip_account_id)}</span></div>
         <div className="chip-row"><span className="chip">{agent.provider || 'openai'}</span><span className="chip">{agent.model || 'Без модели'}</span>{agent.tools.slice(0, 2).map(t => <span className="chip" key={t}>{toolDisplayName(t)}</span>)}</div>
         <div className="entity-meta"><span><Link2 size={14}/>{agent.links.length} связей</span><span>{agent.typing_enabled ? 'Индикатор набора вкл.' : 'Индикатор набора выкл.'}</span></div>
-        <div className="card-actions"><button className="secondary" onClick={() => setEditing(agent)}>Настроить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(agent)}><Trash2 size={17}/></button></div>
+        <div className="card-actions"><button className="secondary" onClick={() => setEditing(agent)}>Настроить</button><button className="secondary" onClick={() => setClearing(agent)}>Удалить всё</button><button className="icon-button danger-ghost" onClick={() => setDeleting(agent)}><Trash2 size={17}/></button></div>
       </article>)}</div>}
     {editing && <AgentForm value={editing} agents={data} profiles={profiles.data || []} telegram={telegram.data || []} sip={sip.data || []} onClose={() => setEditing(null)} onSave={async value => {
       if (value.id) { const saved = await api.agents.update(value.id, value); setData(data.map(a => a.id === saved.id ? saved : a)) }
@@ -294,6 +331,7 @@ function AgentsScreen() {
       setEditing(null)
     }}/>}
     {deleting && <ConfirmDelete name={deleting.name} onClose={() => setDeleting(null)} onDelete={async () => { await api.agents.remove(deleting.id); setData(data.filter(a => a.id !== deleting.id)) }}/>}
+    {clearing && <ConfirmClearJournals agentId={clearing.id} agentName={clearing.name} onClose={() => setClearing(null)} onCleared={() => undefined}/>}
     {error && <button className="secondary" onClick={refresh}><RefreshCw size={16}/>Повторить</button>}
   </>
 }
@@ -305,6 +343,7 @@ function AgentForm({ value, agents, profiles, telegram, sip, onClose, onSave }: 
   const [form, setForm] = useState(value)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [clearing, setClearing] = useState(false)
   const toolOptions = ['web_search', 'memory', 'code_execution', 'telegram', 'sip', 'filesystem', 'mcp']
   const permissionOptions = [
     ['telegram_delete_dialog', 'Удалять диалоги Telegram'],
@@ -369,8 +408,9 @@ function AgentForm({ value, agents, profiles, telegram, sip, onClose, onSave }: 
         <div className="toggle-box"><Toggle label="Показывать индикатор набора" checked={form.typing_enabled ?? true} onChange={v => patch({ typing_enabled: v })}/></div>
         <div className="toggle-box"><Toggle label="Агент включён" checked={form.enabled ?? true} onChange={v => patch({ enabled: v })}/></div>
       </div>
-      <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Отмена</button><button className="primary" disabled={busy}>{busy && <LoaderCircle className="spin" size={16}/>}Сохранить агента</button></div>
+      <div className="modal-actions">{form.id && <button type="button" className="danger" onClick={() => setClearing(true)}><Trash2 size={16}/>Удалить всё</button>}<button type="button" className="secondary" onClick={onClose}>Отмена</button><button className="primary" disabled={busy}>{busy && <LoaderCircle className="spin" size={16}/>}Сохранить агента</button></div>
     </form>
+    {clearing && form.id && <ConfirmClearJournals agentId={String(form.id)} agentName={form.name} onClose={() => setClearing(false)} onCleared={() => setClearing(false)}/>}
   </Modal>
 }
 
@@ -575,6 +615,7 @@ function CallsScreen() {
   const [number, setNumber] = useState('')
   const [busy, setBusy] = useState(false)
   const [dialError, setDialError] = useState('')
+  const [clearing, setClearing] = useState(false)
   useEffect(() => {
     const timer = window.setInterval(() => { void refresh() }, 5000)
     return () => window.clearInterval(timer)
@@ -595,7 +636,7 @@ function CallsScreen() {
   }
   return <>
     {(error || dialError) && <Alert message={error || dialError}/>}
-    <SectionHead title="SIP-звонки" text="Исходящие и входящие звонки агентов через OpenAI Realtime" action={<button className="secondary" onClick={refresh}><RefreshCw size={16}/>Обновить</button>}/>
+    <SectionHead title="SIP-звонки" text="Исходящие и входящие звонки агентов через OpenAI Realtime" action={<div className="head-actions"><button className="danger" onClick={() => setClearing(true)}><Trash2 size={16}/>Удалить всё</button><button className="secondary" onClick={refresh}><RefreshCw size={16}/>Обновить</button></div>}/>
     <section className="panel">
       <SectionHead title="Новый звонок" text="Агент должен иметь SIP-аккаунт, инструмент sip и профиль OpenAI"/>
       <form onSubmit={dial} className="form-grid">
@@ -628,6 +669,7 @@ function CallsScreen() {
             <button className="secondary compact" onClick={async () => { await api.sip.hangup(call.id); setData(await api.sip.calls(false)) }}><PhoneOff size={14}/>Hangup</button>}
         </div>)}</div>}
     </section>
+    {clearing && <ConfirmClearJournals onClose={() => setClearing(false)} onCleared={() => void refresh()}/>}
   </>
 }
 
@@ -816,13 +858,14 @@ function ConversationsScreen() {
   const total = Array.isArray(loaded.data) ? loaded.data.length : loaded.data?.total ?? items.length
   const [selected, setSelected] = useState<Conversation | null>(null)
   const [clearing, setClearing] = useState<Conversation | null>(null)
+  const [clearingAll, setClearingAll] = useState(false)
   useEffect(() => {
     const interval = window.setInterval(() => void loaded.refresh(), 30_000)
     return () => window.clearInterval(interval)
   }, [loaded.refresh])
   const agentName = (id: string) => agents.data?.find(agent => String(agent.id) === String(id))?.name || id
   return <>
-    <SectionHead title={`${total} диалогов`} text={total > items.length ? `Показаны последние ${items.length}; обновление каждые 30 секунд` : 'Контекст обновляется каждые 30 секунд'} action={<button className="secondary compact" disabled={loaded.loading} onClick={loaded.refresh}><RefreshCw className={loaded.loading ? 'spin' : ''} size={15}/>Обновить</button>}/>
+    <SectionHead title={`${total} диалогов`} text={total > items.length ? `Показаны последние ${items.length}; обновление каждые 30 секунд` : 'Контекст обновляется каждые 30 секунд'} action={<div className="head-actions"><button className="danger" onClick={() => setClearingAll(true)}><Trash2 size={16}/>Удалить всё</button><button className="secondary compact" disabled={loaded.loading} onClick={loaded.refresh}><RefreshCw className={loaded.loading ? 'spin' : ''} size={15}/>Обновить</button></div>}/>
     <form className="filter-bar conversation-filters" onSubmit={event => { event.preventDefault(); setQuery(search.trim()) }}>
       <div className="search-box"><Search size={17}/><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Поиск по пользователю, чату или сводке…"/></div>
       <select aria-label="Фильтр по агенту" value={agentId} onChange={event => setAgentId(event.target.value)}><option value="">Все агенты</option>{agents.data?.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select>
@@ -839,6 +882,7 @@ function ConversationsScreen() {
       </button>)}</div>}
     {selected && <ConversationDetailModal id={selected.id} agentName={agentName(selected.agent_id)} onClose={() => setSelected(null)} onClear={conversation => setClearing(conversation)}/>}
     {clearing && <ClearConversationModal conversation={clearing} onClose={() => setClearing(null)} onCleared={() => { setClearing(null); setSelected(null); void loaded.refresh() }}/>}
+    {clearingAll && <ConfirmClearJournals agentId={agentId || undefined} agentName={agentId ? agentName(agentId) : undefined} onClose={() => setClearingAll(false)} onCleared={() => { setClearingAll(false); setSelected(null); void loaded.refresh() }}/>}
   </>
 }
 
@@ -849,6 +893,7 @@ function MemoryScreen() {
   const [deleting, setDeleting] = useState<MemoryItem | null>(null)
   const [migrateMsg, setMigrateMsg] = useState('')
   const [migrating, setMigrating] = useState(false)
+  const [clearing, setClearing] = useState(false)
   async function migrate() {
     setMigrating(true); setMigrateMsg('')
     try {
@@ -862,13 +907,14 @@ function MemoryScreen() {
     }
   }
   return <>
-    <SectionHead title="Сохранённый контекст" text="Поиск семантической и структурированной памяти агентов" action={<button className="secondary" disabled={migrating} onClick={() => void migrate()}>{migrating ? <LoaderCircle className="spin" size={16}/> : null}Перенести RAM → Qdrant</button>}/>
+    <SectionHead title="Сохранённый контекст" text="Поиск семантической и структурированной памяти агентов" action={<div className="head-actions"><button className="danger" onClick={() => setClearing(true)}><Trash2 size={16}/>Удалить всё</button><button className="secondary" disabled={migrating} onClick={() => void migrate()}>{migrating ? <LoaderCircle className="spin" size={16}/> : null}Перенести RAM → Qdrant</button></div>}/>
     {migrateMsg && <Alert message={migrateMsg}/>}
     <form className="filter-bar" onSubmit={e => { e.preventDefault(); setQuery(search) }}><div className="search-box"><Search size={17}/><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Поиск по содержимому, ключам или области…"/></div><button className="secondary">Поиск</button></form>
     {loaded.error && <Alert message={loaded.error}/>}
     {loaded.loading ? <Loading/> : items.length === 0 ? <Empty icon={BrainCircuit} title="Подходящих записей нет" text="Записи памяти агентов появятся по мере создания."/> :
       <div className="memory-list">{items.map(item => <article className="memory-card" key={item.id}><div className="memory-head"><div><span className="scope">{item.scope}</span><strong>{item.key}</strong></div><button className="icon-button danger-ghost" onClick={() => setDeleting(item)}><Trash2 size={16}/></button></div><p>{item.content}</p><div className="entity-meta"><span>{item.agent_id ? `Агент ${item.agent_id}` : 'Глобально'}</span>{item.created_at && <time>{new Date(item.created_at).toLocaleString()}</time>}</div></article>)}</div>}
     {deleting && <ConfirmDelete name={deleting.key} onClose={() => setDeleting(null)} onDelete={async () => { await api.memory.remove(deleting.id); loaded.setData(Array.isArray(loaded.data) ? loaded.data.filter(i => i.id !== deleting.id) : loaded.data ? { ...loaded.data, items: loaded.data.items.filter(i => i.id !== deleting.id) } : loaded.data) }}/>}
+    {clearing && <ConfirmClearJournals onClose={() => setClearing(false)} onCleared={() => void loaded.refresh()}/>}
   </>
 }
 
@@ -981,6 +1027,7 @@ function RuntimeScreen() {
   const loaded = useLoad(api.settings.runtime, []); const profiles = useLoad(api.llmProfiles.list, [])
   const [form, setForm] = useState<RuntimeSettings>(); const [busy, setBusy] = useState(false)
   const [saved, setSaved] = useState(false); const [error, setError] = useState(''); const [searchResult, setSearchResult] = useState('')
+  const [clearing, setClearing] = useState(false)
   useEffect(() => { if (loaded.data) setForm({
     ...loaded.data,
     timezone: loaded.data.timezone ?? 'UTC',
@@ -1032,7 +1079,7 @@ function RuntimeScreen() {
         <div className="toggle-box"><Toggle label="Суммаризация включена" checked={form.summarization_enabled} onChange={v => patch({ summarization_enabled: v })}/></div>
       </div>
     </section>
-    <section className="panel"><SectionHead title="Бэкенд памяти" text="Долговременная семантическая память и хранилище эмбеддингов"/>
+    <section className="panel"><SectionHead title="Бэкенд памяти" text="Долговременная семантическая память и хранилище эмбеддингов" action={<button type="button" className="danger compact" onClick={() => setClearing(true)}><Trash2 size={15}/>Удалить всё</button>}/>
       <div className="form-grid">
         <Field label="Бэкенд памяти"><select value={form.memory_backend} onChange={e => patch({ memory_backend: e.target.value })}><option value="local">Local Mem0 + Qdrant</option><option value="platform">Mem0 Platform</option></select></Field>
         <Field label="Профиль LLM для памяти" hint="Используется для извлечения фактов; embeddings создаются локально через FastEmbed"><select value={form.memory_llm_profile_id || ''} onChange={e => patch({ memory_llm_profile_id: e.target.value || null })}><option value="">Без отдельного профиля</option>{profiles.data?.map(p => <option key={p.id} value={p.id}>{p.name} · {p.default_model}</option>)}</select></Field>
@@ -1047,6 +1094,7 @@ function RuntimeScreen() {
     </section>
     <section className="panel"><SectionHead title="Выполнение задач" text="Параллелизм и лимиты цикла инструментов"/><div className="form-grid"><Field label="Воркеры задач"><input required min="1" type="number" value={form.task_workers} onChange={e => number('task_workers', e.target.value)}/></Field><Field label="Максимум раундов инструментов"><input required min="1" type="number" value={form.max_tool_rounds} onChange={e => number('max_tool_rounds', e.target.value)}/></Field></div></section>
     <div className="save-bar"><span>{saved && <><CheckCircle2 size={17}/>Настройки runtime сохранены</>}</span><button className="primary" disabled={busy}>{busy && <LoaderCircle className="spin" size={16}/>}Сохранить runtime</button></div>
+    {clearing && <ConfirmClearJournals onClose={() => setClearing(false)} onCleared={() => setClearing(false)}/>}
   </form>
 }
 
@@ -1072,6 +1120,7 @@ function LiveScreen({ mode }: { mode: 'logs' | 'tasks' }) {
   const logsLoad = useLoad(() => api.logs(), []); const tasksLoad = useLoad(api.tasks, [])
   const [connected, setConnected] = useState(false); const [search, setSearch] = useState(''); const [level, setLevel] = useState('')
   const [logs, setLogs] = useState<LogEntry[]>([]); const [tasks, setTasks] = useState<AgentTask[]>([])
+  const [clearing, setClearing] = useState(false)
   useEffect(() => { if (logsLoad.data) setLogs(Array.isArray(logsLoad.data) ? logsLoad.data : logsLoad.data.items) }, [logsLoad.data])
   useEffect(() => { if (tasksLoad.data) setTasks(Array.isArray(tasksLoad.data) ? tasksLoad.data : tasksLoad.data.items) }, [tasksLoad.data])
   useEffect(() => {
@@ -1091,11 +1140,12 @@ function LiveScreen({ mode }: { mode: 'logs' | 'tasks' }) {
   const filteredTasks = useMemo(() => tasks.filter(t => !search || `${t.title} ${t.payload || ''}`.toLowerCase().includes(search.toLowerCase())), [tasks, search])
   const loading = mode === 'logs' ? logsLoad.loading : tasksLoad.loading; const error = mode === 'logs' ? logsLoad.error : tasksLoad.error
   return <>
-    <SectionHead title={mode === 'logs' ? `${filteredLogs.length} недавних событий` : `${filteredTasks.length} задач`} text={connected ? 'Получение обновлений в реальном времени' : 'Поток недоступен — показаны данные API'} action={<span className={`live-pill ${connected ? '' : 'muted'}`}>{connected ? <Wifi size={14}/> : <WifiOff size={14}/>} {connected ? 'Подключено' : 'Офлайн'}</span>}/>
+    <SectionHead title={mode === 'logs' ? `${filteredLogs.length} недавних событий` : `${filteredTasks.length} задач`} text={connected ? 'Получение обновлений в реальном времени' : 'Поток недоступен — показаны данные API'} action={<div className="head-actions">{mode === 'logs' && <button className="danger" onClick={() => setClearing(true)}><Trash2 size={16}/>Удалить всё</button>}<span className={`live-pill ${connected ? '' : 'muted'}`}>{connected ? <Wifi size={14}/> : <WifiOff size={14}/>} {connected ? 'Подключено' : 'Офлайн'}</span></div>}/>
     <div className="filter-bar"><div className="search-box"><Search size={17}/><input value={search} onChange={e => setSearch(e.target.value)} placeholder={mode === 'logs' ? 'Поиск по логам…' : 'Поиск по задачам…'}/></div>{mode === 'logs' && <select value={level} onChange={e => setLevel(e.target.value)}><option value="">Все уровни</option><option>debug</option><option>info</option><option>warning</option><option>error</option></select>}</div>
     {error && <Alert message={error}/>}
     {loading ? <Loading/> : mode === 'logs' ? <div className="log-view">{filteredLogs.length === 0 ? <Empty icon={FileText} title="Нет событий логов" text="События runtime появятся здесь."/> : filteredLogs.map(log => <div className="log-row" key={log.id}><time>{new Date(log.timestamp).toLocaleTimeString()}</time><span className={`log-level ${log.level}`}>{log.level}</span><strong>{log.source}</strong><p>{log.message}</p></div>)}</div> :
       <div className="task-board">{(['queued', 'running', 'completed', 'failed'] as AgentTask['status'][]).map(status => <section className="task-column" key={status}><h3><span className={`task-dot ${status}`}/>{taskStatusLabel[status] || status}<small>{filteredTasks.filter(t => t.status === status).length}</small></h3>{filteredTasks.filter(t => t.status === status).map(task => <article className="task-card" key={task.id}><strong>{task.title}</strong>{task.payload && <p>{task.payload}</p>}<div><span>{task.from_agent_id || 'система'} → {task.to_agent_id}</span><time>{new Date(task.created_at).toLocaleString()}</time></div></article>)}</section>)}</div>}
+    {clearing && <ConfirmClearJournals onClose={() => setClearing(false)} onCleared={() => { setLogs([]); void logsLoad.refresh() }}/>}
   </>
 }
 

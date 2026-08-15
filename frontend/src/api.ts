@@ -122,6 +122,20 @@ export const api = {
     hangup: (id: string) => request<{ ok: boolean }>(`/sip/calls/${id}/hangup`, { method: 'POST' }),
     status: () => request<Record<string, unknown>>('/sip/status'),
   },
+  journals: {
+    clear: (agentId?: string) =>
+      request<{
+        ok: boolean
+        memory_deleted: number
+        memory_remaining: number
+        calls_deleted: number
+        conversations_cleared: number
+        messages_deleted: number
+      }>(agentId ? `/agents/${agentId}/journals/clear` : '/journals/clear', {
+        method: 'POST',
+        ...body({ memory: true, calls: true, conversations: true }),
+      }),
+  },
   memory: {
     list: (search?: string, agentId?: string) =>
       request<Paginated<MemoryItem> | MemoryItem[]>(`/memory${qs({ search, agent_id: agentId })}`),

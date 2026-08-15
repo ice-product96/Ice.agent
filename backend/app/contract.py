@@ -16,6 +16,7 @@ from .db import (
 )
 from .events import events
 from .integrations import exception_text
+from .memory_clear import clear_journals
 from .schemas import LlmProfileBody, RuntimeSettingsBody
 from .secrets import SecretStore, masked_secret
 from .security import issue_token, require_admin, valid_password, verify_token
@@ -1163,6 +1164,70 @@ async def memory_migrate(request: Request) -> dict[str, Any]:
 async def memory_delete(memory_id: str, request: Request) -> Response:
     await request.app.state.memory.delete(memory_id)
     return Response(status_code=204)
+
+
+class JournalsClearBody(BaseModel):
+    memory: bool = True
+    calls: bool = True
+    conversations: bool = True
+
+
+async def _journals_clear(
+    request: Request,
+    db: AsyncSession,
+    *,
+    agent_id: int | None,
+    payload: JournalsClearBody,
+) -> dict[str, Any]:
+    try:
+        return await clear_journals(
+            db=db,
+            memory=request.app.state.memory,
+            agent_id=agent_id,
+            include_memory=payload.memory,
+            include_calls=payload.calls,
+            include_conversations=payload.conversations,
+        )
+    except Exception as exc:
+        detail = exception_text(exc)
+        memory = getattr(request.app.state, "memory", None)
+        if memory is not None:
+            memory.last_error = detail
+        raise HTTPException(
+            status_code=502,
+            detail=f"Journal clear failed: {detail}",
+        ) from exc
+
+
+@router.post("/journals/clear", dependencies=auth)
+async def clear_all_journals(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    payload: JournalsClearBody | None = None,
+) -> dict[str, Any]:
+    return await _journals_clear(request, db, agent_id=None, payload=payload or JournalsClearBody())
+
+
+@router.post("/agents/{agent_id}/journals/clear", dependencies=auth)
+async def clear_agent_journals(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    payload: JournalsClearBody | None = None,
+) -> dict[str, Any]:
+    agent = await one(db, Agent, agent_id)
+    return await _journals_clear(request, db, agent_id=agent.id, payload=payload or JournalsClearBody())
+
+
+@router.post("/agents/{agent_id}/memory/clear", dependencies=auth)
+async def clear_agent_memory_compat(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    payload: JournalsClearBody | None = None,
+) -> dict[str, Any]:
+    agent = await one(db, Agent, agent_id)
+    return await _journals_clear(request, db, agent_id=agent.id, payload=payload or JournalsClearBody())
 
 
 def mcp_json(server: McpServer) -> dict[str, Any]:

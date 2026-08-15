@@ -95,6 +95,7 @@ main { padding-left: 250px; min-height: 100vh; }
 .panel { padding: 21px; }
 .section-head { margin-bottom: 18px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .section-head h2 { font-size: 15px; }.section-head p { color: #747d90; font-size: 11px; margin-top: 5px; }
+.head-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
 .service-row, .account-row, .server-row { display: flex; align-items: center; gap: 12px; min-height: 56px; border-top: 1px solid #1e2430; }
 .service-row:first-child { border-top: 0; }
 .service-row > div:not(.grow) { flex: 1; }.service-row strong, .service-row small, .account-row strong, .account-row small, .server-row strong, .server-row small { display: block; }

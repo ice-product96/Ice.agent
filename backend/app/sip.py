@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from sqlalchemy import select
@@ -11,10 +12,18 @@ from sqlalchemy import select
 import os
 
 from .config import Settings
-from .db import Agent, LlmProfile, SessionLocal, SipAccount, SipCall, utcnow
+from .db import Agent, LlmProfile, RuntimeSettings, SessionLocal, SipAccount, SipCall, utcnow
 from .events import EventHub
-from .integrations import exception_text
-from .realtime_bridge import DEFAULT_REALTIME_MODEL, HANGUP_INSTRUCTION, RealtimeSession
+from .integrations import MemoryStore, exception_text
+from .realtime_bridge import (
+    CALL_HISTORY_TOOL,
+    DEFAULT_REALTIME_MODEL,
+    HANGUP_INSTRUCTION,
+    MEMORY_ADD_TOOL,
+    MEMORY_SEARCH_TOOL,
+    MEMORY_VOICE_INSTRUCTION,
+    RealtimeSession,
+)
 from .secrets import SecretStore
 from .sip_ua import ActiveCall, SipEndpointConfig, SipUserAgent
 
@@ -26,6 +35,38 @@ INBOUND_GREETING_INSTRUCTION = (
     "Не жди, пока абонент заговорит первым. После приветствия трубку не клади."
 )
 DEFAULT_INBOUND_GREETING = "Скажи коротко: Ало! Чем могу помочь?"
+
+
+def sip_memory_user_id(number: str) -> str:
+    digits = re.sub(r"\D+", "", number or "")
+    if len(digits) >= 11:
+        return digits[-11:]
+    if len(digits) >= 10:
+        return digits
+    return (number or "").strip() or "unknown"
+
+
+def _compact_memory_text(item: dict[str, Any]) -> str:
+    return str(item.get("memory") or item.get("text") or "").strip()
+
+
+def _call_when(row: SipCall) -> str:
+    stamp = row.started_at or row.created_at
+    if stamp is None:
+        return ""
+    return stamp.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _history_item(row: SipCall, *, transcript_limit: int = 1200) -> dict[str, Any]:
+    transcript = (row.transcript or "").strip()
+    if len(transcript) > transcript_limit:
+        transcript = transcript[: transcript_limit - 3] + "..."
+    return {
+        "when": _call_when(row),
+        "direction": row.direction,
+        "remote_number": row.remote_number,
+        "transcript": transcript,
+    }
 
 
 def _ring_delay_seconds(account_value: Any, fallback: float | None) -> float:
@@ -52,9 +93,15 @@ def _resolve_openai_http_proxy(profile_proxy: str | None, settings: Settings) ->
 
 
 class SipGateway:
-    def __init__(self, settings: Settings, events: EventHub) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        events: EventHub,
+        memory: MemoryStore | None = None,
+    ) -> None:
         self.settings = settings
         self.events = events
+        self.memory = memory
         self.secrets = SecretStore.from_settings(settings)
         self._agents: dict[int, SipUserAgent] = {}
         self._reg_status: dict[int, dict[str, Any]] = {}
@@ -62,6 +109,7 @@ class SipGateway:
         self._realtime: dict[str, RealtimeSession] = {}  # sip call-id -> session
         self._pending_realtime: dict[str, asyncio.Task[RealtimeSession]] = {}
         self._desired: dict[int, SipAccount] = {}
+        self._remembered_calls: set[str] = set()
         self._keeper_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
 
@@ -278,6 +326,124 @@ class SipGateway:
                 .limit(1)
             )
 
+    async def _memory_enabled(self) -> bool:
+        async with SessionLocal() as db:
+            settings = await db.get(RuntimeSettings, 1)
+        return bool(settings and settings.memory_enabled and self.memory is not None)
+
+    async def _load_call_history(
+        self,
+        *,
+        agent_id: int,
+        remote_number: str,
+        limit: int = 3,
+        exclude_sip_call_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        key = sip_memory_user_id(remote_number)
+        if key == "unknown":
+            return []
+        limit = max(1, min(int(limit or 3), 5))
+        async with SessionLocal() as db:
+            rows = (await db.scalars(
+                select(SipCall)
+                .where(SipCall.agent_id == agent_id, SipCall.transcript != "")
+                .order_by(SipCall.id.desc())
+                .limit(30)
+            )).all()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            if sip_memory_user_id(row.remote_number) != key:
+                continue
+            sip_id = str((row.metadata_json or {}).get("sip_call_id") or "")
+            if exclude_sip_call_id and sip_id == exclude_sip_call_id:
+                continue
+            if not (row.transcript or "").strip():
+                continue
+            items.append(_history_item(row))
+            if len(items) >= limit:
+                break
+        return items
+
+    async def _voice_context_block(
+        self,
+        agent: Agent,
+        remote_number: str,
+        *,
+        exclude_sip_call_id: str | None = None,
+    ) -> str:
+        user_id = sip_memory_user_id(remote_number)
+        memories: list[str] = []
+        if await self._memory_enabled() and user_id != "unknown" and self.memory is not None:
+            try:
+                found = await self.memory.search(
+                    f"абонент {remote_number} прошлые звонки договорённости факты имя",
+                    user_id=user_id,
+                    agent_id=str(agent.id),
+                    limit=8,
+                )
+                memories = [text for item in found if (text := _compact_memory_text(item))]
+            except Exception:
+                logger.exception("SIP memory search failed for %s", remote_number)
+        history = await self._load_call_history(
+            agent_id=agent.id,
+            remote_number=remote_number,
+            limit=2,
+            exclude_sip_call_id=exclude_sip_call_id,
+        )
+        parts = [MEMORY_VOICE_INSTRUCTION]
+        if memories:
+            parts.append("Relevant long-term memories:")
+            parts.extend(f"- {text[:400]}" for text in memories[:8])
+        else:
+            parts.append("No relevant long-term memories were found.")
+        if history:
+            parts.append("Prior calls with this number (do not read aloud unless asked):")
+            for item in history:
+                parts.append(
+                    f"[{item['when']} {item['direction']}]\n{item['transcript'][:800]}"
+                )
+        return "\n".join(parts)
+
+    async def _remember_ended_call(self, sip_call_id: str, transcript: str) -> None:
+        if sip_call_id in self._remembered_calls:
+            return
+        self._remembered_calls.add(sip_call_id)
+        text = (transcript or "").strip()
+        if not text or not await self._memory_enabled() or self.memory is None:
+            return
+        db_id = self._call_map.get(sip_call_id)
+        agent_id: int | None = None
+        remote_number = ""
+        agent_name = ""
+        async with SessionLocal() as db:
+            row = await db.get(SipCall, db_id) if db_id else None
+            if row is None:
+                return
+            agent_id = row.agent_id
+            remote_number = row.remote_number or ""
+            if agent_id is not None:
+                agent = await db.get(Agent, agent_id)
+                agent_name = agent.name if agent else ""
+        user_id = sip_memory_user_id(remote_number)
+        if user_id == "unknown":
+            return
+        try:
+            await self.memory.add(
+                f"Phone call with {remote_number}\n{text[:4000]}",
+                user_id=user_id,
+                agent_id=str(agent_id) if agent_id is not None else None,
+                metadata={
+                    "kind": "sip_call",
+                    "channel": "sip",
+                    "remote_number": remote_number,
+                    "sip_call_id": sip_call_id,
+                    "agent_name": agent_name,
+                },
+            )
+            logger.info("SIP memory stored for %s agent=%s", user_id, agent_id)
+        except Exception:
+            logger.exception("SIP memory add failed for %s", sip_call_id[:24])
+
     async def _create_db_call(
         self,
         *,
@@ -333,7 +499,7 @@ class SipGateway:
 
         # Prepare Realtime first so media callbacks are ready when RTP starts.
         # Temporary call id until dial returns the real SIP Call-ID.
-        bootstrap = await self._prepare_realtime(agent)
+        bootstrap = await self._prepare_realtime(agent, remote_number=number)
         session = bootstrap["session"]
         try:
             call = await ua.dial(
@@ -345,6 +511,9 @@ class SipGateway:
             await session.close()
             raise
 
+        sip_ref = bootstrap["sip_ref"]
+        sip_ref.clear()
+        sip_ref.append(call.call_id)
         self._realtime[call.call_id] = session
         # MtzVersion pattern: learn symmetric RTP before speaking.
         await ua.wait_first_rtp(call)
@@ -379,10 +548,15 @@ class SipGateway:
             "sip_account_id": account.id,
         }
 
-    async def _prepare_realtime(self, agent: Agent) -> dict[str, Any]:
-        session = await self._build_realtime_session(agent, sip_call_id_ref=[])
+    async def _prepare_realtime(self, agent: Agent, *, remote_number: str = "") -> dict[str, Any]:
+        sip_ref: list[str] = []
+        session = await self._build_realtime_session(
+            agent,
+            sip_ref,
+            remote_number=remote_number,
+        )
         await session.connect()
-        return {"session": session}
+        return {"session": session, "sip_ref": sip_ref}
 
     async def _build_realtime_session(
         self,
@@ -390,6 +564,7 @@ class SipGateway:
         sip_call_id_ref: list[str],
         *,
         inbound: bool = False,
+        remote_number: str = "",
     ) -> RealtimeSession:
         if agent.llm_profile_id is None:
             raise RuntimeError("Agent has no LLM profile for Realtime")
@@ -418,6 +593,26 @@ class SipGateway:
                 f"{instructions}\n\n{INBOUND_GREETING_INSTRUCTION}"
                 + (f"\nФормулировка приветствия: {extra}" if extra else "")
             )
+        memory_on = await self._memory_enabled()
+        extra_tools = [CALL_HISTORY_TOOL]
+        if memory_on:
+            extra_tools = [MEMORY_SEARCH_TOOL, MEMORY_ADD_TOOL, CALL_HISTORY_TOOL]
+        exclude_id = sip_call_id_ref[0] if sip_call_id_ref else None
+        if remote_number:
+            try:
+                context_block = await self._voice_context_block(
+                    agent,
+                    remote_number,
+                    exclude_sip_call_id=exclude_id,
+                )
+                instructions = f"{instructions}\n\n{context_block}"
+            except Exception:
+                logger.exception("SIP voice memory context failed")
+                instructions = f"{instructions}\n\n{MEMORY_VOICE_INSTRUCTION}"
+        else:
+            instructions = f"{instructions}\n\n{MEMORY_VOICE_INSTRUCTION}"
+        agent_id = str(agent.id)
+        agent_name = agent.name
 
         async def on_hangup(reason: str) -> None:
             sip_call_id = sip_call_id_ref[0] if sip_call_id_ref else None
@@ -465,6 +660,63 @@ class SipGateway:
                 },
             )
 
+        async def on_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+            tool = (name or "").strip().lower()
+            number = remote_number
+            if not number:
+                sip_call_id = sip_call_id_ref[0] if sip_call_id_ref else ""
+                for ua in self._agents.values():
+                    call = ua.calls.get(sip_call_id)
+                    if call is not None:
+                        number = call.remote_number
+                        break
+            scope_user = sip_memory_user_id(number)
+            if tool == "memory_search":
+                if not memory_on or self.memory is None:
+                    return {"memories": [], "note": "memory disabled"}
+                query = str(args.get("query") or number or "").strip()
+                found = await self.memory.search(
+                    query,
+                    user_id=scope_user if scope_user != "unknown" else None,
+                    agent_id=agent_id,
+                    limit=8,
+                )
+                texts = [text for item in found if (text := _compact_memory_text(item)[:400])]
+                logger.info("SIP memory_search hits=%s query=%s", len(texts), query[:80])
+                return {"memories": texts} if texts else {"memories": [], "note": "nothing found"}
+            if tool == "memory_add":
+                if not memory_on or self.memory is None:
+                    return {"ok": False, "error": "memory disabled"}
+                fact = str(args.get("text") or "").strip()
+                if not fact:
+                    return {"ok": False, "error": "empty text"}
+                await self.memory.add(
+                    fact,
+                    user_id=scope_user,
+                    agent_id=agent_id,
+                    metadata={
+                        "kind": "sip_fact",
+                        "channel": "sip",
+                        "remote_number": number,
+                        "agent_name": agent_name,
+                    },
+                )
+                return {"ok": True}
+            if tool == "call_history":
+                try:
+                    limit = int(args.get("limit") or 3)
+                except (TypeError, ValueError):
+                    limit = 3
+                calls = await self._load_call_history(
+                    agent_id=agent.id,
+                    remote_number=number,
+                    limit=limit,
+                    exclude_sip_call_id=sip_call_id_ref[0] if sip_call_id_ref else None,
+                )
+                logger.info("SIP call_history hits=%s number=%s", len(calls), number)
+                return {"calls": calls} if calls else {"calls": [], "note": "no previous calls"}
+            return {"error": f"unknown tool {name}"}
+
         session = RealtimeSession(
             api_key=api_key,
             base_url=base_url,
@@ -474,6 +726,8 @@ class SipGateway:
             http_proxy=http_proxy,
             on_transcript=on_transcript,
             on_hangup=on_hangup,
+            on_tool=on_tool,
+            extra_tools=extra_tools,
         )
         return session
 
@@ -491,10 +745,20 @@ class SipGateway:
                 session = await pending
             except Exception as prefetch_exc:
                 logger.warning("Realtime prefetch failed (%s) — reconnecting", prefetch_exc)
-                session = await self._build_realtime_session(agent, sip_ref, inbound=inbound)
+                session = await self._build_realtime_session(
+                    agent,
+                    sip_ref,
+                    inbound=inbound,
+                    remote_number=call.remote_number,
+                )
                 await session.connect()
         else:
-            session = await self._build_realtime_session(agent, sip_ref, inbound=inbound)
+            session = await self._build_realtime_session(
+                agent,
+                sip_ref,
+                inbound=inbound,
+                remote_number=call.remote_number,
+            )
             await session.connect()
         self._realtime[call.call_id] = session
         # Mic path immediately; enable silence TX (NAT), wait briefly for peer, then greet.
@@ -535,7 +799,12 @@ class SipGateway:
             return
         await ua.wait_first_rtp(call)
 
-    async def _prefetch_realtime(self, account_id: int, sip_call_id: str) -> None:
+    async def _prefetch_realtime(
+        self,
+        account_id: int,
+        sip_call_id: str,
+        remote_number: str = "",
+    ) -> None:
         if sip_call_id in self._pending_realtime or sip_call_id in self._realtime:
             return
         agent = await self._resolve_agent(account_id)
@@ -543,7 +812,12 @@ class SipGateway:
             return
 
         async def _build() -> RealtimeSession:
-            session = await self._build_realtime_session(agent, [sip_call_id], inbound=True)
+            session = await self._build_realtime_session(
+                agent,
+                [sip_call_id],
+                inbound=True,
+                remote_number=remote_number,
+            )
             await session.connect()
             return session
 
@@ -641,7 +915,11 @@ class SipGateway:
                 )
             fields = {"status": "ringing"}
             if str(payload.get("direction") or "inbound") == "inbound":
-                await self._prefetch_realtime(account_id, sip_call_id)
+                await self._prefetch_realtime(
+                    account_id,
+                    sip_call_id,
+                    str(payload.get("remote_number") or ""),
+                )
         elif status == "failed":
             await self._cancel_prefetch(sip_call_id)
             fields = {"status": "failed", "ended_at": utcnow(), "hangup_cause": str(payload.get("code") or "failed")}
@@ -673,6 +951,11 @@ class SipGateway:
             ua = self._agents.get(account_id)
             if ua is not None and not ua.registered:
                 asyncio.create_task(self._refresh_register(account_id), name=f"sip-refresh-{account_id}")
+            if transcript.strip():
+                asyncio.create_task(
+                    self._remember_ended_call(sip_call_id, transcript),
+                    name=f"sip-mem-{sip_call_id[:12]}",
+                )
         if fields:
             await self._update_db_call(sip_call_id, **fields)
         await self.events.publish(
@@ -708,14 +991,20 @@ class SipGateway:
                 break
         session = self._realtime.pop(sip_call_id, None)
         if session:
+            transcript = session.transcript_text()
             await self._update_db_call(
                 sip_call_id,
                 status="ended",
                 ended_at=utcnow(),
                 hangup_cause="local_hangup",
-                transcript=session.transcript_text(),
+                transcript=transcript,
             )
             await session.close()
+            if transcript.strip():
+                asyncio.create_task(
+                    self._remember_ended_call(sip_call_id, transcript),
+                    name=f"sip-mem-{sip_call_id[:12]}",
+                )
 
     async def status(self, account_id: int | None = None) -> dict[str, Any]:
         if account_id is not None:
