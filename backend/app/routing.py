@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .conversation import as_utc
 from .db import Agent, MessageLog, RuntimeSettings, TelegramAccount
+from .employee import CONSULT_CMD_RE
 from .events import EventHub
 from .runtime import AgentRuntime, NO_TELEGRAM_REPLY
 from .telegram import TelegramGateway
@@ -117,6 +118,46 @@ class TelegramEventRouter:
                 return
             is_admin = bool(payload.get("is_admin"))
             is_admin_command = text.lower().startswith(("/admin", "/system"))
+            consult_match = CONSULT_CMD_RE.match(text) if is_admin else None
+            if consult_match:
+                action = consult_match.group(1).lower()
+                consult_id = int(consult_match.group(2))
+                answer_body = (consult_match.group(3) or "").strip()
+                status = {
+                    "answer": "answered",
+                    "approve": "approved",
+                    "reject": "rejected",
+                }[action]
+                try:
+                    item = await self.runtime.employee.resolve_consultation(
+                        db,
+                        consult_id,
+                        status=status,
+                        answer_text=answer_body,
+                        answered_by=str(payload.get("sender_id") or ""),
+                        schedule_tick=True,
+                    )
+                    confirm = (
+                        f"Консультация #{item.id}: {status}."
+                        + (f" Ответ сохранён." if answer_body else "")
+                    )
+                except KeyError:
+                    confirm = f"Консультация #{consult_id} не найдена."
+                except Exception as exc:
+                    confirm = f"Не удалось обработать консультацию #{consult_id}: {exc}"
+                entity = payload.get("chat_id") or payload.get("sender_id")
+                if entity is not None:
+                    try:
+                        await self.telegram.send_message(
+                            phone,
+                            entity,
+                            confirm,
+                            reply_to=payload.get("message_id"),
+                            humanize=False,
+                        )
+                    except Exception:
+                        logger.exception("consult reply failed")
+                return
             if is_admin_command and not is_admin:
                 db.add(MessageLog(
                     agent_id=agent.id,

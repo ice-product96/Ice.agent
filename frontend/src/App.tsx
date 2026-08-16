@@ -1,24 +1,25 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import {
-  Activity, Bot, BrainCircuit, CalendarClock, CheckCircle2, ChevronRight, CircleAlert,
+  Activity, Bot, BrainCircuit, Briefcase, CalendarClock, CheckCircle2, ChevronRight, CircleAlert,
   Clock3, Database, FileText, Globe2, KeyRound, LayoutDashboard, Link2, LoaderCircle, LogOut, Menu,
-  MessageCircle, MessagesSquare, Moon, Phone, PhoneCall, PhoneOff, Plus, RefreshCw, Search, ServerCog, Settings, ShieldCheck,
+  MessageCircle, MessagesSquare, Moon, Phone, PhoneCall, PhoneOff, Play, Plus, RefreshCw, Search, ServerCog, Settings, ShieldCheck,
   Sparkles, Trash2, Users, Wifi, WifiOff, X, Zap,
 } from 'lucide-react'
 import { api, openLiveSocket } from './api'
 import { agentModelPresets, profileModelPresets } from './llmModels'
 import type {
-  AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
+  AdminSettings, Agent, AgentTask, Consultation, CronJob, Dashboard, EmployeeState, LogEntry, McpServer,
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, RuntimeSettings,
   SipAccount, SipCall, Status, TelegramAccount,
 } from './types'
 
-type Page = 'dashboard' | 'agents' | 'connections' | 'runtime' | 'telegram' | 'sip' | 'calls' | 'conversations' | 'memory' | 'mcp' | 'cron' | 'settings' | 'logs' | 'tasks'
+type Page = 'dashboard' | 'agents' | 'connections' | 'runtime' | 'telegram' | 'sip' | 'calls' | 'conversations' | 'employee' | 'memory' | 'mcp' | 'cron' | 'settings' | 'logs' | 'tasks'
 type Icon = typeof LayoutDashboard
 
 const nav: { id: Page; label: string; icon: Icon; group?: string }[] = [
   { id: 'dashboard', label: 'Обзор', icon: LayoutDashboard, group: 'Рабочая область' },
   { id: 'agents', label: 'Агенты', icon: Bot },
+  { id: 'employee', label: 'Сотрудник', icon: Briefcase },
   { id: 'connections', label: 'Подключения', icon: KeyRound },
   { id: 'telegram', label: 'Telegram', icon: MessageCircle },
   { id: 'sip', label: 'SIP', icon: Phone },
@@ -36,6 +37,7 @@ const nav: { id: Page; label: string; icon: Icon; group?: string }[] = [
 const title: Record<Page, [string, string]> = {
   dashboard: ['Центр управления', 'Статус рабочей области Ice.agent в реальном времени'],
   agents: ['Агенты', 'Настройка интеллекта, подключений и возможностей'],
+  employee: ['Сотрудник', 'Автономия, планы, потребности и консультации с руководителем'],
   connections: ['Подключения и провайдеры', 'Управление учётными данными LLM и эндпоинтами моделей'],
   telegram: ['Аккаунты Telegram', 'Управление подключёнными пользовательскими и бот-сессиями'],
   sip: ['SIP-аккаунты', 'Регистрация в АТС и привязка к агентам для голосовых звонков'],
@@ -70,7 +72,7 @@ function serviceDisplayName(name: string) {
 function toolDisplayName(tool: string) {
   const map: Record<string, string> = {
     web_search: 'веб-поиск', memory: 'память', code_execution: 'выполнение кода',
-    telegram: 'Telegram', sip: 'SIP', filesystem: 'файловая система', mcp: 'MCP',
+    telegram: 'Telegram', sip: 'SIP', filesystem: 'файловая система', mcp: 'MCP', employee: 'сотрудник',
   }
   return map[tool] || tool.replace('_', ' ')
 }
@@ -243,8 +245,11 @@ function DashboardScreen({ go }: { go: (p: Page) => void }) {
   const memoryItems = d.memory_items ?? 0
   const configuration = healthItems(d)
   const conversationCount = d.counts?.conversations ?? d.counts?.active_conversations ?? d.conversations_count ?? d.active_conversations_count
+  const openConsults = d.counts?.open_consultations ?? d.open_consultations_count ?? 0
+  const autonomous = d.counts?.autonomous_agents ?? d.autonomous_agents_count ?? 0
   const stats = [
     ['Активные агенты', agents.online, `${agents.total} настроено`, Bot, 'violet'],
+    ['Сотрудники', autonomous, `${openConsults} консультаций`, Briefcase, 'amber'],
     ['Telegram', telegram.connected, `${telegram.total} аккаунтов`, MessageCircle, 'blue'],
     ['SIP', sip.registered, `${sip.total} аккаунтов · ${sip.active_calls || 0} звонков`, Phone, 'cyan'],
     ['Выполняемые задачи', tasks.running, `${tasks.queued} в очереди`, Zap, 'amber'],
@@ -344,7 +349,7 @@ function AgentForm({ value, agents, profiles, telegram, sip, onClose, onSave }: 
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [clearing, setClearing] = useState(false)
-  const toolOptions = ['web_search', 'memory', 'code_execution', 'telegram', 'sip', 'filesystem', 'mcp']
+  const toolOptions = ['web_search', 'memory', 'code_execution', 'telegram', 'sip', 'filesystem', 'mcp', 'employee']
   const permissionOptions = [
     ['telegram_delete_dialog', 'Удалять диалоги Telegram'],
     ['telegram_delete_messages', 'Удалять сообщения Telegram'],
@@ -886,6 +891,174 @@ function ConversationsScreen() {
   </>
 }
 
+function EmployeeScreen() {
+  const agents = useLoad(api.agents.list, [])
+  const overview = useLoad(api.employees.list, [])
+  const consults = useLoad(() => api.consultations.list(undefined, 'open'), [])
+  const [agentId, setAgentId] = useState('')
+  const [state, setState] = useState<EmployeeState | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState('')
+  const [answerDrafts, setAnswerDrafts] = useState<Record<string, string>>({})
+  const [sections, setSections] = useState<Record<string, string>>({})
+  const [mission, setMission] = useState('')
+  const [roleTitle, setRoleTitle] = useState('')
+  const [heartbeat, setHeartbeat] = useState(15)
+  const [workStart, setWorkStart] = useState('09:00')
+  const [workEnd, setWorkEnd] = useState('18:00')
+  const [timezone, setTimezone] = useState('UTC')
+  const [budget, setBudget] = useState(48)
+  const [autonomy, setAutonomy] = useState(false)
+
+  useEffect(() => {
+    if (!agentId && agents.data?.length) setAgentId(String(agents.data[0].id))
+  }, [agents.data, agentId])
+
+  async function load(id: string) {
+    if (!id) return
+    setLoading(true); setError('')
+    try {
+      const data = await api.agents.employee(id)
+      setState(data)
+      setSections(data.prompt_sections || {})
+      setMission(data.profile.mission || '')
+      setRoleTitle(data.profile.role_title || '')
+      setHeartbeat(data.profile.heartbeat_minutes || 15)
+      setWorkStart(data.profile.workday_start || '09:00')
+      setWorkEnd(data.profile.workday_end || '18:00')
+      setTimezone(data.profile.timezone || 'UTC')
+      setBudget(data.profile.budget_ticks_per_day || 48)
+      setAutonomy(Boolean(data.profile.autonomy_enabled))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось загрузить сотрудника')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { if (agentId) void load(agentId) }, [agentId])
+
+  async function saveProfile() {
+    if (!agentId) return
+    setBusy('save'); setError('')
+    try {
+      const data = await api.agents.updateEmployee(agentId, {
+        autonomy_enabled: autonomy,
+        heartbeat_minutes: heartbeat,
+        workday_start: workStart,
+        workday_end: workEnd,
+        timezone,
+        budget_ticks_per_day: budget,
+        role_title: roleTitle,
+        mission,
+        prompt_sections: sections,
+      })
+      setState(data)
+      await overview.refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось сохранить')
+    } finally { setBusy('') }
+  }
+
+  const openConsults = consults.data?.items || []
+
+  return <>
+    <SectionHead
+      title="Автономный сотрудник"
+      text={`Автономных: ${overview.data?.autonomous_agents ?? 0} · на паузе: ${overview.data?.paused_agents ?? 0} · открытых консультаций: ${overview.data?.open_consultations ?? openConsults.length}`}
+      action={<div className="head-actions">
+        <select value={agentId} onChange={e => setAgentId(e.target.value)} aria-label="Агент">
+          <option value="">Выберите агента</option>
+          {(agents.data || []).map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+        </select>
+        <button className="secondary" disabled={!agentId || loading} onClick={() => void load(agentId)}><RefreshCw size={15}/>Обновить</button>
+      </div>}
+    />
+    {(error || agents.error || overview.error || consults.error) && <Alert message={error || agents.error || overview.error || consults.error}/>}
+    {loading && !state ? <Loading/> : !agentId ? <Empty icon={Briefcase} title="Выберите агента" text="Включите автономию и задайте миссию — сотрудник начнёт жить по heartbeat."/> : state && <>
+      <section className="panel">
+        <SectionHead title={`${state.agent_name}`} text={`Тиков сегодня: ${state.profile.ticks_used_today}/${state.profile.budget_ticks_per_day} · последний тик: ${state.profile.last_tick_at ? new Date(state.profile.last_tick_at).toLocaleString() : '—'}`}
+          action={<div className="head-actions">
+            <button className="secondary" disabled={!!busy} onClick={async () => {
+              setBusy('pause')
+              try {
+                await api.agents.pauseEmployee(agentId, !state.profile.paused)
+                await load(agentId); await overview.refresh()
+              } catch (err) { setError(err instanceof Error ? err.message : 'Пауза не удалась') }
+              finally { setBusy('') }
+            }}>{state.profile.paused ? 'Снять паузу' : 'Пауза'}</button>
+            <button className="primary" disabled={!!busy} onClick={async () => {
+              setBusy('tick')
+              try { await api.agents.tickEmployee(agentId); await load(agentId) }
+              catch (err) { setError(err instanceof Error ? err.message : 'Тик не удался') }
+              finally { setBusy('') }
+            }}>{busy === 'tick' ? <LoaderCircle className="spin" size={15}/> : <Play size={15}/>}Force tick</button>
+          </div>}
+        />
+        <div className="form-grid">
+          <div className="toggle-box"><Toggle label="Автономия включена" checked={autonomy} onChange={setAutonomy}/></div>
+          <Field label="Должность"><input value={roleTitle} onChange={e => setRoleTitle(e.target.value)} placeholder="Менеджер по продажам"/></Field>
+          <Field label="Heartbeat (мин)"><input type="number" min={1} max={120} value={heartbeat} onChange={e => setHeartbeat(Number(e.target.value) || 15)}/></Field>
+          <Field label="Бюджет тиков/день"><input type="number" min={1} max={500} value={budget} onChange={e => setBudget(Number(e.target.value) || 48)}/></Field>
+          <Field label="Начало дня"><input value={workStart} onChange={e => setWorkStart(e.target.value)} placeholder="09:00"/></Field>
+          <Field label="Конец дня"><input value={workEnd} onChange={e => setWorkEnd(e.target.value)} placeholder="18:00"/></Field>
+          <Field label="Часовой пояс"><input value={timezone} onChange={e => setTimezone(e.target.value)} placeholder="Asia/Yekaterinburg"/></Field>
+          <Field label="Миссия" wide><textarea rows={3} value={mission} onChange={e => setMission(e.target.value)} placeholder="Что сотрудник должен достигать"/></Field>
+        </div>
+        <div className="form-grid" style={{ marginTop: 12 }}>
+          {(['identity', 'role', 'rules', 'skills', 'tone', 'self_notes'] as const).map(key => (
+            <Field key={key} label={`Промпт · ${key}`} wide hint={key === 'self_notes' || key === 'skills' || key === 'tone' ? 'Сотрудник может править сам' : 'Только руководитель'}>
+              <textarea rows={key === 'identity' || key === 'rules' ? 5 : 3} value={sections[key] || ''} onChange={e => setSections(s => ({ ...s, [key]: e.target.value }))}/>
+            </Field>
+          ))}
+        </div>
+        <div className="modal-actions"><button className="primary" disabled={!!busy} onClick={() => void saveProfile()}>{busy === 'save' ? <LoaderCircle className="spin" size={15}/> : null}Сохранить сотрудника</button></div>
+      </section>
+
+      <section className="panel">
+        <SectionHead title={`Планы (${state.plans.length})`} text="Час / день / неделя / месяц"/>
+        {state.plans.length === 0 ? <Empty icon={CalendarClock} title="Планов пока нет" text="Появятся на первом тике или когда сотрудник создаст их сам."/> :
+          <div className="card-grid">{state.plans.map(plan => <article className="entity-card" key={plan.id}>
+            <div className="entity-top"><span className="chip">{plan.horizon}</span><StatusDot status={plan.status === 'active' ? 'online' : plan.status === 'done' ? 'paused' : 'pending'}/></div>
+            <h3>{plan.title || `План #${plan.id}`}</h3>
+            <p style={{ whiteSpace: 'pre-wrap' }}>{(plan.body?.steps || []).map(s => `${s.status === 'done' ? '✓' : '·'} ${s.title}`).join('\n') || 'Шагов нет'}</p>
+          </article>)}</div>}
+      </section>
+
+      <section className="panel">
+        <SectionHead title={`Потребности (${state.needs.length})`}/>
+        {state.needs.length === 0 ? <p className="transcript-empty">Открытых потребностей нет.</p> :
+          <div className="list-panel">{state.needs.map(need => <div className="server-row" key={need.id}>
+            <span className="chip">{need.kind}</span>
+            <div className="grow"><strong>{need.title}</strong><small>{need.status} · p={need.priority} · {need.detail.slice(0, 160)}</small></div>
+          </div>)}</div>}
+      </section>
+
+      <section className="panel">
+        <SectionHead title={`Консультации (${openConsults.length} открытых)`} text="Ответы также в Telegram: /answer id · /approve id · /reject id"/>
+        {openConsults.length === 0 ? <Empty icon={MessageCircle} title="Очередь пуста" text="Когда сотруднику что-то нужно — запрос появится здесь и у админов в Telegram."/> :
+          <div className="list-panel">{openConsults.map((item: Consultation) => <div className="server-row" key={item.id} style={{ alignItems: 'flex-start', paddingTop: 12, paddingBottom: 12 }}>
+            <span className="chip">{item.requires_approval ? 'approval' : 'consult'}</span>
+            <div className="grow">
+              <strong>#{item.id} · агент {item.agent_id}</strong>
+              <small>{item.question}</small>
+              {item.context && <small>{item.context.slice(0, 240)}</small>}
+              <textarea rows={2} style={{ marginTop: 8, width: '100%' }} placeholder="Ответ руководителя…" value={answerDrafts[item.id] || ''} onChange={e => setAnswerDrafts(d => ({ ...d, [item.id]: e.target.value }))}/>
+              <div className="head-actions" style={{ marginTop: 8 }}>
+                <button className="secondary compact" onClick={async () => { await api.consultations.resolve(item.id, { status: 'answered', answer_text: answerDrafts[item.id] || '' }); await consults.refresh(); await load(agentId) }}>Ответить</button>
+                {item.requires_approval && <>
+                  <button className="primary compact" onClick={async () => { await api.consultations.resolve(item.id, { status: 'approved', answer_text: answerDrafts[item.id] || 'approved' }); await consults.refresh(); await load(agentId) }}>Одобрить</button>
+                  <button className="danger compact" onClick={async () => { await api.consultations.resolve(item.id, { status: 'rejected', answer_text: answerDrafts[item.id] || 'rejected' }); await consults.refresh(); await load(agentId) }}>Отклонить</button>
+                </>}
+              </div>
+            </div>
+          </div>)}</div>}
+      </section>
+    </>}
+  </>
+}
+
 function MemoryScreen() {
   const [search, setSearch] = useState(''); const [query, setQuery] = useState('')
   const loaded = useLoad(() => api.memory.list(query), [query])
@@ -1162,7 +1335,7 @@ export default function App() {
   const screen = {
     dashboard: <DashboardScreen go={setPage}/>, agents: <AgentsScreen/>, telegram: <TelegramScreen/>,
     sip: <SipScreen/>, calls: <CallsScreen/>,
-    conversations: <ConversationsScreen/>, connections: <ConnectionsScreen/>, runtime: <RuntimeScreen/>, memory: <MemoryScreen/>, mcp: <McpScreen/>, cron: <CronScreen/>, settings: <SettingsScreen/>,
+    conversations: <ConversationsScreen/>, employee: <EmployeeScreen/>, connections: <ConnectionsScreen/>, runtime: <RuntimeScreen/>, memory: <MemoryScreen/>, mcp: <McpScreen/>, cron: <CronScreen/>, settings: <SettingsScreen/>,
     logs: <LiveScreen mode="logs"/>, tasks: <LiveScreen mode="tasks"/>,
   }[page] ?? <DashboardScreen go={setPage}/>
   return <Shell page={page} setPage={setPage} logout={() => { localStorage.removeItem('ice_token'); setAuthenticated(false) }}>{screen}</Shell>

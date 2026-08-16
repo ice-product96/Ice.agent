@@ -11,8 +11,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import Settings, get_settings
 from .db import (
     AdminSettings, Agent, AgentLink, AgentTask, CronJob, LlmProfile, McpServer,
-    ConversationState, MessageLog, RuntimeSettings, SipAccount, SipCall,
+    Consultation, ConversationState, EmployeeNeed, EmployeePlan, EmployeeProfile,
+    MessageLog, PromptSection, RuntimeSettings, SipAccount, SipCall,
     TelegramAccount, get_db,
+)
+from .employee import (
+    PROMPT_SECTION_KEYS,
+    consultation_json,
+    ensure_prompt_sections,
+    get_or_create_profile,
+    need_json,
+    plan_json,
+    profile_json,
+    sync_heartbeat_job,
 )
 from .events import events
 from .integrations import exception_text
@@ -192,6 +203,20 @@ async def dashboard(
         "tasks": await count(AgentTask),
         "logs": await count(MessageLog),
         "active_conversations": await count(ConversationState),
+        "open_consultations": int(
+            await db.scalar(
+                select(func.count()).select_from(Consultation).where(Consultation.status == "open")
+            )
+            or 0
+        ),
+        "autonomous_agents": int(
+            await db.scalar(
+                select(func.count()).select_from(EmployeeProfile).where(
+                    EmployeeProfile.autonomy_enabled.is_(True)
+                )
+            )
+            or 0
+        ),
     }
     profiles = {
         item.id: item
@@ -560,6 +585,212 @@ async def delete_agent(agent_id: str, db: AsyncSession = Depends(get_db)) -> Res
     await db.delete(agent)
     await db.commit()
     return Response(status_code=204)
+
+
+class EmployeeProfileBody(BaseModel):
+    autonomy_enabled: bool | None = None
+    paused: bool | None = None
+    heartbeat_minutes: int | None = Field(default=None, ge=1, le=120)
+    workday_start: str | None = None
+    workday_end: str | None = None
+    timezone: str | None = None
+    budget_ticks_per_day: int | None = Field(default=None, ge=1, le=500)
+    role_title: str | None = None
+    mission: str | None = None
+    prompt_sections: dict[str, str] | None = None
+
+
+class ConsultationResolveBody(BaseModel):
+    status: str = "answered"  # answered|approved|rejected
+    answer_text: str = ""
+
+
+@router.get("/agents/{agent_id}/employee", dependencies=auth)
+async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    agent = await one(db, Agent, agent_id)
+    profile = await get_or_create_profile(db, agent.id)
+    sections = await ensure_prompt_sections(db, agent)
+    plans = (
+        await db.scalars(
+            select(EmployeePlan)
+            .where(EmployeePlan.agent_id == agent.id)
+            .order_by(EmployeePlan.id.desc())
+            .limit(40)
+        )
+    ).all()
+    needs = (
+        await db.scalars(
+            select(EmployeeNeed)
+            .where(EmployeeNeed.agent_id == agent.id)
+            .order_by(EmployeeNeed.priority.asc(), EmployeeNeed.id.desc())
+            .limit(40)
+        )
+    ).all()
+    consults = (
+        await db.scalars(
+            select(Consultation)
+            .where(Consultation.agent_id == agent.id)
+            .order_by(Consultation.id.desc())
+            .limit(40)
+        )
+    ).all()
+    return {
+        "agent_id": agent.id,
+        "agent_name": agent.name,
+        "profile": profile_json(profile),
+        "prompt_sections": sections,
+        "plans": [plan_json(p) for p in plans],
+        "needs": [need_json(n) for n in needs],
+        "consultations": [consultation_json(c) for c in consults],
+    }
+
+
+@router.patch("/agents/{agent_id}/employee", dependencies=auth)
+async def patch_employee(
+    agent_id: str,
+    payload: EmployeeProfileBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    agent = await one(db, Agent, agent_id)
+    profile = await get_or_create_profile(db, agent.id)
+    data = payload.model_dump(exclude_unset=True)
+    sections_payload = data.pop("prompt_sections", None)
+    for key, value in data.items():
+        if value is not None:
+            setattr(profile, key, value)
+    if sections_payload:
+        await ensure_prompt_sections(db, agent)
+        for key, content in sections_payload.items():
+            if key not in PROMPT_SECTION_KEYS:
+                continue
+            row = await db.scalar(
+                select(PromptSection).where(
+                    PromptSection.agent_id == agent.id,
+                    PromptSection.key == key,
+                )
+            )
+            if row is None:
+                db.add(PromptSection(agent_id=agent.id, key=key, content=str(content or "")[:12000]))
+            else:
+                row.content = str(content or "")[:12000]
+            if key == "identity":
+                agent.prompt = str(content or "")
+    await db.commit()
+    await db.refresh(profile)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    await sync_heartbeat_job(db, scheduler, profile)
+    return await get_employee(str(agent.id), request, db)
+
+
+@router.post("/agents/{agent_id}/employee/pause", dependencies=auth)
+async def pause_employee(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    paused: bool = Query(True),
+) -> dict[str, Any]:
+    agent = await one(db, Agent, agent_id)
+    profile = await get_or_create_profile(db, agent.id)
+    profile.paused = bool(paused)
+    await db.commit()
+    scheduler = getattr(request.app.state, "scheduler", None)
+    await sync_heartbeat_job(db, scheduler, profile)
+    return {"ok": True, "paused": profile.paused, "profile": profile_json(profile)}
+
+
+@router.post("/agents/{agent_id}/employee/tick", dependencies=auth)
+async def force_employee_tick(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    agent = await one(db, Agent, agent_id)
+    runtime = getattr(request.app.state, "runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="Runtime unavailable")
+    return await runtime.tick(db, agent, force=True, reason="manual")
+
+
+@router.get("/agents/{agent_id}/employee/plans", dependencies=auth)
+async def employee_plans(agent_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    agent = await one(db, Agent, agent_id)
+    plans = (
+        await db.scalars(
+            select(EmployeePlan)
+            .where(EmployeePlan.agent_id == agent.id)
+            .order_by(EmployeePlan.id.desc())
+            .limit(100)
+        )
+    ).all()
+    return {"items": [plan_json(p) for p in plans]}
+
+
+@router.get("/consultations", dependencies=auth)
+async def list_consultations(
+    db: AsyncSession = Depends(get_db),
+    agent_id: int | None = None,
+    status: str = "open",
+    limit: int = Query(50, ge=1, le=200),
+) -> dict[str, Any]:
+    filters = []
+    if agent_id is not None:
+        filters.append(Consultation.agent_id == agent_id)
+    if status and status != "all":
+        filters.append(Consultation.status == status)
+    items = (
+        await db.scalars(
+            select(Consultation)
+            .where(*filters)
+            .order_by(Consultation.id.desc())
+            .limit(limit)
+        )
+    ).all()
+    return {"items": [consultation_json(item) for item in items], "total": len(items)}
+
+
+@router.post("/consultations/{consultation_id}/resolve", dependencies=auth)
+async def resolve_consultation_api(
+    consultation_id: int,
+    payload: ConsultationResolveBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    runtime = getattr(request.app.state, "runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="Runtime unavailable")
+    status = payload.status if payload.status in {"answered", "approved", "rejected"} else "answered"
+    try:
+        item = await runtime.employee.resolve_consultation(
+            db,
+            consultation_id,
+            status=status,
+            answer_text=payload.answer_text,
+            answered_by="web",
+            schedule_tick=True,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Consultation not found") from exc
+    return {"ok": True, "consultation": consultation_json(item)}
+
+
+@router.get("/employees", dependencies=auth)
+async def list_employees(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    profiles = (await db.scalars(select(EmployeeProfile).order_by(EmployeeProfile.agent_id))).all()
+    open_consults = int(
+        await db.scalar(
+            select(func.count()).select_from(Consultation).where(Consultation.status == "open")
+        )
+        or 0
+    )
+    paused = sum(1 for p in profiles if p.paused and p.autonomy_enabled)
+    autonomous = sum(1 for p in profiles if p.autonomy_enabled)
+    return {
+        "items": [profile_json(p) for p in profiles],
+        "open_consultations": open_consults,
+        "paused_agents": paused,
+        "autonomous_agents": autonomous,
+    }
 
 
 def llm_profile_json(profile: LlmProfile) -> dict[str, Any]:

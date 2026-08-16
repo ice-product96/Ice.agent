@@ -273,6 +273,75 @@ class AgentTask(TimestampMixin, Base):
     error: Mapped[str | None] = mapped_column(Text)
 
 
+class EmployeeProfile(TimestampMixin, Base):
+    __tablename__ = "employee_profiles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), unique=True, index=True)
+    autonomy_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    heartbeat_minutes: Mapped[int] = mapped_column(Integer, default=15)
+    workday_start: Mapped[str] = mapped_column(String(8), default="09:00")
+    workday_end: Mapped[str] = mapped_column(String(8), default="18:00")
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
+    budget_ticks_per_day: Mapped[int] = mapped_column(Integer, default=48)
+    ticks_used_today: Mapped[int] = mapped_column(Integer, default=0)
+    ticks_day: Mapped[str | None] = mapped_column(String(16))  # YYYY-MM-DD in employee tz
+    last_tick_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_digest_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    role_title: Mapped[str] = mapped_column(String(200), default="")
+    mission: Mapped[str] = mapped_column(Text, default="")
+
+
+class PromptSection(TimestampMixin, Base):
+    __tablename__ = "prompt_sections"
+    __table_args__ = (UniqueConstraint("agent_id", "key", name="uq_prompt_sections_agent_key"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    key: Mapped[str] = mapped_column(String(64))  # identity|role|rules|skills|tone|self_notes
+    content: Mapped[str] = mapped_column(Text, default="")
+
+
+class EmployeePlan(TimestampMixin, Base):
+    __tablename__ = "employee_plans"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    horizon: Mapped[str] = mapped_column(String(16), index=True)  # hour|day|week|month
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    title: Mapped[str] = mapped_column(String(300), default="")
+    body: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # {steps: [...]}
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True)
+
+
+class Consultation(TimestampMixin, Base):
+    __tablename__ = "consultations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    question: Mapped[str] = mapped_column(Text, default="")
+    context: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(24), default="open", index=True)
+    requires_approval: Mapped[bool] = mapped_column(Boolean, default=False)
+    action_name: Mapped[str | None] = mapped_column(String(120))  # dangerous tool to unlock
+    telegram_message_ids: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    answer_text: Mapped[str | None] = mapped_column(Text)
+    answered_by: Mapped[str | None] = mapped_column(String(64))
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class EmployeeNeed(TimestampMixin, Base):
+    __tablename__ = "employee_needs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(32), default="info")  # info|access|decision|resource|rest
+    title: Mapped[str] = mapped_column(String(300), default="")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    priority: Mapped[int] = mapped_column(Integer, default=5)
+    status: Mapped[str] = mapped_column(String(24), default="open", index=True)
+    consultation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("consultations.id", ondelete="SET NULL"), index=True
+    )
+
+
 settings = get_settings()
 engine = create_async_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)

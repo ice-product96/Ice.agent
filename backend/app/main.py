@@ -146,13 +146,27 @@ async def lifespan(app: FastAPI):
     async def run_scheduled(agent_id: int, payload: dict[str, Any]) -> None:
         async with SessionLocal() as db:
             agent = await db.get(Agent, agent_id)
-            if agent:
-                result = await runtime.run(db, agent, str(payload.get("message", "")), payload)
-                phone = payload.get("reply_phone")
-                chat_id = payload.get("reply_chat_id")
-                if phone and chat_id:
-                    entity = int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
-                    await telegram.send_message(str(phone), entity, result)
+            if not agent:
+                return
+            kind = str(payload.get("kind") or "")
+            if kind == "employee_tick" or payload.get("source") in {
+                "employee_heartbeat",
+                "consult_resolved",
+                "employee_tick",
+            }:
+                await runtime.tick(
+                    db,
+                    agent,
+                    force=bool(payload.get("force")),
+                    reason=str(payload.get("source") or kind or "heartbeat"),
+                )
+                return
+            result = await runtime.run(db, agent, str(payload.get("message", "")), payload)
+            phone = payload.get("reply_phone")
+            chat_id = payload.get("reply_chat_id")
+            if phone and chat_id:
+                entity = int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
+                await telegram.send_message(str(phone), entity, result)
 
     scheduler = CronManager(SessionLocal, run_scheduled)
     runtime.bind_scheduler(scheduler)

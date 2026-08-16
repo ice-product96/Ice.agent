@@ -1,6 +1,7 @@
 import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
-  Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
+  Conversation, ConversationDetail, Consultation, EmployeeProfile, EmployeeState,
+  LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
   RuntimeSettings, SipAccount, SipCall, TelegramAccount,
 } from './types'
 
@@ -78,6 +79,21 @@ export const api = {
     create: (data: Omit<Agent, 'id'>) => request<Agent>('/agents', { method: 'POST', ...body(data) }),
     update: (id: string, data: Partial<Agent>) => request<Agent>(`/agents/${id}`, { method: 'PATCH', ...body(data) }),
     remove: (id: string) => request<void>(`/agents/${id}`, { method: 'DELETE' }),
+    employee: (id: string) => request<EmployeeState>(`/agents/${id}/employee`),
+    updateEmployee: (id: string, data: Partial<EmployeeProfile> & { prompt_sections?: Record<string, string> }) =>
+      request<EmployeeState>(`/agents/${id}/employee`, { method: 'PATCH', ...body(data) }),
+    pauseEmployee: (id: string, paused = true) =>
+      request<{ ok: boolean; paused: boolean }>(`/agents/${id}/employee/pause?paused=${paused ? 'true' : 'false'}`, { method: 'POST' }),
+    tickEmployee: (id: string) => request<{ ok: boolean; skipped?: boolean; reason?: string; result?: string }>(`/agents/${id}/employee/tick`, { method: 'POST' }),
+  },
+  employees: {
+    list: () => request<{ items: EmployeeProfile[]; open_consultations: number; paused_agents: number; autonomous_agents: number }>('/employees'),
+  },
+  consultations: {
+    list: (agentId?: string, status = 'open') =>
+      request<{ items: Consultation[]; total: number }>(`/consultations${qs({ agent_id: agentId, status, limit: 100 })}`),
+    resolve: (id: string, data: { status: string; answer_text?: string }) =>
+      request<{ ok: boolean; consultation: Consultation }>(`/consultations/${id}/resolve`, { method: 'POST', ...body(data) }),
   },
   llmProfiles: {
     list: () => request<LlmProfile[]>('/llm-profiles'),

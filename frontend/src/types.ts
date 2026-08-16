@@ -270,6 +270,69 @@ export interface ConversationDetail extends Conversation {
   messages: ConversationMessage[]
 }
 
+export interface EmployeeProfile {
+  id: ID
+  agent_id: ID
+  autonomy_enabled: boolean
+  paused: boolean
+  heartbeat_minutes: number
+  workday_start: string
+  workday_end: string
+  timezone: string
+  budget_ticks_per_day: number
+  ticks_used_today: number
+  ticks_day?: string | null
+  last_tick_at?: string | null
+  last_digest_at?: string | null
+  role_title: string
+  mission: string
+}
+
+export interface EmployeePlan {
+  id: ID
+  agent_id: ID
+  horizon: 'hour' | 'day' | 'week' | 'month' | string
+  period_start?: string | null
+  period_end?: string | null
+  title: string
+  body: { steps?: Array<{ id?: string; title?: string; status?: string; result?: string }> }
+  status: string
+}
+
+export interface EmployeeNeed {
+  id: ID
+  agent_id: ID
+  kind: string
+  title: string
+  detail: string
+  priority: number
+  status: string
+  consultation_id?: ID | null
+}
+
+export interface Consultation {
+  id: ID
+  agent_id: ID
+  question: string
+  context: string
+  status: string
+  requires_approval: boolean
+  action_name?: string | null
+  answer_text?: string | null
+  answered_by?: string | null
+  answered_at?: string | null
+}
+
+export interface EmployeeState {
+  agent_id: ID
+  agent_name: string
+  profile: EmployeeProfile
+  prompt_sections: Record<string, string>
+  plans: EmployeePlan[]
+  needs: EmployeeNeed[]
+  consultations: Consultation[]
+}
+
 export interface Paginated<T> {
   items: T[]
   total: number

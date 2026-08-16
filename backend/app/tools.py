@@ -30,8 +30,36 @@ SIP_OPERATIONAL_PERMISSIONS = {
     "sip_status",
 }
 
+# Granted when autonomy/employee mode is enabled on the agent profile or tools include employee.
+EMPLOYEE_OPERATIONAL_PERMISSIONS = {
+    "plan_upsert",
+    "plan_get",
+    "plan_complete_step",
+    "need_upsert",
+    "need_satisfy",
+    "consult_manager",
+    "request_approval",
+    "self_configure",
+    "employee_status",
+    "schedule_self",
+    "schedule_self_list",
+    "schedule_self_cancel",
+}
 
-def resolve_tool_permissions(agent_config: dict[str, Any] | None) -> set[str]:
+# Dangerous tools that require a fresh manager approval while autonomy is on.
+APPROVAL_REQUIRED_TOOLS = {
+    "telegram_delete_messages",
+    "telegram_delete_dialog",
+    "telegram_leave_channel",
+    "sip_dial",
+}
+
+
+def resolve_tool_permissions(
+    agent_config: dict[str, Any] | None,
+    *,
+    employee_autonomy: bool = False,
+) -> set[str]:
     config = agent_config or {}
     permissions = {str(item) for item in (config.get("tool_permissions") or [])}
     tools = {str(item) for item in (config.get("tools") or [])}
@@ -39,6 +67,8 @@ def resolve_tool_permissions(agent_config: dict[str, Any] | None) -> set[str]:
         permissions |= TELEGRAM_OPERATIONAL_PERMISSIONS
     if "sip" in tools:
         permissions |= SIP_OPERATIONAL_PERMISSIONS
+    if employee_autonomy or "employee" in tools or "autonomy" in tools:
+        permissions |= EMPLOYEE_OPERATIONAL_PERMISSIONS
     return permissions
 
 
@@ -48,6 +78,7 @@ class ToolPolicy:
         "send_message", "send_file", "forward_message", "edit_message", "join_channel",
         "leave_channel", "reaction", "draft", "escalate", "ban", "kick",
         "change_permissions", "schedule_self", "sip_dial", "sip_hangup",
+        "request_approval", "self_configure",
     }
 
     def check(self, tool_name: str, arguments: dict[str, Any], allowed: set[str] | None = None) -> None:
@@ -112,6 +143,7 @@ class ToolRegistry:
         self.policy = policy or ToolPolicy()
         self.tools: dict[str, RegisteredTool] = {}
         self.audit: list[dict[str, Any]] = []
+        self.before_call: Callable[[str, dict[str, Any]], Any] | None = None
 
     def register(
         self,
@@ -136,6 +168,10 @@ class ToolRegistry:
         self.audit.append(record)
         try:
             self.policy.check(name, arguments, permissions)
+            if self.before_call is not None:
+                maybe = self.before_call(name, arguments)
+                if inspect.isawaitable(maybe):
+                    await maybe
             tool = self.tools.get(name)
             if tool is None:
                 raise KeyError(f"Unknown tool: {name}")
