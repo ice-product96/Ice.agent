@@ -231,6 +231,8 @@ export interface Dashboard {
   telegram_accounts_count?: number
   sip_accounts_count?: number
   mcp_servers_count?: number
+  open_consultations_count?: number
+  autonomous_agents_count?: number
   counts?: {
     conversations?: number
     active_conversations?: number
@@ -238,6 +240,8 @@ export interface Dashboard {
     telegram_accounts?: number
     sip_accounts?: number
     mcp_servers?: number
+    open_consultations?: number
+    autonomous_agents?: number
     [key: string]: number | undefined
   }
 }
