@@ -200,12 +200,12 @@ async def assemble_system_prompt(db: AsyncSession, agent: Agent) -> str:
     sections = await ensure_prompt_sections(db, agent)
     parts: list[str] = []
     labels = {
-        "identity": "Identity",
-        "role": "Role",
-        "rules": "Rules (manager-owned)",
-        "skills": "Skills",
-        "tone": "Tone",
-        "self_notes": "Self notes (employee-owned)",
+        "identity": "Личность",
+        "role": "Роль",
+        "rules": "Правила (задаёт руководитель)",
+        "skills": "Навыки",
+        "tone": "Тон общения",
+        "self_notes": "Заметки сотрудника",
     }
     for key in PROMPT_SECTION_KEYS:
         text = (sections.get(key) or "").strip()
@@ -272,39 +272,39 @@ def build_employee_context_block(
     consultations: list[Consultation],
 ) -> str:
     lines = [
-        "Employee state (internal — do not recite to customers):",
-        f"Role title: {profile.role_title or '(none)'}",
-        f"Mission: {profile.mission or '(none)'}",
-        f"Autonomy: enabled={profile.autonomy_enabled} paused={profile.paused}",
-        f"Workday: {profile.workday_start}-{profile.workday_end} {profile.timezone}",
-        f"Ticks today: {profile.ticks_used_today}/{profile.budget_ticks_per_day}",
+        "Состояние сотрудника (служебно — не зачитывать клиентам):",
+        f"Должность: {profile.role_title or '(не задана)'}",
+        f"Миссия: {profile.mission or '(не задана)'}",
+        f"Автономия: включена={profile.autonomy_enabled} пауза={profile.paused}",
+        f"Рабочий день: {profile.workday_start}-{profile.workday_end} {profile.timezone}",
+        f"Тиков сегодня: {profile.ticks_used_today}/{profile.budget_ticks_per_day}",
     ]
     if plans:
-        lines.append("Active plans:")
+        lines.append("Активные планы:")
         for plan in plans:
             steps = (plan.body or {}).get("steps") or []
             open_steps = [s for s in steps if isinstance(s, dict) and s.get("status") != "done"]
             lines.append(
                 f"- [{plan.horizon}] #{plan.id} {plan.title} "
-                f"({len(steps) - len(open_steps)}/{len(steps)} steps done)"
+                f"({len(steps) - len(open_steps)}/{len(steps)} шагов готово)"
             )
             for step in open_steps[:5]:
                 lines.append(f"    · {step.get('id')}: {step.get('title')} [{step.get('status', 'todo')}]")
     else:
-        lines.append("Active plans: (none — create hour/day/week/month as needed)")
+        lines.append("Активные планы: (нет — создайте hour/day/week/month по необходимости)")
     if needs:
-        lines.append("Open needs:")
+        lines.append("Открытые потребности:")
         for need in needs[:10]:
             lines.append(f"- #{need.id} [{need.kind}/{need.status} p={need.priority}] {need.title}")
     else:
-        lines.append("Open needs: (none)")
+        lines.append("Открытые потребности: (нет)")
     if consultations:
-        lines.append("Pending consultations with manager:")
+        lines.append("Ожидают ответа руководителя:")
         for item in consultations[:10]:
-            kind = "approval" if item.requires_approval else "question"
+            kind = "одобрение" if item.requires_approval else "вопрос"
             lines.append(f"- #{item.id} ({kind}) {item.question[:200]}")
     else:
-        lines.append("Pending consultations: (none)")
+        lines.append("Ожидают ответа руководителя: (нет)")
     return "\n".join(lines)
 
 

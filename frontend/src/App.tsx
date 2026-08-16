@@ -1007,8 +1007,15 @@ function EmployeeScreen() {
           <Field label="Миссия" wide><textarea rows={3} value={mission} onChange={e => setMission(e.target.value)} placeholder="Что сотрудник должен достигать"/></Field>
         </div>
         <div className="form-grid" style={{ marginTop: 12 }}>
-          {(['identity', 'role', 'rules', 'skills', 'tone', 'self_notes'] as const).map(key => (
-            <Field key={key} label={`Промпт · ${key}`} wide hint={key === 'self_notes' || key === 'skills' || key === 'tone' ? 'Сотрудник может править сам' : 'Только руководитель'}>
+          {([
+            ['identity', 'Личность', 'Только руководитель'],
+            ['role', 'Роль', 'Только руководитель'],
+            ['rules', 'Правила', 'Только руководитель'],
+            ['skills', 'Навыки', 'Сотрудник может править сам'],
+            ['tone', 'Тон общения', 'Сотрудник может править сам'],
+            ['self_notes', 'Заметки сотрудника', 'Сотрудник может править сам'],
+          ] as const).map(([key, label, hint]) => (
+            <Field key={key} label={label} wide hint={hint}>
               <textarea rows={key === 'identity' || key === 'rules' ? 5 : 3} value={sections[key] || ''} onChange={e => setSections(s => ({ ...s, [key]: e.target.value }))}/>
             </Field>
           ))}
