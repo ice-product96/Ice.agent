@@ -62,6 +62,7 @@ from .memory_scope import (
 )
 from .sip_dial import (
     SipDialError,
+    format_channel_context,
     sip_failure_admin_message,
     sip_failure_customer_message,
     validate_sip_dial_target,
@@ -425,7 +426,11 @@ class AgentRuntime:
                 )
         tools_enabled = set((agent.config or {}).get("tools") or [])
         if self.sip and agent.sip_account_id is not None and "sip" in tools_enabled:
-            async def sip_dial(number: str = "") -> dict[str, Any]:
+            async def sip_dial(
+                number: str = "",
+                purpose: str = "",
+                opening: str = "",
+            ) -> dict[str, Any]:
                 """Place an outbound phone call via the agent's SIP account and talk with OpenAI Realtime."""
                 from .db import SipAccount
 
@@ -440,13 +445,30 @@ class AgentRuntime:
                     sender = ctx.get("sender_id") or ctx.get("chat_id")
                     if sender is not None:
                         target = await self.telegram.get_user_phone(phone, sender) or ""
+                interlocutor = str(ctx.get("sender_username") or "").strip()
                 try:
                     normalized = validate_sip_dial_target(target, ctx)
-                    return await self.sip.dial(
+                    user_message = str(
+                        ctx.get("_user_message") or ctx.get("text") or ctx.get("message") or ""
+                    )
+                    channel_context = format_channel_context(
+                        ctx.get("telegram_history") if isinstance(ctx.get("telegram_history"), list) else [],
+                        user_message,
+                    )
+                    await self.sip.dial(
                         account=account,
                         agent=agent,
                         number=normalized,
+                        purpose=purpose,
+                        opening=opening,
+                        interlocutor=interlocutor,
+                        channel_context=channel_context,
+                        current_message=user_message,
                     )
+                    if ctx.get("source") == "telegram":
+                        ctx["_suppress_telegram_reply"] = True
+                        ctx["_suppress_telegram_reason"] = "Outbound SIP call connected"
+                    return {"ok": True, "telegram_reply": None}
                 except Exception as exc:
                     is_customer = (
                         ctx.get("source") == "telegram" and not ctx.get("is_admin")
@@ -495,11 +517,32 @@ class AgentRuntime:
                 sip_dial,
                 "sip_dial",
                 (
-                    "Dial a phone number through the agent's SIP account. "
-                    "Never pass Telegram sender_id/chat_id — only a real mobile number. "
-                    "If the customer said 'call me' without a number, ask for +7… first. "
-                    "On failure, reply to the customer using customer_reply from the tool result."
+                    "Place an outbound phone call. Always pass purpose: who you call, why, "
+                    "what to achieve, and facts from this chat. Pass opening: first spoken sentence. "
+                    "Never pass Telegram sender_id as the number. "
+                    "On success the platform talks on the phone — do not write anything to Telegram. "
+                    "On failure, reply using customer_reply from the tool result."
                 ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "number": {
+                            "type": "string",
+                            "description": "Mobile number like 79001234567, not a Telegram id",
+                        },
+                        "purpose": {
+                            "type": "string",
+                            "description": (
+                                "Call briefing for the voice agent: goal, who the person is, "
+                                "what already discussed in Telegram, what to say/ask/close"
+                            ),
+                        },
+                        "opening": {
+                            "type": "string",
+                            "description": "First sentence to speak after they pick up, in character",
+                        },
+                    },
+                },
             )
             registry.register(sip_hangup, "sip_hangup", "Hang up an active SIP call")
             registry.register(sip_status, "sip_status", "SIP registration and active call status")
@@ -893,6 +936,7 @@ class AgentRuntime:
         if not api_key:
             raise RuntimeError("Assigned LLM profile has no API key")
         context = context or {}
+        context["_user_message"] = message
         await self.events.publish("agent.started", {"agent_id": agent.id})
         user_id = str(context.get("user_id") or context.get("sender_id") or context.get("chat_id") or "global")
         memories: list[dict[str, Any]] = []
@@ -1043,6 +1087,8 @@ class AgentRuntime:
                     "the request — without technical internals. "
                     "Never claim an external action succeeded unless its tool call returned successfully. "
                     "When no Telegram reply should be sent, call telegram_suppress_reply. "
+                    "After a successful sip_dial the platform already suppresses the Telegram reply — "
+                    "do not describe the call. "
                     "Never describe silence in a message. "
                     f"If that tool is unavailable, return exactly {NO_TELEGRAM_REPLY}.\n"
                     + (

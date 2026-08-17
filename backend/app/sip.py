@@ -25,7 +25,7 @@ from .realtime_bridge import (
     RealtimeSession,
 )
 from .secrets import SecretStore
-from .sip_dial import validate_sip_dial_target
+from .sip_dial import build_outbound_briefing, validate_sip_dial_target
 from .sip_ua import ActiveCall, SipEndpointConfig, SipUserAgent
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,10 @@ INBOUND_GREETING_INSTRUCTION = (
     "Не жди, пока абонент заговорит первым. После приветствия трубку не клади."
 )
 DEFAULT_INBOUND_GREETING = "Скажи коротко: Ало! Чем могу помочь?"
+OUTBOUND_CALL_INSTRUCTION = (
+    "Это исходящий звонок. Ты инициатор. После ответа абонента сразу веди разговор к цели "
+    "из блока «Цель звонка». Не жди, пока он заговорит первым."
+)
 
 
 def sip_memory_user_id(number: str) -> str:
@@ -563,13 +567,30 @@ class SipGateway:
         account: SipAccount,
         agent: Agent,
         number: str,
+        purpose: str = "",
+        opening: str = "",
+        interlocutor: str = "",
+        channel_context: str = "",
+        current_message: str = "",
     ) -> dict[str, Any]:
         ua = await self._ensure_registered(account)
         number = validate_sip_dial_target(number)
+        briefing = build_outbound_briefing(
+            number=number,
+            purpose=purpose,
+            opening=opening,
+            interlocutor=interlocutor,
+            channel_context=channel_context,
+            current_message=current_message,
+        )
 
         # Prepare Realtime first so media callbacks are ready when RTP starts.
         # Temporary call id until dial returns the real SIP Call-ID.
-        bootstrap = await self._prepare_realtime(agent, remote_number=number)
+        bootstrap = await self._prepare_realtime(
+            agent,
+            remote_number=number,
+            briefing=briefing,
+        )
         session = bootstrap["session"]
         try:
             call = await ua.dial(
@@ -602,6 +623,7 @@ class SipGateway:
         await ua.wait_first_rtp(call)
         call.on_rtp = session.send_pcm24
         call.playback_provider = session.read_playback_frame
+        await session.request_response(briefing["opening_prompt"])
         db_id = await self._create_db_call(
             agent_id=agent.id,
             sip_account_id=account.id,
@@ -622,21 +644,31 @@ class SipGateway:
             },
         )
         return {
-            "sip_call_id": call.call_id,
-            "db_id": db_id,
+            "ok": True,
             "status": call.state,
             "remote_number": call.remote_number,
+            "sip_call_id": call.call_id,
+            "db_id": db_id,
             "direction": "outbound",
             "agent_id": agent.id,
             "sip_account_id": account.id,
         }
 
-    async def _prepare_realtime(self, agent: Agent, *, remote_number: str = "") -> dict[str, Any]:
+    async def _prepare_realtime(
+        self,
+        agent: Agent,
+        *,
+        remote_number: str = "",
+        briefing: dict[str, str] | None = None,
+        inbound: bool = False,
+    ) -> dict[str, Any]:
         sip_ref: list[str] = []
         session = await self._build_realtime_session(
             agent,
             sip_ref,
+            inbound=inbound,
             remote_number=remote_number,
+            briefing=briefing,
         )
         await session.connect()
         return {"session": session, "sip_ref": sip_ref}
@@ -648,6 +680,7 @@ class SipGateway:
         *,
         inbound: bool = False,
         remote_number: str = "",
+        briefing: dict[str, str] | None = None,
     ) -> RealtimeSession:
         if agent.llm_profile_id is None:
             raise RuntimeError("Agent has no LLM profile for Realtime")
@@ -675,6 +708,10 @@ class SipGateway:
             instructions = (
                 f"{instructions}\n\n{INBOUND_GREETING_INSTRUCTION}"
                 + (f"\nФормулировка приветствия: {extra}" if extra else "")
+            )
+        elif briefing and briefing.get("voice_block"):
+            instructions = (
+                f"{instructions}\n\n{OUTBOUND_CALL_INSTRUCTION}\n\n{briefing['voice_block']}"
             )
         memory_on = await self._memory_enabled()
         extra_tools = [CALL_HISTORY_TOOL]

@@ -102,3 +102,78 @@ def sip_failure_admin_message(exc: BaseException, *, number: str = "") -> str:
     if isinstance(exc, SipDialError):
         lines.append("Агент, вероятно, передал Telegram id вместо телефона.")
     return "\n".join(lines)
+
+
+def format_channel_context(
+    history: list[Any] | None,
+    current_message: str = "",
+    *,
+    limit: int = 12,
+) -> str:
+    """Compact Telegram (or similar) transcript for the voice-agent briefing."""
+    lines: list[str] = []
+    for item in (history or [])[-limit:]:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or item.get("message") or "").strip()
+        if not text:
+            continue
+        outgoing = bool(item.get("out") or item.get("outgoing"))
+        who = "агент" if outgoing else "собеседник"
+        lines.append(f"{who}: {text[:280]}")
+    current = str(current_message or "").strip()
+    if current and (not lines or current not in lines[-1]):
+        lines.append(f"собеседник: {current[:280]}")
+    return "\n".join(lines[-limit:])
+
+
+def build_outbound_briefing(
+    *,
+    number: str,
+    purpose: str = "",
+    opening: str = "",
+    interlocutor: str = "",
+    channel_context: str = "",
+    current_message: str = "",
+) -> dict[str, str]:
+    """Instructions + first-turn prompt for an outbound Realtime call."""
+    goal = str(purpose or "").strip()
+    if not goal:
+        snippet = (current_message or channel_context or "").strip()
+        if snippet:
+            goal = (
+                "Клиент попросил перезвонить. Опирайся на переписку и выясни/закрой его запрос. "
+                f"Последний сигнал: {snippet[:400]}"
+            )
+        else:
+            goal = "Исходящий звонок. Представься, уточни, чем помочь, и веди разговор к результату."
+    name = str(interlocutor or "").strip()
+    parts = [
+        "Это ИСХОДЯЩИЙ звонок: ты сам позвонил, абонент уже взял трубку.",
+        "Не веди себя как на входящем: не начинай с «Ало, чем могу помочь?» без цели.",
+        f"Номер: {number}",
+    ]
+    if name:
+        parts.append(f"Как обращаться: {name}")
+    parts.append(f"Цель звонка:\n{goal}")
+    context = str(channel_context or "").strip()
+    if context:
+        parts.append(
+            "Контекст переписки (служебный бриф, не зачитывай дословно):\n" + context[:1800]
+        )
+    parts.append(
+        "Не упоминай Telegram, SIP, инструменты, JSON и что звонок «системный». "
+        "Сразу после ответа поздоровайся и переходи к цели."
+    )
+    spoken = str(opening or "").strip()
+    if not spoken:
+        spoken = (
+            "Абонент ответил. Коротко поздоровайся по имени, если оно известно, "
+            "и сразу переходи к цели звонка из инструкций."
+        )
+    else:
+        spoken = (
+            "Абонент ответил. Скажи первым примерно так (своими словами, голосом): "
+            + spoken
+        )
+    return {"voice_block": "\n".join(parts), "opening_prompt": spoken}

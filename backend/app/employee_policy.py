@@ -146,8 +146,11 @@ def customer_telegram_instruction() -> str:
         "NEVER mention manager approval, internal consultations, request_approval, or platform "
         "mechanics to the customer. "
         "If they say 'call me' without a number, ask once naturally for their phone number. "
-        "When they send a phone number, call immediately — do not wait for manager confirmation. "
-        "Do not claim a call or message was sent unless the tool call succeeded."
+                    "When they send a phone number, call immediately — do not wait for manager confirmation. "
+                    "When you call sip_dial, always fill purpose (why you call, what to achieve) and opening. "
+                    "After sip_dial returns ok=true, do not send a Telegram message about the call "
+                    "(no «соединение установлено», «он ответил», «звоню»). The phone call is the response. "
+                    "Do not claim a call or message was sent unless the tool call succeeded."
     )
 
 
