@@ -25,6 +25,8 @@ TELEGRAM_SURFACE_TOOLS = frozenset(
 
 SIP_SURFACE_TOOLS = frozenset({"sip_dial", "sip_hangup", "sip_status"})
 
+CURSORREMOTE_SURFACE_TOOLS = frozenset({"cursorremote_do"})
+
 EMPLOYEE_SURFACE_TOOLS = frozenset(
     {
         "plan_get",
@@ -76,7 +78,7 @@ def is_surface_tool(name: str) -> bool:
     tool = str(name or "").strip()
     if tool in META_TOOL_NAMES or tool in CORE_SURFACE_TOOLS:
         return True
-    if tool in TELEGRAM_SURFACE_TOOLS | SIP_SURFACE_TOOLS | EMPLOYEE_SURFACE_TOOLS:
+    if tool in TELEGRAM_SURFACE_TOOLS | SIP_SURFACE_TOOLS | EMPLOYEE_SURFACE_TOOLS | CURSORREMOTE_SURFACE_TOOLS:
         return True
     if tool in AGENT_SURFACE_TOOLS | SCHEDULER_SURFACE_TOOLS:
         return True

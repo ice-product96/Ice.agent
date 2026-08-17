@@ -51,7 +51,24 @@ def test_manager_chat_skips_approval_by_default() -> None:
     )
 
 
-def test_employee_policy_merges_defaults() -> None:
+def test_cursorremote_never_requires_manager_approval() -> None:
+    profile = SimpleNamespace(config_json={
+        "policy": {
+            "approval_required_tools": ["mcp_cursorremote_send_prompt", "mcp_cursorremote_approve"],
+            "customer_requests_without_approval": False,
+            "manager_orders_without_approval": False,
+        }
+    })
+    assert not approval_required_for_tool(
+        profile,
+        "mcp_cursorremote_approve",
+        {"source": "telegram", "is_admin": False},
+    )
+    assert not approval_required_for_tool(
+        profile,
+        "cursorremote_do",
+        {"source": "telegram", "is_admin": False},
+    )
     policy = employee_policy(SimpleNamespace(config_json={"policy": {"consult_manager_on_idle_tick": True}}))
     assert policy["consult_manager_on_idle_tick"] is True
     assert "sip_dial" not in policy["approval_required_tools"]

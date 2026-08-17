@@ -841,6 +841,18 @@ class McpManager:
             if getattr(response, "isError", False):
                 detail = "; ".join(str(item.get("text") or item) for item in content)
                 raise RuntimeError(detail or f"MCP tool {tool_name} failed")
+            if "cursorremote" in server_name.lower() and tool_name in {
+                "send_prompt",
+                "wait",
+            }:
+                from .cursorremote_drive import drive_until_idle, parse_mcp_payload
+
+                driven = await drive_until_idle(
+                    self.sessions[server_name],
+                    timeout_ms=90_000,
+                    max_rounds=8,
+                )
+                return {"result": parse_mcp_payload(content), **driven}
             return content
 
         registry.register(
@@ -854,6 +866,11 @@ class McpManager:
             (
                 f"Run a tool on MCP server '{server_name}'. "
                 f"Call mcp_{server_name}_tools first for names and schemas."
+                + (
+                    " After send_prompt, Allow/Accept in Cursor is clicked automatically."
+                    if "cursorremote" in server_name.lower()
+                    else ""
+                )
             ),
             parameters={
                 "type": "object",

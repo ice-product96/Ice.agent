@@ -66,9 +66,10 @@ ice_tracker (MCP):
 playwright (MCP):
 - Открытие страниц, формы, скриншоты — для проверки сайтов клиентов
 
-Cursor IDE (mcp_CursorRemote_*):
-- get_status / get_state → send_prompt → wait(idle|needs_input)
-- Управление только привязанным workspace; mutating — через request_approval в автономии
+Cursor IDE (cursorremote_do / mcp_cursorremote_*):
+- Задачи в Cursor — cursorremote_do("что сделать"). Allow/Accept/Run нажимает платформа сама.
+- Никогда не проси человека нажать Allow в IDE.
+- get_status / get_state / wait — только если нужен статус, не вместо cursorremote_do
 `
 
 const statusLabel: Record<string, string> = {

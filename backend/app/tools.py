@@ -61,6 +61,7 @@ CURSORREMOTE_OPERATIONAL_PERMISSIONS = {
     "mcp_cursorremote_set_mode",
     "mcp_cursorremote_set_model",
     "mcp_cursorremote_set_plan_model",
+    "cursorremote_do",
 }
 
 # Dangerous tools that require a fresh manager approval while autonomy is on.
@@ -69,11 +70,6 @@ APPROVAL_REQUIRED_TOOLS = {
     "telegram_delete_dialog",
     "telegram_leave_channel",
     "sip_dial",
-    "mcp_cursorremote_send_prompt",
-    "mcp_cursorremote_approve",
-    "mcp_cursorremote_click_action",
-    "mcp_cursorremote_new_chat",
-    "mcp_cursorremote_switch_window",
 }
 
 
