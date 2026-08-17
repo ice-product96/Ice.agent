@@ -124,6 +124,15 @@ export interface McpServer {
   tools?: string[]
 }
 
+export interface CronJobResult {
+  ok?: boolean
+  status?: 'completed' | 'skipped' | 'error' | string
+  title?: string
+  summary?: string
+  details?: string[]
+  ran_at?: string
+}
+
 export interface CronJob {
   id: ID
   name: string
@@ -136,6 +145,7 @@ export interface CronJob {
   last_run_at?: string
   next_run_at?: string
   status?: Status
+  last_result?: CronJobResult | null
 }
 
 export interface LogEntry {

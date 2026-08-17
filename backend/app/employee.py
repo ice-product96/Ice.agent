@@ -291,6 +291,18 @@ def _job_message(job: CronJob) -> str:
     return text[:180]
 
 
+def _job_result_text(job: CronJob) -> str:
+    payload = job.payload or {}
+    result = payload.get("last_result") or {}
+    if not isinstance(result, dict):
+        return ""
+    summary = str(result.get("summary") or "").strip()
+    title = str(result.get("title") or "").strip()
+    if summary:
+        return summary[:180]
+    return title[:80]
+
+
 def build_employee_context_block(
     profile: EmployeeProfile,
     jobs: list[CronJob],
@@ -310,7 +322,10 @@ def build_employee_context_block(
         for job in jobs[:15]:
             kind = "heartbeat" if job.name.startswith(HEARTBEAT_JOB_PREFIX) else "task"
             msg = _job_message(job)
+            outcome = _job_result_text(job)
             suffix = f" — {msg}" if msg else ""
+            if outcome:
+                suffix = f"{suffix} | итог: {outcome}"
             lines.append(f"- [{kind}] #{job.id} {job.name} ({_job_when(job)}){suffix}")
     else:
         lines.append(

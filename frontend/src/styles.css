@@ -125,6 +125,20 @@ button.chip { cursor: pointer; font: inherit; }
 .entity-meta { color: #71798c; display: flex; gap: 15px; font-size: 9px; }.entity-meta span { display: flex; align-items: center; gap: 4px; }
 .card-actions { margin-top: 15px; padding-top: 14px; border-top: 1px solid #202532; display: flex; gap: 8px; }.card-actions .secondary { flex: 1; height: 33px; }
 .list-panel { overflow: hidden; padding: 0 18px; }.account-row, .server-row { min-height: 70px; }.grow { flex: 1; min-width: 0; }
+.server-row.cron-row { align-items: flex-start; padding-top: 14px; padding-bottom: 14px; }
+.cron-outcome { margin-top: 8px; padding: 9px 11px; border-radius: 8px; background: #171c27; border: 1px solid #232a38; }
+.cron-outcome strong { display: block; font-size: 10px; color: #c5cbd8; }
+.cron-outcome small { display: block; margin-top: 2px; color: #737c8f; font-size: 10px; }
+.cron-outcome p, .cron-outcome li { color: #9aa3b4; font-size: 11px; line-height: 1.5; white-space: pre-wrap; }
+.cron-outcome p { margin: 5px 0 0; }
+.cron-outcome ul { margin: 6px 0 0; padding-left: 16px; }
+.cron-outcome.completed { border-color: #24352c; background: #141c18; }
+.cron-outcome.completed strong { color: #9dccb0; }
+.cron-outcome.error { border-color: #5a2a36; background: #21151a; }
+.cron-outcome.error strong { color: #ff8fa0; }
+.cron-outcome.skipped { border-color: #3a3424; background: #1c1a14; }
+.cron-outcome.muted { margin-top: 6px; color: #737c8f; font-size: 10px; }
+.field .cron-outcome { margin-top: 0; }
 .memory-list { display: grid; gap: 10px; }.memory-card { padding: 17px 19px; border: 1px solid var(--line); border-radius: 10px; background: #10141d; }.memory-head { display: flex; align-items: center; justify-content: space-between; }.memory-head > div { display: flex; align-items: center; gap: 10px; }.memory-head strong { font-size: 12px; }.scope { color: #9b8eff; background: #8c7cff12; border: 1px solid #8c7cff20; border-radius: 5px; padding: 4px 7px; font-size: 9px; text-transform: uppercase; }.memory-card > p { color: #9ba2b2; margin: 12px 0; font-size: 11px; line-height: 1.6; white-space: pre-wrap; }.memory-card time { margin-left: auto; }
 
 .conversation-filters select { width: min(230px, 30vw); }

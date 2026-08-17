@@ -51,11 +51,16 @@ def test_employee_context_uses_schedule_not_plans() -> None:
         id=12,
         name="once-check-cursor",
         cron="@once",
-        payload={"run_once_at": "2026-08-17T13:00:00+00:00", "message": "cursorremote_check LAVVE"},
+        payload={
+            "run_once_at": "2026-08-17T13:00:00+00:00",
+            "message": "cursorremote_check LAVVE",
+            "last_result": {"title": "Выполнено", "summary": "Cursor закончил работу."},
+        },
     )
     block = build_employee_context_block(profile, [job], [], [])
     assert "Расписание" in block
     assert "cursorremote_check LAVVE" in block
+    assert "итог: Cursor закончил работу" in block
     assert "hour/day/week/month" in block
     assert "Активные планы" not in block
 

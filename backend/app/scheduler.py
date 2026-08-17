@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -6,17 +5,18 @@ from typing import Any, Awaitable, Callable
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .db import CronJob
+from .job_result import humanize_job_outcome
 from .timezones import normalize_timezone
 
 logger = logging.getLogger(__name__)
 
 
 class CronManager:
-    def __init__(self, sessions: async_sessionmaker[AsyncSession], callback: Callable[[int, dict[str, Any]], Awaitable[None]]) -> None:
+    def __init__(self, sessions: async_sessionmaker[AsyncSession], callback: Callable[[int, dict[str, Any]], Awaitable[Any]]) -> None:
         self.sessions = sessions
         self.callback = callback
         self.scheduler = AsyncIOScheduler(timezone="UTC")
@@ -65,15 +65,24 @@ class CronManager:
         payload: dict[str, Any],
         run_once: bool,
     ) -> None:
+        outcome: dict[str, Any]
         try:
-            await self.callback(agent_id, payload)
-        finally:
-            values: dict[str, Any] = {"last_run_at": datetime.now(timezone.utc)}
+            raw = await self.callback(agent_id, payload)
+            outcome = humanize_job_outcome(raw, payload=payload)
+        except Exception as exc:
+            logger.exception("Scheduled job id=%s failed", job_id)
+            outcome = humanize_job_outcome(None, payload=payload, error=exc)
+        async with self.sessions() as db:
+            job = await db.get(CronJob, job_id)
+            if job is None:
+                return
+            stored = dict(job.payload or {})
+            stored["last_result"] = outcome
+            job.payload = stored
+            job.last_run_at = datetime.now(timezone.utc)
             if run_once:
-                values["enabled"] = False
-            async with self.sessions() as db:
-                await db.execute(update(CronJob).where(CronJob.id == job_id).values(**values))
-                await db.commit()
+                job.enabled = False
+            await db.commit()
 
     def remove(self, job_id: int) -> None:
         if self.scheduler.get_job(f"cron-{job_id}"):

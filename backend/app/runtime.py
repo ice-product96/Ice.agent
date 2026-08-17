@@ -26,6 +26,7 @@ from .db import (
     utcnow,
 )
 from .action_reports import cursor_finished_in_audit, format_admin_action_report
+from .job_result import notes_from_audit
 from .employee import (
     AGENT_EDITABLE_SECTIONS,
     NEED_KINDS,
@@ -894,7 +895,12 @@ class AgentRuntime:
             "employee.tick",
             {"agent_id": agent.id, "reason": reason, "force": force},
         )
-        return {"ok": True, "skipped": False, "result": result}
+        return {
+            "ok": True,
+            "skipped": False,
+            "result": result,
+            "notes": list(context.get("_job_notes") or []),
+        }
 
     async def run(
         self,
@@ -1314,6 +1320,7 @@ class AgentRuntime:
                 )
                 await db.commit()
             await self.events.publish("agent.completed", {"agent_id": agent.id, "text": result})
+            context["_job_notes"] = notes_from_audit(registry.audit)
             if cursor_finished_in_audit(registry.audit) and not suppressed:
                 context["_deliver_origin_reply"] = True
             return result

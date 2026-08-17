@@ -161,24 +161,23 @@ async def lifespan(app: FastAPI):
         for server in servers
     ]
 
-    async def run_scheduled(agent_id: int, payload: dict[str, Any]) -> None:
+    async def run_scheduled(agent_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         async with SessionLocal() as db:
             agent = await db.get(Agent, agent_id)
             if not agent:
-                return
+                return {"ok": False, "skipped": True, "reason": "agent_missing"}
             kind = str(payload.get("kind") or "")
             if kind == "employee_tick" or payload.get("source") in {
                 "employee_heartbeat",
                 "consult_resolved",
                 "employee_tick",
             }:
-                await runtime.tick(
+                return await runtime.tick(
                     db,
                     agent,
                     force=bool(payload.get("force")),
                     reason=str(payload.get("source") or kind or "heartbeat"),
                 )
-                return
             result = await runtime.run(db, agent, str(payload.get("message", "")), payload)
             if payload.get("_deliver_origin_reply"):
                 phone = payload.get("reply_phone")
@@ -187,6 +186,12 @@ async def lifespan(app: FastAPI):
                 if phone and chat_id and text:
                     entity = int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
                     await telegram.send_message(str(phone), entity, text)
+            return {
+                "ok": True,
+                "result": result,
+                "notified": bool(payload.get("_deliver_origin_reply")),
+                "notes": list(payload.get("_job_notes") or []),
+            }
 
     scheduler = CronManager(SessionLocal, run_scheduled)
     runtime.bind_scheduler(scheduler)

@@ -28,6 +28,7 @@ from .employee import (
 )
 from .events import events
 from .integrations import exception_text
+from .job_result import public_job_result
 from .memory_clear import clear_journals
 from .schemas import ConversationPatch, LlmProfileBody, RuntimeSettingsBody
 from .secrets import SecretStore, masked_secret
@@ -1679,6 +1680,7 @@ def cron_json(job: CronJob) -> dict[str, Any]:
         "created_at": iso(job.created_at),
         "updated_at": iso(job.updated_at),
         "status": cron_job_status(job),
+        "last_result": public_job_result(payload.get("last_result")),
     }
 
 
@@ -1754,7 +1756,10 @@ async def create_cron(payload: CronBody, request: Request, db: AsyncSession = De
 async def update_cron(job_id: str, request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     job = await one(db, CronJob, job_id)
     payload = CronBody.model_validate({**cron_json(job), **await request.json()})
+    previous = dict(job.payload or {})
     schedule, job_payload = cron_values(payload)
+    if previous.get("last_result"):
+        job_payload["last_result"] = previous["last_result"]
     job.name = payload.name
     job.agent_id = as_int(payload.agent_id, "agent_id")
     job.cron = schedule
