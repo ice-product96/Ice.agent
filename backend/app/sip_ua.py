@@ -240,6 +240,8 @@ class ActiveCall:
     media_tx_enabled: bool = False
     rtp_marker_next: bool = True
     invite_final: bool = False
+    tx_talkspurt: bool = False
+    tx_ratecv_state: Any = None
     seq: int = field(default_factory=lambda: random.randint(1, 0xFFFF))
     timestamp: int = field(default_factory=lambda: random.randint(1, 0xFFFFFFFF))
     ssrc: int = field(default_factory=lambda: random.randint(1, 0x7FFFFFFF))
@@ -250,6 +252,7 @@ def _parse_rtp_packet(data: bytes) -> tuple[int, bytes] | None:
     if len(data) < 12:
         return None
     cc = data[0] & 0x0F
+    padding = bool(data[0] & 0x20)
     hlen = 12 + cc * 4
     if len(data) < hlen:
         return None
@@ -262,7 +265,12 @@ def _parse_rtp_packet(data: bytes) -> tuple[int, bytes] | None:
         if len(data) < hlen:
             return None
     pt = data[1] & 0x7F
-    return pt, data[hlen:]
+    payload = data[hlen:]
+    if padding and payload:
+        pad = payload[-1]
+        if 0 < pad <= len(payload):
+            payload = payload[:-pad]
+    return pt, payload
 
 
 def _rtp_header(pt: int, seq: int, ts: int, ssrc: int, marker: int = 0) -> bytes:
@@ -294,6 +302,7 @@ class RtpProtocol(asyncio.DatagramProtocol):
     def __init__(self, call: ActiveCall) -> None:
         self.call = call
         self.transport: asyncio.DatagramTransport | None = None
+        self._rx_lock = asyncio.Lock()
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
@@ -302,7 +311,10 @@ class RtpProtocol(asyncio.DatagramProtocol):
         parsed = _parse_rtp_packet(data)
         if parsed is None:
             return
-        # Symmetric RTP: Telphin/NAT often sends media from a different IP:port than SDP.
+        pt, payload = parsed
+        # CN / DTMF / telephone-event decoded as G.711 sound like noise.
+        if pt not in {0, 8}:
+            return
         host, port = addr[0], int(addr[1])
         if _is_ipv4(host) and (
             self.call.remote_rtp_host != host or self.call.remote_rtp_port != port
@@ -327,25 +339,26 @@ class RtpProtocol(asyncio.DatagramProtocol):
                 port,
                 self.call.call_id[:24],
             )
-        pt, payload = parsed
         if pt == 8:
             self.call.codec = "pcma"
-        elif pt == 0:
+        else:
             self.call.codec = "pcmu"
-        if not payload or self.call.on_rtp is None:
+        # Early-media ringback must not go to the LLM — only after the call is up.
+        if self.call.state != "answered" or not payload or self.call.on_rtp is None:
             return
         try:
             pcm24 = sip_to_openai(payload, self.call.codec)
         except Exception:
             return
-        asyncio.create_task(self._safe_on_rtp(pcm24))
+        asyncio.create_task(self._deliver_rtp(pcm24), name="rtp-rx")
 
-    async def _safe_on_rtp(self, pcm24: bytes) -> None:
-        try:
-            if self.call.on_rtp:
-                await self.call.on_rtp(pcm24)
-        except Exception:
-            logger.exception("RTP on_rtp failed")
+    async def _deliver_rtp(self, pcm24: bytes) -> None:
+        async with self._rx_lock:
+            try:
+                if self.call.on_rtp:
+                    await self.call.on_rtp(pcm24)
+            except Exception:
+                logger.exception("RTP on_rtp failed")
 
     def send_payload(self, payload: bytes, *, marker: bool | None = None) -> None:
         if not self.transport or not self.call.remote_rtp_host or not self.call.remote_rtp_port:
@@ -1091,12 +1104,17 @@ class SipUserAgent:
                         pcm24 = call.playback_provider() or b""
                     except Exception:
                         pcm24 = b""
-                had_audio = len(pcm24) > 0
+                talking = len(pcm24) > 0
+                if talking and not call.tx_talkspurt:
+                    call.rtp_marker_next = True
+                call.tx_talkspurt = talking
                 if len(pcm24) < OPENAI_FRAME_SAMPLES * 2:
-                    if not had_audio:
-                        call.rtp_marker_next = True
                     pcm24 = pcm24 + b"\x00" * (OPENAI_FRAME_SAMPLES * 2 - len(pcm24))
-                payload = openai_to_sip(pcm24[: OPENAI_FRAME_SAMPLES * 2], call.codec)
+                payload, call.tx_ratecv_state = openai_to_sip(
+                    pcm24[: OPENAI_FRAME_SAMPLES * 2],
+                    call.codec,
+                    state=call.tx_ratecv_state,
+                )
                 call.rtp_protocol.send_payload(payload)
                 await asyncio.sleep(0.02)
         except asyncio.CancelledError:

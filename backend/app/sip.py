@@ -574,12 +574,25 @@ class SipGateway:
         try:
             call = await ua.dial(
                 number,
-                on_rtp=session.send_pcm24,
+                on_rtp=None,
                 playback_provider=None,
             )
-        except Exception:
-            await session.close()
-            raise
+        except Exception as exc:
+            if "403" not in str(exc):
+                await session.close()
+                raise
+            logger.warning("SIP INVITE 403 — re-REGISTER and retry once: %s", exc)
+            try:
+                await self.register_account(account, force=True)
+                ua = await self._ensure_registered(account)
+                call = await ua.dial(
+                    number,
+                    on_rtp=None,
+                    playback_provider=None,
+                )
+            except Exception:
+                await session.close()
+                raise
 
         sip_ref = bootstrap["sip_ref"]
         sip_ref.clear()

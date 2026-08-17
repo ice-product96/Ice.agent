@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import struct
 from collections import deque
-from typing import Literal
+from typing import Any, Literal
 
 try:
     import audioop  # type: ignore
@@ -38,14 +38,13 @@ def pcm16_upsample_8k_to_24k(pcm8: bytes) -> bytes:
     return bytes(out)
 
 
-def pcm16_downsample_24k_to_8k(pcm24: bytes) -> bytes:
-    """PCM16LE 24 kHz -> 8 kHz via audioop.ratecv (same idea as softphone pipelines)."""
+def pcm16_downsample_24k_to_8k(pcm24: bytes, state: Any = None) -> tuple[bytes, Any]:
+    """PCM16LE 24 kHz -> 8 kHz via audioop.ratecv (keep filter state across frames)."""
     if not pcm24:
-        return b""
-    # Prefer proper resampler; fall back to decimation.
+        return b"", state
     try:
-        converted, _ = audioop.ratecv(pcm24, 2, 1, OPENAI_RATE, SIP_RATE, None)
-        return converted
+        converted, new_state = audioop.ratecv(pcm24, 2, 1, OPENAI_RATE, SIP_RATE, state)
+        return converted, new_state
     except Exception:
         samples = memoryview(pcm24).cast("h")
         out = bytearray((len(samples) // 3) * 2)
@@ -54,7 +53,7 @@ def pcm16_downsample_24k_to_8k(pcm24: bytes) -> bytes:
         for i in range(0, len(samples) - 2, 3):
             view[j] = (int(samples[i]) + int(samples[i + 1]) + int(samples[i + 2])) // 3
             j += 1
-        return bytes(out)
+        return bytes(out), state
 
 
 def g711_encode(pcm8: bytes, codec: Codec = "pcmu") -> bytes:
@@ -73,8 +72,9 @@ def sip_to_openai(payload: bytes, codec: Codec = "pcmu") -> bytes:
     return pcm16_upsample_8k_to_24k(g711_decode(payload, codec))
 
 
-def openai_to_sip(pcm24: bytes, codec: Codec = "pcmu") -> bytes:
-    return g711_encode(pcm16_downsample_24k_to_8k(pcm24), codec)
+def openai_to_sip(pcm24: bytes, codec: Codec = "pcmu", state: Any = None) -> tuple[bytes, Any]:
+    pcm8, new_state = pcm16_downsample_24k_to_8k(pcm24, state)
+    return g711_encode(pcm8, codec), new_state
 
 
 class PlaybackBuffer:

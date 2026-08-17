@@ -4,6 +4,8 @@ from app.sip_ua import (
     ActiveCall,
     SipEndpointConfig,
     SipUserAgent,
+    _parse_rtp_packet,
+    _rtp_header,
     outbound_fail_message,
 )
 
@@ -31,6 +33,17 @@ def _call(ua: SipUserAgent) -> ActiveCall:
     )
     ua.calls[call.call_id] = call
     return call
+
+
+def test_parse_rtp_strips_padding() -> None:
+    payload = b"\xff" * 160
+    pkt = _rtp_header(0, 1, 0, 1) + payload + b"\x00\x00\x00\x04"
+    pkt = bytes([pkt[0] | 0x20]) + pkt[1:]
+    parsed = _parse_rtp_packet(pkt)
+    assert parsed is not None
+    pt, body = parsed
+    assert pt == 0
+    assert body == payload
 
 
 def test_outbound_fail_message_includes_sip_code() -> None:
