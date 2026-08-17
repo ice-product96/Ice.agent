@@ -35,7 +35,19 @@ def _call(ua: SipUserAgent) -> ActiveCall:
 
 def test_outbound_fail_message_includes_sip_code() -> None:
     text = outbound_fail_message(403, {"Reason-Phrase": "Forbidden"}, "")
-    assert text == "Outbound call failed (SIP 403 Forbidden)"
+    assert "Outbound call failed (SIP 403 Forbidden)" in text
+    assert "Telphin" in text
+
+
+def test_invite_from_uses_login_not_caller_id() -> None:
+    ua = _ua()
+    ua.config.caller_id = "74951234567"
+    ua.config.display_name = "Sales"
+    header = ua._from(tag="abc")
+    assert "sip:062xxx@sip.telphin.com" in header
+    assert "74951234567" not in header
+    identity = ua._identity_headers()
+    assert "74951234567" in identity["P-Asserted-Identity"]
 
 
 def test_digest_nc_increments_for_same_nonce() -> None:

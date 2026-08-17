@@ -60,6 +60,12 @@ from .memory_scope import (
     prefetch_memories,
     resolve_memory_scope,
 )
+from .sip_dial import (
+    SipDialError,
+    sip_failure_admin_message,
+    sip_failure_customer_message,
+    validate_sip_dial_target,
+)
 from .tool_plane import attach_tool_plane
 from .tools import (
     ToolRegistry,
@@ -419,7 +425,7 @@ class AgentRuntime:
                 )
         tools_enabled = set((agent.config or {}).get("tools") or [])
         if self.sip and agent.sip_account_id is not None and "sip" in tools_enabled:
-            async def sip_dial(number: str) -> dict[str, Any]:
+            async def sip_dial(number: str = "") -> dict[str, Any]:
                 """Place an outbound phone call via the agent's SIP account and talk with OpenAI Realtime."""
                 from .db import SipAccount
 
@@ -428,7 +434,41 @@ class AgentRuntime:
                 account = await db.get(SipAccount, agent.sip_account_id)
                 if account is None:
                     raise RuntimeError("SIP account not found")
-                return await self.sip.dial(account=account, agent=agent, number=number)
+                target = str(number or "").strip()
+                ctx = context or {}
+                if not target and ctx.get("source") == "telegram" and phone and self.telegram:
+                    sender = ctx.get("sender_id") or ctx.get("chat_id")
+                    if sender is not None:
+                        target = await self.telegram.get_user_phone(phone, sender) or ""
+                try:
+                    normalized = validate_sip_dial_target(target, ctx)
+                    return await self.sip.dial(
+                        account=account,
+                        agent=agent,
+                        number=normalized,
+                    )
+                except Exception as exc:
+                    is_customer = (
+                        ctx.get("source") == "telegram" and not ctx.get("is_admin")
+                    )
+                    payload: dict[str, Any] = {
+                        "ok": False,
+                        "customer_reply": sip_failure_customer_message(exc),
+                    }
+                    if is_customer:
+                        payload["detail"] = payload["customer_reply"]
+                    else:
+                        payload["detail"] = sip_failure_admin_message(
+                            exc,
+                            number=target or number,
+                        )
+                    if isinstance(exc, SipDialError):
+                        payload["error_code"] = "invalid_number"
+                    elif "403" in str(exc):
+                        payload["error_code"] = "operator_rejected"
+                    else:
+                        payload["error_code"] = "dial_failed"
+                    return payload
 
             async def sip_hangup(call_id: str = "") -> dict[str, Any]:
                 """Hang up an active SIP call. Pass db call id or SIP Call-ID; empty hangs up nothing."""
@@ -451,7 +491,16 @@ class AgentRuntime:
                 """Return SIP registration and active calls for this agent's account."""
                 return await self.sip.status(agent.sip_account_id)
 
-            registry.register(sip_dial, "sip_dial", "Dial a phone number through the agent's SIP account")
+            registry.register(
+                sip_dial,
+                "sip_dial",
+                (
+                    "Dial a phone number through the agent's SIP account. "
+                    "Never pass Telegram sender_id/chat_id — only a real mobile number. "
+                    "If the customer said 'call me' without a number, ask for +7… first. "
+                    "On failure, reply to the customer using customer_reply from the tool result."
+                ),
+            )
             registry.register(sip_hangup, "sip_hangup", "Hang up an active SIP call")
             registry.register(sip_status, "sip_status", "SIP registration and active call status")
         if self.mcp and mcp_server_names:
@@ -958,11 +1007,26 @@ class AgentRuntime:
             is_employee_tick = bool(context.get("employee_tick") or context.get("source") == "employee_tick")
             phone_hint = ""
             if is_telegram and not context.get("is_admin"):
+                lower = message.lower()
                 digits = "".join(ch for ch in message if ch.isdigit())
-                if len(digits) >= 10:
+                call_intent = any(
+                    word in lower
+                    for word in ("звони", "позвони", "перезвони", "набер", "call me", "call")
+                )
+                sender_id = str(context.get("sender_id") or "")
+                if call_intent and len(digits) < 10:
                     phone_hint = (
-                        f"The customer sent a phone number ({digits}). "
-                        "If they asked for a call, invoke sip_dial immediately with this number."
+                        "The customer asked for a call but did NOT provide a phone number. "
+                        "Do NOT call sip_dial yet and do NOT use Telegram sender_id/chat_id "
+                        f"(sender_id={sender_id}) as a phone number. "
+                        "Ask once, naturally, for their mobile number (+7…). "
+                        "Only call sip_dial after they send a full phone number."
+                    )
+                elif len(digits) >= 10:
+                    phone_hint = (
+                        f"The customer sent digits that may be a phone number ({digits}). "
+                        "If they asked for a call, invoke sip_dial with the full mobile number "
+                        "(79XXXXXXXXX). Never use sender_id or chat_id."
                     )
             if is_employee_tick:
                 role_instruction = build_employee_tick_instruction(employee_profile)

@@ -25,6 +25,7 @@ from .realtime_bridge import (
     RealtimeSession,
 )
 from .secrets import SecretStore
+from .sip_dial import validate_sip_dial_target
 from .sip_ua import ActiveCall, SipEndpointConfig, SipUserAgent
 
 logger = logging.getLogger(__name__)
@@ -564,6 +565,7 @@ class SipGateway:
         number: str,
     ) -> dict[str, Any]:
         ua = await self._ensure_registered(account)
+        number = validate_sip_dial_target(number)
 
         # Prepare Realtime first so media callbacks are ready when RTP starts.
         # Temporary call id until dial returns the real SIP Call-ID.

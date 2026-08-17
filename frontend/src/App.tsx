@@ -640,11 +640,7 @@ function CallsScreen() {
   const [busy, setBusy] = useState(false)
   const [dialError, setDialError] = useState('')
   const [clearing, setClearing] = useState(false)
-  useEffect(() => {
-    const timer = window.setInterval(() => { void refresh() }, 5000)
-    return () => window.clearInterval(timer)
-  }, [refresh])
-  if (loading || agents.loading) return <Loading/>
+  if ((loading && !data) || (agents.loading && !agents.data)) return <Loading/>
   const items = data?.items || []
   const active = data?.active || []
   const sipAgents = (agents.data || []).filter(a => a.sip_account_id)

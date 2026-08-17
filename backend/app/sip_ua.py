@@ -117,7 +117,13 @@ def outbound_fail_message(status: int, headers: dict[str, str], body: str = "") 
     text = f"SIP {status}" + (f" {reason}" if reason else "")
     if extra:
         text = f"{text}: {extra}"
-    return f"Outbound call failed ({text})"
+    hint = ""
+    if status == 403:
+        hint = (
+            " — Telphin отклонил исходящий. Проверьте: From=логин АТС (не чужой Caller ID), "
+            "номер как 79XXXXXXXXX, в ЛК Telphin включены исходящие, Public IP не 172.*"
+        )
+    return f"Outbound call failed ({text}){hint}"
 
 
 def _sip_uri(user: str, host: str, port: int | None = None) -> str:
@@ -548,10 +554,26 @@ class SipUserAgent:
         transport = (self.config.transport or "udp").lower()
         return f"<sip:{self.config.login}@{self.local_ip}:{self.config.local_sip_port};transport={transport}>"
 
-    def _from(self) -> str:
+    def _aor_uri(self) -> str:
+        # Telphin matches the registered AOR. Putting a DID in From is a common 403.
+        return _sip_uri(self.config.login, self.config.domain)
+
+    def _from(self, *, tag: str | None = None) -> str:
         display = self.config.display_name or self.config.login
-        uri = _sip_uri(self.config.caller_id or self.config.login, self.config.domain)
-        return f"{_quote(display)} <{uri}>;tag={self._from_tag}"
+        return f"{_quote(display)} <{self._aor_uri()}>;tag={tag or self._from_tag}"
+
+    def _identity_headers(self) -> dict[str, str]:
+        raw = str(self.config.caller_id or "").strip()
+        if not raw:
+            return {}
+        digits = re.sub(r"[^\d]", "", raw)
+        if not digits or digits == self.config.login:
+            return {}
+        uri = _sip_uri(digits, self.config.domain)
+        return {
+            "P-Asserted-Identity": f"<{uri}>",
+            "Remote-Party-ID": f"<{uri}>;party=calling;privacy=off;screen=yes",
+        }
 
     def _auth_header(self, method: str, uri: str, challenge: dict[str, str]) -> str:
         realm = challenge.get("realm", "")
@@ -1421,7 +1443,11 @@ class SipUserAgent:
         active = self._active_calls()
         if len(active) >= self.config.max_concurrent_calls:
             raise RuntimeError("Max concurrent calls reached for this SIP account")
-        number = re.sub(r"[^\d+*#]", "", number)
+        number = re.sub(r"[^\d*#]", "", number)
+        if number.startswith("00") and len(number) > 2:
+            number = number[2:]
+        if len(number) == 11 and number.startswith("8"):
+            number = "7" + number[1:]
         if not number:
             raise ValueError("Empty number")
         rtp_port = self._allocate_rtp_port()
@@ -1429,7 +1455,7 @@ class SipUserAgent:
         local_tag = f"{random.randint(10**6, 10**9)}"
         self._cseq += 1
         request_uri = f"sip:{number}@{self.config.domain}"
-        from_header = f"{_quote(self.config.display_name or self.config.login)} <{_sip_uri(self.config.caller_id or self.config.login, self.config.domain)}>;tag={local_tag}"
+        from_header = self._from(tag=local_tag)
         to_header = f"<{request_uri}>"
         sdp = self._local_sdp(rtp_port)
         call = ActiveCall(
@@ -1456,6 +1482,7 @@ class SipUserAgent:
             "Contact": self._contact(),
             "Content-Type": "application/sdp",
             "Allow": "INVITE, ACK, CANCEL, BYE, OPTIONS, INFO",
+            **self._identity_headers(),
         }
         # fire INVITE with auth retry; provisional/200 also update state via handle_message
         try:
@@ -1478,6 +1505,14 @@ class SipUserAgent:
                 (self._proxy_ip, self._proxy_port),
             )
         if status >= 400 or call.state in {"failed", "ended"}:
+            logger.warning(
+                "SIP INVITE failed status=%s from=%s to=%s uri=%s warning=%s",
+                status,
+                from_header,
+                to_header,
+                request_uri,
+                (resp_headers.get("Warning") or resp_body or "")[:180],
+            )
             if call.call_id in self.calls:
                 await self.hangup(call.call_id, cause=f"sip_{status}", send_bye=False)
             raise RuntimeError(outbound_fail_message(status, resp_headers, resp_body))

@@ -686,6 +686,19 @@ class TelegramGateway:
             "entity": telegram_json(target),
         }
 
+    async def get_user_phone(self, phone: str, entity: str | int) -> str | None:
+        """Return the user's phone if Telethon exposes it (contact / mutual access)."""
+        from .sip_dial import normalize_sip_dial_number
+
+        try:
+            user = await self._get(phone).get_entity(entity)
+            raw = getattr(user, "phone", None)
+            if not raw:
+                return None
+            return normalize_sip_dial_number(str(raw))
+        except Exception:
+            return None
+
     async def resolve_phone(
         self,
         phone: str,
