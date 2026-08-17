@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import Agent, AgentLink, AgentTask, Base, TelegramAccount
-from app.integrations import McpManager
+from app.integrations import McpManager, mcp_session_dead
 from app.routing import ADMIN_ACK_TEXT, TelegramEventRouter
 from app.runtime import TaskBus
 from app.tools import ToolRegistry
@@ -197,6 +197,63 @@ async def test_telegram_router_routes_and_prevents_loops(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_telegram_router_routes_image_and_voice_without_text(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "media.db")
+    async with sessions() as db:
+        account = TelegramAccount(
+            phone="+100000",
+            name="routing",
+            session_path="routing.session",
+            authorized=True,
+        )
+        db.add(account)
+        await db.flush()
+        agent = Agent(name="routing-agent", telegram_account_id=account.id)
+        db.add(agent)
+        await db.commit()
+
+    runtime = RoutingRuntime()
+    telegram = RoutingTelegram()
+    events = RecordingEvents()
+    router = TelegramEventRouter(sessions, runtime, telegram, events)
+    base = {
+        "phone": "+100000",
+        "sender_id": 10,
+        "chat_id": 20,
+        "outgoing": False,
+        "service": False,
+        "is_admin": False,
+    }
+    await router.new_message({**base, "message_id": 40, "text": ""})
+    assert runtime.calls == []
+
+    photo = {
+        "kind": "image",
+        "mime_type": "image/jpeg",
+        "filename": "photo.jpg",
+        "size": 4,
+        "data_b64": "aaaa",
+    }
+    await router.new_message({**base, "message_id": 41, "text": "", "attachments": [photo]})
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0][1] == "[Вложение: изображение]"
+    assert runtime.calls[0][2]["_attachments"][0]["data_b64"] == "aaaa"
+    assert "data_b64" not in runtime.calls[0][2]["attachments"][0]
+
+    voice = {
+        "kind": "voice",
+        "mime_type": "audio/ogg",
+        "filename": "voice.ogg",
+        "size": 8,
+        "data_b64": "YmJiYg==",
+    }
+    await router.new_message({**base, "message_id": 42, "text": "", "attachments": [voice]})
+    assert len(runtime.calls) == 2
+    assert runtime.calls[1][1] == "[Вложение: голосовое сообщение]"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_mcp_registration_filters_attached_servers() -> None:
     class Session:
         async def list_tools(self) -> Any:
@@ -239,3 +296,36 @@ async def test_mcp_registration_uses_gateway_for_large_servers() -> None:
     registry = ToolRegistry()
     await manager.register_tools(registry, {"heavy"})
     assert set(registry.tools) == {"mcp_heavy_tools", "mcp_heavy_run"}
+
+
+def test_mcp_session_dead_detects_terminated() -> None:
+    class MCPError(Exception):
+        pass
+
+    assert mcp_session_dead(MCPError("Session terminated"))
+    assert mcp_session_dead(ConnectionResetError())
+    assert not mcp_session_dead(RuntimeError("tool not found"))
+
+
+@pytest.mark.asyncio
+async def test_mcp_registration_skips_dead_session() -> None:
+    class DeadSession:
+        async def list_tools(self) -> Any:
+            raise RuntimeError("Session terminated")
+
+    class LiveSession:
+        async def list_tools(self) -> Any:
+            definition = SimpleNamespace(
+                name="lookup",
+                description="Lookup data",
+                inputSchema={"type": "object", "properties": {}},
+            )
+            return SimpleNamespace(tools=[definition])
+
+    manager = McpManager()
+    manager.sessions = {"dead": DeadSession(), "live": LiveSession()}
+    registry = ToolRegistry()
+    await manager.register_tools(registry, {"dead", "live"})
+    assert set(registry.tools) == {"mcp_live_tools", "mcp_live_run"}
+    assert "dead" not in manager.sessions
+    assert "live" in manager.sessions

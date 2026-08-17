@@ -10,7 +10,7 @@ from .db import Agent, MessageLog, RuntimeSettings, TelegramAccount
 from .employee import CONSULT_CMD_RE
 from .events import EventHub
 from .runtime import AgentRuntime, NO_TELEGRAM_REPLY
-from .telegram import TelegramGateway
+from .telegram import TelegramGateway, attachment_label, public_attachment
 
 ADMIN_ACK_TEXT = "Принято, обрабатываю…"
 logger = logging.getLogger(__name__)
@@ -67,10 +67,14 @@ class TelegramEventRouter:
 
     async def new_message(self, payload: dict[str, Any]) -> None:
         text = str(payload.get("text") or "").strip()
+        attachments = [
+            item for item in (payload.get("attachments") or [])
+            if isinstance(item, dict)
+        ]
         if (
             payload.get("outgoing")
             or payload.get("service")
-            or not text
+            or (not text and not attachments)
             or self._seen(payload)
         ):
             return
@@ -117,6 +121,8 @@ class TelegramEventRouter:
                 )
                 return
             is_admin = bool(payload.get("is_admin"))
+            if not text:
+                text = attachment_label(attachments)
             is_admin_command = text.lower().startswith(("/admin", "/system"))
             consult_match = CONSULT_CMD_RE.match(text) if is_admin else None
             if consult_match:
@@ -211,6 +217,8 @@ class TelegramEventRouter:
                 "is_admin": is_admin,
                 "admin_command": is_admin_command,
                 "telegram_history": history,
+                "attachments": [public_attachment(item) for item in attachments],
+                "_attachments": attachments,
             }
             logger.info(
                 "telegram.routing agent=%s phone=%s chat=%s admin=%s text=%r",

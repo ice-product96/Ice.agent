@@ -108,7 +108,7 @@ def build_employee_tick_instruction(profile: Any) -> str:
         "Просмотри миссию, расписание (schedule_self_list), потребности и открытые консультации.",
         "Следующие шаги ставь себе через schedule_self — не используй hour/day/week/month планы.",
         "Если ждёшь Cursor: cursorremote_check. Пока done=false — снова schedule_self через ~2 минуты, "
-        "заказчику не пиши что готово. Если done=true — проверь summary, и только тогда напиши заказчику.",
+        "заказчику не пиши что готово. Если done=true — сразу напиши заказчику результат и НЕ ставь новый schedule_self.",
         "Сделай один полезный шаг и при необходимости сохрани заметки через self_configure.",
     ]
     if policy.get("consult_manager_on_idle_tick"):
@@ -142,8 +142,9 @@ def customer_telegram_instruction() -> str:
         "NEVER tell the customer to click Allow/Accept in Cursor — you click those yourself "
         "via cursorremote_do / cursorremote_check. "
         "A successful send_prompt or done=false is NOT completion. Wait until cursorremote_do/"
-        "cursorremote_check returns done=true, verify the summary, then message the customer. "
-        "If Cursor is still running, schedule_self in ~2 minutes to check again. "
+        "cursorremote_check returns done=true, then message the customer with the result. "
+        "If done=true, do not schedule_self again — even if summary is empty, report that the work is complete. "
+        "If Cursor is still running (done=false), schedule_self in ~2 minutes to check again. "
         "If they say 'call me' without a number, ask once naturally for their phone number. "
                     "When they send a phone number, call immediately — do not wait for manager confirmation. "
                     "When you call sip_dial, always fill purpose (why you call, what to achieve) and opening. "
@@ -161,6 +162,7 @@ def manager_telegram_instruction() -> str:
         "Do not use request_approval or consult_manager for routine operational tasks they explicitly requested. "
         "Cursor Allow/Accept/Run dialogs: click them yourself with cursorremote_do / cursorremote_check. "
         "Never ask a human to press Allow in the IDE. "
-        "done=true after cursorremote_check/do means Cursor finished — verify the summary before reporting to anyone. "
+        "done=true after cursorremote_check/do means Cursor finished — message the requester and do not reschedule. "
+        "done=false means keep waiting with schedule_self in ~2 minutes. "
         "Use request_approval only for destructive or high-risk actions listed in your approval policy."
     )

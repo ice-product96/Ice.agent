@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import inspect
 import logging
 import random
@@ -18,6 +19,26 @@ from .tools import DangerousActionError, ToolRegistry
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 logger = logging.getLogger(__name__)
+
+MAX_TELEGRAM_ATTACHMENT_BYTES = 20 * 1024 * 1024
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+_AUDIO_EXTS = {".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
+_IMAGE_MIMES = {
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+}
+_KIND_LABELS = {
+    "image": "изображение",
+    "voice": "голосовое сообщение",
+    "audio": "аудиофайл",
+    "video": "видео",
+    "sticker": "стикер",
+    "file": "файл",
+}
 
 
 def telegram_topic_id(message: Any) -> int | None:
@@ -50,6 +71,136 @@ def telegram_json(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def classify_telegram_media(message: Any) -> dict[str, Any] | None:
+    """Return kind/mime/filename/size for a Telethon message, or None if there is no media."""
+    if message is None:
+        return None
+    file = getattr(message, "file", None)
+    has_media = any(
+        getattr(message, name, None) is not None
+        for name in (
+            "media",
+            "photo",
+            "voice",
+            "audio",
+            "video",
+            "video_note",
+            "sticker",
+            "gif",
+            "document",
+            "file",
+        )
+    )
+    if not has_media:
+        return None
+    mime = str(getattr(file, "mime_type", None) or "").strip().lower()
+    name = str(getattr(file, "name", None) or "")
+    ext = str(getattr(file, "ext", None) or "").strip().lower()
+    if ext and not ext.startswith("."):
+        ext = f".{ext}"
+    if not ext and "." in name:
+        ext = "." + name.rsplit(".", 1)[-1].lower()
+    size = int(getattr(file, "size", None) or 0)
+    if mime == "application/x-tgsticker":
+        kind = "sticker"
+    elif getattr(message, "voice", None) is not None:
+        kind = "voice"
+    elif getattr(message, "photo", None) is not None or mime in _IMAGE_MIMES or ext in _IMAGE_EXTS:
+        kind = "image"
+    elif getattr(message, "sticker", None) is not None and mime.startswith("image/"):
+        kind = "image"
+    elif getattr(message, "sticker", None) is not None:
+        kind = "sticker"
+    elif (
+        getattr(message, "audio", None) is not None
+        or mime.startswith("audio/")
+        or ext in _AUDIO_EXTS
+    ):
+        kind = "audio"
+    elif (
+        getattr(message, "video", None) is not None
+        or getattr(message, "video_note", None) is not None
+        or getattr(message, "gif", None) is not None
+        or mime.startswith("video/")
+    ):
+        kind = "video"
+    elif getattr(message, "document", None) is not None or file is not None:
+        kind = "file"
+    else:
+        return None
+    return {
+        "kind": kind,
+        "mime_type": mime,
+        "filename": name,
+        "size": size,
+    }
+
+
+def attachment_label(attachments: Iterable[dict[str, Any]]) -> str:
+    labels = [
+        _KIND_LABELS.get(str(item.get("kind") or ""), "вложение")
+        for item in attachments
+    ]
+    unique = [label for label in dict.fromkeys(labels) if label]
+    if not unique:
+        return ""
+    return "[Вложение: " + ", ".join(unique) + "]"
+
+
+def public_attachment(attachment: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in attachment.items() if key != "data_b64"}
+
+
+def event_messages(event: Any) -> list[Any]:
+    messages = getattr(event, "messages", None)
+    if messages:
+        return list(messages)
+    message = getattr(event, "message", None)
+    return [message] if message is not None else []
+
+
+async def _download_media_bytes(event: Any, message: Any) -> bytes | None:
+    client = getattr(event, "client", None) or getattr(message, "client", None)
+    if client is not None and getattr(client, "download_media", None):
+        data = await client.download_media(message, file=bytes)
+    elif getattr(message, "download_media", None):
+        data = await message.download_media(file=bytes)
+    else:
+        return None
+    return data if isinstance(data, bytes) else None
+
+
+async def collect_telegram_attachments(event: Any, messages: Iterable[Any]) -> list[dict[str, Any]]:
+    attachments: list[dict[str, Any]] = []
+    for message in messages:
+        meta = classify_telegram_media(message)
+        if meta is None:
+            continue
+        item = dict(meta)
+        kind = str(item.get("kind") or "")
+        download = kind in {"image", "voice", "audio"}
+        size = int(item.get("size") or 0)
+        if download and size > MAX_TELEGRAM_ATTACHMENT_BYTES:
+            item["skipped"] = "too_large"
+            download = False
+        if download:
+            try:
+                data = await _download_media_bytes(event, message)
+            except Exception as exc:
+                logger.warning("telegram media download failed: %s", exc)
+                item["download_error"] = str(exc)
+                data = None
+            if data:
+                if len(data) > MAX_TELEGRAM_ATTACHMENT_BYTES:
+                    item["skipped"] = "too_large"
+                    item["size"] = len(data)
+                else:
+                    item["data_b64"] = base64.b64encode(data).decode("ascii")
+                    item["size"] = len(data)
+        attachments.append(item)
+    return attachments
 
 
 def normalize_contact_phone(value: str) -> str:
@@ -106,16 +257,21 @@ def telegram_datetime(value: Any) -> str | None:
 
 
 def normalized_message(message: Any) -> dict[str, Any]:
+    text = str(
+        getattr(message, "message", None)
+        or getattr(message, "raw_text", None)
+        or ""
+    ).strip()
+    media = classify_telegram_media(message)
+    if not text and media is not None:
+        text = attachment_label([media])
     return {
         "id": getattr(message, "id", None),
         "date": telegram_datetime(getattr(message, "date", None)),
         "sender_id": getattr(message, "sender_id", None),
         "outgoing": bool(getattr(message, "out", False)),
-        "text": str(
-            getattr(message, "message", None)
-            or getattr(message, "raw_text", None)
-            or ""
-        ),
+        "text": text,
+        "media": media,
     }
 
 
@@ -312,7 +468,8 @@ class TelegramGateway:
         self.callbacks[event_name].append(callback)
 
     async def _dispatch(self, event_name: str, event: Any, phone: str) -> None:
-        message = getattr(event, "message", None)
+        messages = event_messages(event)
+        message = messages[0] if messages else getattr(event, "message", None)
         sender_id = getattr(event, "sender_id", None) or getattr(message, "sender_id", None)
         sender = getattr(event, "sender", None)
         if sender is None:
@@ -320,6 +477,9 @@ class TelegramGateway:
                 sender = await event.get_sender()
             except Exception:
                 sender = None
+        attachments: list[dict[str, Any]] = []
+        if event_name == "new_message" and messages:
+            attachments = await collect_telegram_attachments(event, messages)
         payload = {
             "event": event_name,
             "phone": phone,
@@ -335,16 +495,18 @@ class TelegramGateway:
             ),
             "text": (
                 getattr(event, "raw_text", None)
+                or getattr(event, "text", None)
                 or getattr(message, "message", None)
                 or ""
             ),
             "outgoing": bool(getattr(event, "out", False) or getattr(message, "out", False)),
             "service": bool(getattr(message, "action", None)),
             "callback_data": telegram_json(getattr(event, "data", None)),
+            "attachments": attachments,
             "data": telegram_json(event),
         }
         logger.info(
-            "telegram.%s phone=%s chat=%s sender=%s admin=%s out=%s text=%r",
+            "telegram.%s phone=%s chat=%s sender=%s admin=%s out=%s text=%r attachments=%s",
             event_name,
             phone,
             payload.get("chat_id"),
@@ -352,6 +514,15 @@ class TelegramGateway:
             payload.get("is_admin"),
             payload.get("outgoing"),
             str(payload.get("text") or "")[:120],
+            [
+                {
+                    "kind": item.get("kind"),
+                    "mime": item.get("mime_type"),
+                    "bytes": item.get("size"),
+                    "has_data": bool(item.get("data_b64")),
+                }
+                for item in attachments
+            ],
         )
         results = await asyncio.gather(
             *(callback(payload) for callback in self.callbacks[event_name]),
@@ -371,6 +542,11 @@ class TelegramGateway:
         from telethon import events
 
         async def new_message(event: Any) -> None:
+            if getattr(event, "grouped_id", None):
+                return
+            await self._dispatch("new_message", event, phone)
+
+        async def album(event: Any) -> None:
             await self._dispatch("new_message", event, phone)
 
         async def message_edited(event: Any) -> None:
@@ -380,6 +556,7 @@ class TelegramGateway:
             await self._dispatch("callback_query", event, phone)
 
         client.add_event_handler(new_message, events.NewMessage())
+        client.add_event_handler(album, events.Album())
         client.add_event_handler(message_edited, events.MessageEdited())
         client.add_event_handler(callback_query, events.CallbackQuery())
 

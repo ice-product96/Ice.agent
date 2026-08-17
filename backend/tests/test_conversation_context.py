@@ -202,6 +202,7 @@ def test_telegram_history_normalization_and_timezone_validation() -> None:
         "sender_id": 42,
         "outgoing": False,
         "text": "hello",
+        "media": None,
     }
     with pytest.raises(ValueError):
         RuntimeSettingsBody(timezone="Not/A_Real_Zone")

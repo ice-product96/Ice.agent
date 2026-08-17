@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import logging
 import os
 from contextlib import AsyncExitStack
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -15,6 +18,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from .tool_plane import schemas_for_tool_plane
 from .tools import MAX_LLM_TOOLS, ToolRegistry
 
+logger = logging.getLogger(__name__)
+
 
 def _chat_tools_need_no_reasoning(model: str) -> bool:
     """gpt-5.6-* rejects tools + reasoning_effort on /v1/chat/completions."""
@@ -24,6 +29,175 @@ def _chat_tools_need_no_reasoning(model: str) -> bool:
 def _is_tools_reasoning_conflict(exc: BaseException) -> bool:
     text = str(exc).lower()
     return "reasoning_effort" in text and "function tools" in text
+
+
+def _attachment_mime(attachment: dict[str, Any]) -> str:
+    mime = str(attachment.get("mime_type") or "").strip().lower()
+    if mime == "image/jpg":
+        return "image/jpeg"
+    return mime
+
+
+def _audio_input_format(attachment: dict[str, Any]) -> str | None:
+    mime = _attachment_mime(attachment)
+    name = str(attachment.get("filename") or "").lower()
+    ext = name.rsplit(".", 1)[-1] if "." in name else ""
+    if mime.endswith("wav") or ext in {"wav", "wave"}:
+        return "wav"
+    if mime.endswith("mp3") or mime.endswith("mpeg") or ext == "mp3":
+        return "mp3"
+    return None
+
+
+def llm_user_content(
+    text: str,
+    attachments: list[dict[str, Any]] | None = None,
+) -> str | list[dict[str, Any]]:
+    """Build chat-completions user content, attaching images and supported audio."""
+    parts: list[dict[str, Any]] = []
+    body = str(text or "").strip()
+    if body:
+        parts.append({"type": "text", "text": body})
+    for attachment in attachments or []:
+        data_b64 = attachment.get("data_b64")
+        if not data_b64:
+            continue
+        kind = str(attachment.get("kind") or "")
+        if kind == "image":
+            mime = _attachment_mime(attachment) or "image/jpeg"
+            if not mime.startswith("image/"):
+                mime = "image/jpeg"
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{data_b64}"},
+                }
+            )
+        elif kind in {"voice", "audio"}:
+            fmt = _audio_input_format(attachment)
+            if fmt:
+                parts.append(
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": data_b64, "format": fmt},
+                    }
+                )
+    if not parts:
+        return body
+    if len(parts) == 1 and parts[0].get("type") == "text":
+        return parts[0]["text"]
+    if not any(part.get("type") == "text" for part in parts):
+        parts.insert(0, {"type": "text", "text": "Пользователь отправил вложение."})
+    return parts
+
+
+async def ingest_attachments_for_llm(
+    client: LLMClient,
+    text: str,
+    attachments: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Transcribe voice/audio and keep binary attachments for the chat request."""
+    lines: list[str] = []
+    caption = str(text or "").strip()
+    if caption:
+        lines.append(caption)
+    image_count = 0
+    for attachment in attachments:
+        kind = str(attachment.get("kind") or "")
+        if kind in {"voice", "audio"} and attachment.get("data_b64"):
+            label = "Голосовое сообщение" if kind == "voice" else "Аудиофайл"
+            try:
+                raw = base64.b64decode(attachment["data_b64"])
+                transcript = (
+                    await client.transcribe_audio(
+                        raw,
+                        filename=str(
+                            attachment.get("filename")
+                            or ("voice.ogg" if kind == "voice" else "audio.mp3")
+                        ),
+                    )
+                ).strip()
+            except Exception as exc:
+                logger.warning("audio transcription failed: %s", exc)
+                transcript = ""
+                attachment["transcript_error"] = str(exc)
+            attachment["transcript"] = transcript
+            if transcript:
+                lines.append(f"[{label}]: {transcript}")
+            else:
+                lines.append(f"[{label}: речь не распознана]")
+        elif kind == "image":
+            image_count += 1
+        elif kind == "video":
+            lines.append("[Видео]")
+        elif kind == "file":
+            name = attachment.get("filename") or attachment.get("mime_type") or "вложение"
+            lines.append(f"[Файл: {name}]")
+        elif kind == "sticker":
+            lines.append("[Стикер]")
+    if image_count and not caption:
+        lines.insert(
+            0,
+            "[Изображение]" if image_count == 1 else f"[Изображения: {image_count}]",
+        )
+    return "\n".join(line for line in lines if line).strip(), attachments
+
+
+def _messages_have_media(messages: list[dict[str, Any]]) -> bool:
+    for item in messages:
+        content = item.get("content")
+        if isinstance(content, list) and any(
+            isinstance(part, dict)
+            and part.get("type") in {"image_url", "input_audio", "file"}
+            for part in content
+        ):
+            return True
+    return False
+
+
+def _flatten_message_content(content: Any) -> str:
+    if isinstance(content, str) or content is None:
+        return content or ""
+    if not isinstance(content, list):
+        return str(content)
+    texts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind == "text":
+            texts.append(str(part.get("text") or ""))
+        elif kind == "image_url":
+            texts.append("[изображение]")
+        elif kind == "input_audio":
+            texts.append("[аудио]")
+    return "\n".join(item for item in texts if item)
+
+
+def _text_only_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    flattened: list[dict[str, Any]] = []
+    for item in messages:
+        cloned = dict(item)
+        if "content" in cloned:
+            cloned["content"] = _flatten_message_content(cloned.get("content"))
+        flattened.append(cloned)
+    return flattened
+
+
+def _looks_like_multimodal_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        needle in text
+        for needle in (
+            "image_url",
+            "input_audio",
+            "unsupported content",
+            "invalid content",
+            "does not support",
+            "vision",
+            "modalit",
+        )
+    )
 
 
 class LLMClient:
@@ -88,6 +262,22 @@ class LLMClient:
                 conversation.append({"role": "tool", "tool_call_id": call.id, "content": content})
         raise RuntimeError("Maximum tool-call rounds exceeded")
 
+    async def transcribe_audio(
+        self,
+        data: bytes,
+        *,
+        filename: str = "voice.ogg",
+    ) -> str:
+        if not data:
+            return ""
+        buffer = BytesIO(data)
+        buffer.name = filename or "voice.ogg"
+        result = await self.client.audio.transcriptions.create(
+            model="whisper-1",
+            file=buffer,
+        )
+        return str(getattr(result, "text", None) or "").strip()
+
     async def _chat_complete(
         self,
         conversation: list[dict[str, Any]],
@@ -107,6 +297,12 @@ class LLMClient:
         except APIStatusError as exc:
             if tool_schemas and reasoning_effort != "none" and _is_tools_reasoning_conflict(exc):
                 kwargs["reasoning_effort"] = "none"
+                return await self.client.chat.completions.create(**kwargs)
+            if _looks_like_multimodal_error(exc) and _messages_have_media(conversation):
+                text_only = _text_only_messages(conversation)
+                conversation[:] = text_only
+                kwargs["messages"] = conversation
+                logger.warning("LLM rejected multimodal content; retrying text-only")
                 return await self.client.chat.completions.create(**kwargs)
             raise
 
@@ -678,11 +874,33 @@ def exception_text(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
+def mcp_session_dead(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    needles = (
+        "session terminated",
+        "session closed",
+        "connection closed",
+        "not connected",
+        "closed resource",
+        "broken pipe",
+        "connection reset",
+    )
+    return any(needle in text for needle in needles) or name in {
+        "closedresourceerror",
+        "connectionreseterror",
+        "brokenpipeerror",
+    }
+
+
 class McpManager:
     def __init__(self) -> None:
         self.sessions: dict[str, Any] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stops: dict[str, asyncio.Event] = {}
+        self._configs: dict[str, dict[str, Any]] = {}
+        self._reconnect_tasks: dict[str, asyncio.Task[None]] = {}
+        self._closing = False
 
     async def _run_connection(
         self,
@@ -755,18 +973,41 @@ class McpManager:
                 self.sessions[name] = session
                 if not ready.done():
                     ready.set_result(None)
-                await stop.wait()
+                while not stop.is_set():
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=20)
+                        break
+                    except TimeoutError:
+                        ping = getattr(session, "send_ping", None)
+                        if ping is None:
+                            continue
+                        try:
+                            await asyncio.wait_for(ping(), timeout=8)
+                        except Exception as exc:
+                            logger.warning(
+                                "MCP session %s died: %s",
+                                name,
+                                exception_text(exc),
+                            )
+                            break
+        except asyncio.CancelledError:
+            if not ready.done():
+                ready.cancel()
+            raise
         except BaseException as exc:
             if not ready.done():
                 ready.set_exception(exc)
-            elif not isinstance(exc, asyncio.CancelledError):
-                raise
+            else:
+                logger.warning("MCP connection %s ended: %s", name, exception_text(exc))
         finally:
             if self.sessions.get(name) is session:
                 self.sessions.pop(name, None)
+            if not stop.is_set() and not self._closing and self._configs.get(name):
+                self._schedule_reconnect(name)
 
     async def hot_reload(self, name: str, config: dict[str, Any]) -> None:
-        await self.disconnect(name)
+        self._configs[name] = dict(config)
+        await self.disconnect(name, forget=False)
         stop = asyncio.Event()
         ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         task = asyncio.create_task(
@@ -785,7 +1026,12 @@ class McpManager:
             self._tasks.pop(name, None)
             raise
 
-    async def disconnect(self, name: str) -> None:
+    async def disconnect(self, name: str, *, forget: bool = True) -> None:
+        if forget:
+            self._configs.pop(name, None)
+            reconnect = self._reconnect_tasks.pop(name, None)
+            if reconnect is not None and not reconnect.done():
+                reconnect.cancel()
         stop = self._stops.pop(name, None)
         task = self._tasks.pop(name, None)
         if stop is not None:
@@ -794,15 +1040,59 @@ class McpManager:
             await asyncio.gather(task, return_exceptions=True)
         self.sessions.pop(name, None)
 
+    def _schedule_reconnect(self, name: str) -> None:
+        if self._closing or not self._configs.get(name):
+            return
+        existing = self._reconnect_tasks.get(name)
+        if existing is not None and not existing.done():
+            return
+        self._reconnect_tasks[name] = asyncio.create_task(
+            self._reconnect_loop(name),
+            name=f"mcp-reconnect-{name}",
+        )
+
+    async def _reconnect_loop(self, name: str) -> None:
+        delay = 2.0
+        while not self._closing and name in self._configs and name not in self.sessions:
+            logger.info("MCP reconnecting %s in %.0fs", name, delay)
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            if self._closing or name not in self._configs or name in self.sessions:
+                return
+            config = self._configs.get(name)
+            if not config:
+                return
+            try:
+                await self.hot_reload(name, config)
+                logger.info("MCP reconnected %s", name)
+                return
+            except Exception as exc:
+                logger.warning("MCP reconnect failed for %s: %s", name, exception_text(exc))
+                delay = min(delay * 2, 60.0)
+
     async def register_tools(
         self,
         registry: ToolRegistry,
         server_names: set[str] | None = None,
     ) -> None:
-        for server_name, session in self.sessions.items():
+        for server_name, session in list(self.sessions.items()):
             if server_names is not None and server_name not in server_names:
                 continue
-            result = await session.list_tools()
+            try:
+                async with asyncio.timeout(8):
+                    result = await session.list_tools()
+            except Exception as exc:
+                logger.warning(
+                    "MCP list_tools failed for %s: %s — skipping this turn",
+                    server_name,
+                    exception_text(exc),
+                )
+                if self.sessions.get(server_name) is session:
+                    self.sessions.pop(server_name, None)
+                self._schedule_reconnect(server_name)
+                continue
             self._register_mcp_gateway(registry, server_name, list(result.tools))
 
     def _register_mcp_gateway(
@@ -816,7 +1106,10 @@ class McpManager:
         async def list_tools() -> list[dict[str, Any]]:
             items = definitions
             if items is None:
-                result = await self.sessions[server_name].list_tools()
+                session = self.sessions.get(server_name)
+                if session is None:
+                    raise RuntimeError(f"MCP server '{server_name}' is disconnected")
+                result = await session.list_tools()
                 items = list(result.tools)
             if not catalog:
                 catalog.extend(items)
@@ -835,8 +1128,24 @@ class McpManager:
             tool_name = str(tool or "").strip()
             if not tool_name:
                 raise ValueError("tool name is required")
+            session = self.sessions.get(server_name)
+            if session is None:
+                self._schedule_reconnect(server_name)
+                raise RuntimeError(
+                    f"MCP server '{server_name}' is disconnected; retry after it reconnects"
+                )
             kwargs = dict(arguments or {})
-            response = await self.sessions[server_name].call_tool(tool_name, kwargs)
+            try:
+                response = await session.call_tool(tool_name, kwargs)
+            except Exception as exc:
+                if mcp_session_dead(exc):
+                    if self.sessions.get(server_name) is session:
+                        self.sessions.pop(server_name, None)
+                    self._schedule_reconnect(server_name)
+                    raise RuntimeError(
+                        f"MCP server '{server_name}' session ended: {exception_text(exc)}"
+                    ) from exc
+                raise
             content = [item.model_dump() for item in response.content]
             if getattr(response, "isError", False):
                 detail = "; ".join(str(item.get("text") or item) for item in content)
@@ -846,7 +1155,10 @@ class McpManager:
 
                 approvals: list[dict[str, Any]] = []
                 for _ in range(3):
-                    clicked = await click_pending_approvals(self.sessions[server_name])
+                    live = self.sessions.get(server_name)
+                    if live is None:
+                        break
+                    clicked = await click_pending_approvals(live)
                     if not clicked:
                         break
                     approvals.extend(clicked)
@@ -893,7 +1205,11 @@ class McpManager:
         )
 
     async def close(self) -> None:
-        names = set(self.sessions) | set(self._tasks)
+        self._closing = True
+        for task in list(self._reconnect_tasks.values()):
+            task.cancel()
+        self._reconnect_tasks.clear()
+        names = set(self.sessions) | set(self._tasks) | set(self._configs)
         await asyncio.gather(
             *(self.disconnect(name) for name in names),
             return_exceptions=True,

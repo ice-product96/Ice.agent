@@ -69,14 +69,14 @@ playwright (MCP):
 Cursor IDE (cursorremote_do / cursorremote_check):
 - Задачу в Cursor отдавай через cursorremote_do("что сделать"). Allow/Accept/Run нажимает платформа сама.
 - Никогда не проси человека нажать Allow в IDE.
-- done=true — Cursor закончил. Проверь summary. Только после этого пиши заказчику, что готово.
+- done=true — Cursor закончил. Напиши заказчику результат и НЕ ставь новый schedule_self.
 - done=false или один send_prompt — это НЕ готовность. schedule_self через ~2 минуты: cursorremote_check и снова ждать.
 - Не используй hour/day/week/month планы. Следующие шаги — только schedule_self.
 `
 
 const statusLabel: Record<string, string> = {
   online: 'онлайн', offline: 'офлайн', pending: 'ожидание', paused: 'пауза',
-  error: 'ошибка', active: 'активен',
+  error: 'ошибка', active: 'активен', completed: 'выполнено',
 }
 
 const taskStatusLabel: Record<string, string> = {
@@ -1178,7 +1178,7 @@ function EmployeeScreen() {
       </section>
 
       <section className="panel">
-        <SectionHead title={`Расписание (${(state.jobs || []).length})`} text="Штатное расписание агента. Следующие шаги сотрудник ставит себе через schedule_self."/>
+        <SectionHead title={`Расписание (${(state.jobs || []).filter(j => cronJobStatus(j) === 'active').length} активных)`} text="Штатное расписание агента. Разовые после запуска — выполненные, не пауза."/>
         {(state.jobs || []).length === 0 ? <Empty icon={CalendarClock} title="Задач в расписании нет" text="Heartbeat и разовые follow-up (например проверка Cursor) появятся здесь."/> :
           <div className="list-panel">{(state.jobs || []).map(job => <div className="server-row" key={job.id}>
             <span className="chip">{job.run_once_at ? 'once' : 'cron'}</span>
@@ -1186,7 +1186,7 @@ function EmployeeScreen() {
               <strong>{job.name}</strong>
               <small>{job.run_once_at ? new Date(job.run_once_at).toLocaleString() : job.schedule}{job.prompt ? ` · ${job.prompt.slice(0, 160)}` : ''}</small>
             </div>
-            <StatusDot status={job.enabled ? 'online' : 'paused'}/>
+            <StatusDot status={cronJobStatus(job)}/>
           </div>)}</div>}
       </section>
 
@@ -1373,14 +1373,42 @@ function cronScheduleLabel(job: CronJob) {
     return `Однократно: ${job.run_once_at} · ${job.timezone}`
   }
 }
+function cronJobStatus(job: CronJob): Status {
+  if (job.status === 'completed' || job.status === 'active' || job.status === 'paused') return job.status
+  if (job.enabled) return 'active'
+  if (job.run_once_at && job.last_run_at) return 'completed'
+  return 'paused'
+}
+
+const cronFilterLabel: Record<'active' | 'completed' | 'paused' | 'all', string> = {
+  active: 'Активные', completed: 'Выполненные', paused: 'Пауза', all: 'Все',
+}
+
 function CronScreen() {
   const jobs = useLoad(api.cron.list, []); const agents = useLoad(api.agents.list, []); const data = jobs.data || []
   const [editing, setEditing] = useState<Partial<CronJob> | null>(null); const [deleting, setDeleting] = useState<CronJob | null>(null)
+  const [filter, setFilter] = useState<'active' | 'completed' | 'paused' | 'all'>('active')
   if (jobs.loading || agents.loading) return <Loading/>
+  const counts = {
+    active: data.filter(j => cronJobStatus(j) === 'active').length,
+    completed: data.filter(j => cronJobStatus(j) === 'completed').length,
+    paused: data.filter(j => cronJobStatus(j) === 'paused').length,
+    all: data.length,
+  }
+  const visible = data.filter(j => filter === 'all' || cronJobStatus(j) === filter)
   return <>
-    {(jobs.error || agents.error) && <Alert message={jobs.error || agents.error}/>}<SectionHead title={`${data.length} расписаний`} text="Автономные задачи по cron" action={<button className="primary" onClick={() => setEditing({ ...emptyCron, agent_id: agents.data?.[0]?.id || '' })}><Plus size={17}/>Новое расписание</button>}/>
+    {(jobs.error || agents.error) && <Alert message={jobs.error || agents.error}/>}
+    <SectionHead title={`${data.length} расписаний`} text="Автономные задачи по cron. Разовые после запуска помечаются как выполненные, не как пауза." action={<button className="primary" onClick={() => setEditing({ ...emptyCron, agent_id: agents.data?.[0]?.id || '' })}><Plus size={17}/>Новое расписание</button>}/>
+    <div className="chip-row" style={{ margin: '0 0 14px' }}>
+      {(['active', 'completed', 'paused', 'all'] as const).map(id => (
+        <button type="button" key={id} className={`chip ${filter === id ? 'on' : ''}`} onClick={() => setFilter(id)}>
+          {cronFilterLabel[id]} · {counts[id]}
+        </button>
+      ))}
+    </div>
     {data.length === 0 ? <Empty icon={CalendarClock} title="Нет запланированных задач" text="Запланируйте повторяющиеся промпты для любого настроенного агента."/> :
-    <div className="list-panel">{data.map(job => <div className="server-row" key={job.id}><span className="entity-avatar amber"><CalendarClock/></span><div className="grow"><strong>{job.name}</strong><small>{cronScheduleLabel(job)}</small></div><span className="chip">{agents.data?.find(a => a.id === job.agent_id)?.name || job.agent_id}</span><StatusDot status={job.enabled ? (job.status || 'active') : 'paused'}/><button className="secondary compact" onClick={() => setEditing(job)}>Изменить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(job)}><Trash2 size={17}/></button></div>)}</div>}
+    visible.length === 0 ? <Empty icon={CalendarClock} title="Нет задач в этом фильтре" text="Переключите статус, чтобы увидеть остальные расписания."/> :
+    <div className="list-panel">{visible.map(job => <div className="server-row" key={job.id}><span className="entity-avatar amber"><CalendarClock/></span><div className="grow"><strong>{job.name}</strong><small>{cronScheduleLabel(job)}</small></div><span className="chip">{agents.data?.find(a => a.id === job.agent_id)?.name || job.agent_id}</span><StatusDot status={cronJobStatus(job)}/><button className="secondary compact" onClick={() => setEditing(job)}>Изменить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(job)}><Trash2 size={17}/></button></div>)}</div>}
     {editing && <CronForm value={editing} agents={agents.data || []} onClose={() => setEditing(null)} onSave={async v => { const saved = v.id ? await api.cron.update(v.id, v) : await api.cron.create(v as Omit<CronJob, 'id'>); jobs.setData(v.id ? data.map(j => j.id === saved.id ? saved : j) : [...data, saved]); setEditing(null) }}/>}
     {deleting && <ConfirmDelete name={deleting.name} onClose={() => setDeleting(null)} onDelete={async () => { await api.cron.remove(deleting.id); jobs.setData(data.filter(j => j.id !== deleting.id)) }}/>}
   </>

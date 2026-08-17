@@ -28,6 +28,12 @@ FOLLOW_UP_HINT = (
     "done=false or after a mere send_prompt."
 )
 
+DONE_HINT = (
+    "Cursor finished (done=true). Do NOT call schedule_self again. "
+    "Write a short result to the person who asked for this work in the original Telegram chat. "
+    "If summary is empty, still report that Cursor is idle and the task is complete."
+)
+
 NOT_STARTED_HINT = (
     "Cursor did not start working after the prompt. Check get_status / workspace, retry "
     "cursorremote_do once if needed, or schedule_self to retry. Do not tell the customer it is done."
@@ -35,22 +41,29 @@ NOT_STARTED_HINT = (
 
 
 def parse_mcp_payload(content: Any) -> Any:
-    if isinstance(content, dict) and "text" in content and len(content) <= 3:
+    if isinstance(content, dict) and "text" in content:
         text = content.get("text")
         if isinstance(text, str):
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
+            stripped = text.strip()
+            if stripped[:1] in "{[":
+                try:
+                    return parse_mcp_payload(json.loads(stripped))
+                except json.JSONDecodeError:
+                    pass
+            if len(content) <= 3:
                 return text
     if isinstance(content, list):
         if len(content) == 1:
             return parse_mcp_payload(content[0])
         return [parse_mcp_payload(item) for item in content]
     if isinstance(content, str):
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            return content
+        stripped = content.strip()
+        if stripped[:1] in "{[":
+            try:
+                return parse_mcp_payload(json.loads(stripped))
+            except json.JSONDecodeError:
+                return content
+        return content
     return content
 
 
@@ -63,14 +76,23 @@ async def mcp_call(session: Any, tool: str, arguments: dict[str, Any] | None = N
     return parse_mcp_payload(content)
 
 
+def _as_status_dict(status: Any) -> dict[str, Any] | None:
+    data = parse_mcp_payload(status)
+    if isinstance(data, list) and data:
+        data = parse_mcp_payload(data[0])
+    return data if isinstance(data, dict) else None
+
+
 def cursor_is_busy(status: Any) -> bool:
-    if not isinstance(status, dict):
+    data = _as_status_dict(status)
+    if not data:
         return False
-    if int(status.get("pendingApprovalCount") or 0) > 0:
+    if int(data.get("pendingApprovalCount") or 0) > 0:
         return True
-    if status.get("agentActivityLive"):
+    if data.get("agentActivityLive"):
         return True
-    return str(status.get("agentStatus") or "").strip().lower() in BUSY_STATUSES
+    name = str(data.get("agentStatus") or data.get("status") or "").strip().lower()
+    return name in BUSY_STATUSES
 
 
 def summarize_cursor_state(state: Any) -> str:
@@ -201,8 +223,7 @@ def _result(
         "last": last,
         "messages": (state or {}).get("messages") if isinstance(state, dict) else [],
     }
-    if not done:
-        payload["next"] = hint or FOLLOW_UP_HINT
+    payload["next"] = DONE_HINT if done else (hint or FOLLOW_UP_HINT)
     return payload
 
 

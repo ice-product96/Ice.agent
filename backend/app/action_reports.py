@@ -22,6 +22,15 @@ READ_ONLY_TOOLS = {
     "telegram_get_entity",
     "telegram_download_media",
     "telegram_acknowledge_read",
+    "cursorremote_check",
+    "schedule_self_list",
+}
+
+INTERNAL_FOLLOWUP_TOOLS = {
+    "cursorremote_check",
+    "schedule_self",
+    "schedule_self_list",
+    "schedule_self_cancel",
 }
 
 
@@ -58,6 +67,28 @@ def side_effect_calls(audit: list[dict[str, Any]] | None) -> list[dict[str, Any]
     ]
 
 
+def audit_tool_result(call: dict[str, Any]) -> Any:
+    result = call.get("result")
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except json.JSONDecodeError:
+            return result
+    return result
+
+
+def cursor_finished_in_audit(audit: list[dict[str, Any]] | None) -> bool:
+    for call in reversed(audit or []):
+        tool = str(call.get("tool") or "")
+        if tool not in {"cursorremote_check", "cursorremote_do"}:
+            continue
+        if call.get("status") != "success":
+            return False
+        payload = audit_tool_result(call)
+        return isinstance(payload, dict) and bool(payload.get("done"))
+    return False
+
+
 def format_admin_action_report(
     *,
     agent_name: str,
@@ -66,8 +97,20 @@ def format_admin_action_report(
     chat_id: Any = None,
     sender_id: Any = None,
     sender_username: str | None = None,
+    source: Any = None,
 ) -> str | None:
     """Build a Russian admin digest for mutating tool calls, or None if none."""
+    src = str(source or "").strip()
+    if src in {"scheduled", "employee_tick", "employee_heartbeat"}:
+        extra = [
+            call
+            for call in (audit or [])
+            if isinstance(call, dict)
+            and is_side_effect_tool(str(call.get("tool") or ""))
+            and str(call.get("tool") or "") not in INTERNAL_FOLLOWUP_TOOLS
+        ]
+        if not extra:
+            return None
     calls = side_effect_calls(audit)
     if not calls:
         return None

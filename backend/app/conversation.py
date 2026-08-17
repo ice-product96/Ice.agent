@@ -9,6 +9,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import ConversationState, MessageLog, RuntimeSettings, utcnow
+from .telegram import public_attachment
 
 Summarizer = Callable[[str], Awaitable[str]]
 
@@ -336,9 +337,13 @@ class ConversationContextService:
                 message_at=event_at,
                 text=message,
                 metadata_json={
-                    key: value
+                    key: (
+                        [public_attachment(item) for item in value]
+                        if key == "attachments" and isinstance(value, list)
+                        else value
+                    )
                     for key, value in context.items()
-                    if key not in {"telegram_history", "_outbound_log_id"}
+                    if key not in {"telegram_history", "_outbound_log_id", "_attachments"}
                 },
             )
             db.add(inbound)

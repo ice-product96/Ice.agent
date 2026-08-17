@@ -132,22 +132,24 @@ async def lifespan(app: FastAPI):
 
     async def connect_mcp(server: McpServer) -> None:
         stop = mcp_startup_stops[server.id]
+        config = {
+            "transport": server.transport,
+            "command": server.command,
+            "args": server.args,
+            "url": server.url,
+            "env": json.loads(secrets.decrypt(server.env_ciphertext) or "{}"),
+        }
         try:
-            async with asyncio.timeout(15):
-                await mcp.hot_reload(server.name, {
-                    "transport": server.transport,
-                    "command": server.command,
-                    "args": server.args,
-                    "url": server.url,
-                    "env": json.loads(secrets.decrypt(server.env_ciphertext) or "{}"),
-                })
-            # Keep ownership of AnyIO cancel scopes in this task until shutdown.
+            try:
+                async with asyncio.timeout(15):
+                    await mcp.hot_reload(server.name, config)
+            except Exception as exc:
+                await events.publish(
+                    "mcp.connection_failed",
+                    {"server": server.name, "error": exception_text(exc)},
+                )
+            # Hold this task until shutdown so McpManager can reconnect in the background.
             await stop.wait()
-        except BaseException as exc:
-            await events.publish(
-                "mcp.connection_failed",
-                {"server": server.name, "error": exception_text(exc)},
-            )
         finally:
             await mcp.disconnect(server.name)
 
@@ -178,12 +180,13 @@ async def lifespan(app: FastAPI):
                 )
                 return
             result = await runtime.run(db, agent, str(payload.get("message", "")), payload)
-            if payload.get("reply_to_chat"):
+            if payload.get("_deliver_origin_reply"):
                 phone = payload.get("reply_phone")
                 chat_id = payload.get("reply_chat_id")
-                if phone and chat_id:
+                text = (result or "").strip()
+                if phone and chat_id and text:
                     entity = int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
-                    await telegram.send_message(str(phone), entity, result)
+                    await telegram.send_message(str(phone), entity, text)
 
     scheduler = CronManager(SessionLocal, run_scheduled)
     runtime.bind_scheduler(scheduler)

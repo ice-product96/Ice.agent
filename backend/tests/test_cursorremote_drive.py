@@ -17,8 +17,13 @@ class _Item:
 
     def model_dump(self) -> dict:
         if isinstance(self.payload, str):
-            return {"type": "text", "text": self.payload}
-        return {"type": "text", "text": json.dumps(self.payload)}
+            return {"type": "text", "text": self.payload, "annotations": None}
+        return {
+            "type": "text",
+            "text": json.dumps(self.payload),
+            "annotations": None,
+            "_meta": {},
+        }
 
 
 class _Resp:
@@ -53,6 +58,19 @@ def test_parse_mcp_json_text() -> None:
     assert payload["pendingApprovalCount"] == 1
 
 
+def test_parse_mcp_json_text_with_extra_keys() -> None:
+    payload = parse_mcp_payload(
+        {
+            "type": "text",
+            "text": '{"agentStatus": "waiting_approval", "pendingApprovalCount": 1}',
+            "annotations": None,
+            "_meta": {},
+        }
+    )
+    assert payload["pendingApprovalCount"] == 1
+    assert cursor_is_busy(payload)
+
+
 def test_approval_actions_skip_reject() -> None:
     pending = [
         {
@@ -72,6 +90,13 @@ def test_cursor_is_busy_statuses() -> None:
     assert cursor_is_busy({"agentStatus": "thinking"})
     assert cursor_is_busy({"agentStatus": "idle", "agentActivityLive": True})
     assert cursor_is_busy({"agentStatus": "idle", "pendingApprovalCount": 2})
+    assert cursor_is_busy(
+        {
+            "type": "text",
+            "text": '{"agentStatus": "waiting_approval", "pendingApprovalCount": 1}',
+            "annotations": None,
+        }
+    )
     assert not cursor_is_busy({"agentStatus": "idle", "pendingApprovalCount": 0})
 
 
@@ -125,6 +150,7 @@ def test_drive_returns_done_after_busy_then_idle() -> None:
     assert result["done"] is True
     assert result["status"] == "idle"
     assert "LAVVE changes applied" in result["summary"]
+    assert "Do NOT call schedule_self" in result["next"]
 
 
 def test_drive_timeout_while_working() -> None:
@@ -154,3 +180,17 @@ def test_check_idle_is_done() -> None:
     result = asyncio.run(check_and_drive(session, timeout_ms=500, idle_debounce_ms=0))
     assert result["done"] is True
     assert "Already finished" in result["summary"]
+
+
+def test_check_does_not_finish_on_waiting_approval() -> None:
+    waiting = {
+        "agentStatus": "waiting_approval",
+        "pendingApprovalCount": 1,
+        "agentActivityLive": False,
+    }
+    session = ScriptSession(
+        {"wait": [{"status": "timeout"} for _ in range(20)]},
+        default=waiting,
+    )
+    result = asyncio.run(check_and_drive(session, timeout_ms=80, idle_debounce_ms=0))
+    assert result["done"] is False

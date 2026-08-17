@@ -25,7 +25,7 @@ from .db import (
     agent_mcp_servers,
     utcnow,
 )
-from .action_reports import format_admin_action_report
+from .action_reports import cursor_finished_in_audit, format_admin_action_report
 from .employee import (
     AGENT_EDITABLE_SECTIONS,
     NEED_KINDS,
@@ -40,7 +40,14 @@ from .employee import (
     need_json,
 )
 from .events import EventHub
-from .integrations import LLMClient, McpManager, MemoryStore, WebSearch
+from .integrations import (
+    LLMClient,
+    McpManager,
+    MemoryStore,
+    WebSearch,
+    ingest_attachments_for_llm,
+    llm_user_content,
+)
 from .employee_policy import (
     approval_required_for_tool,
     build_employee_tick_instruction,
@@ -542,6 +549,7 @@ class AgentRuntime:
             )
             registry.register(sip_hangup, "sip_hangup", "Hang up an active SIP call")
             registry.register(sip_status, "sip_status", "SIP registration and active call status")
+        cursor_state = {"finished": False}
         if self.mcp and mcp_server_names:
             await self.mcp.register_tools(registry, mcp_server_names)
             cursor_session = next(
@@ -559,11 +567,17 @@ class AgentRuntime:
 
                 async def cursorremote_do(prompt: str) -> dict[str, Any]:
                     """Send a task to Cursor IDE, auto-click Allow/Accept/Run, wait until it actually finishes or times out."""
-                    return await send_prompt_and_drive(cursor_session, prompt)
+                    result = await send_prompt_and_drive(cursor_session, prompt)
+                    if result.get("done"):
+                        cursor_state["finished"] = True
+                    return result
 
                 async def cursorremote_check() -> dict[str, Any]:
                     """Poll Cursor for an already sent task: click Allow if needed, return done=true only when idle after work."""
-                    return await check_and_drive(cursor_session)
+                    result = await check_and_drive(cursor_session)
+                    if result.get("done"):
+                        cursor_state["finished"] = True
+                    return result
 
                 registry.register(
                     cursorremote_do,
@@ -572,8 +586,8 @@ class AgentRuntime:
                         "Give Cursor a coding task in the attached workspace. "
                         "Clicks Allow/Accept/Run itself. Returns done=true only after Cursor "
                         "finished (not when it merely started). If done=false, schedule_self "
-                        "in ~2 minutes to cursorremote_check. Do not tell the customer it is ready "
-                        "until done=true and you verified the summary."
+                        "in ~2 minutes to cursorremote_check. If done=true, message the requester "
+                        "and do not schedule another check."
                     ),
                 )
                 registry.register(
@@ -581,8 +595,8 @@ class AgentRuntime:
                     "cursorremote_check",
                     (
                         "Check an already running Cursor job. Clicks Allow/Accept. "
-                        "done=true means finished — verify summary then write to the customer. "
-                        "done=false means still working — schedule_self again, do not report ready."
+                        "done=true means finished — write to the original Telegram chat, "
+                        "do not schedule_self. done=false means still working — schedule_self again."
                     ),
                 )
         if self.task_bus:
@@ -602,7 +616,16 @@ class AgentRuntime:
             registry.register(agent_notify, "agent_notify", "Notify a linked agent")
         if self.scheduler and db is not None and runtime_settings is not None:
             async def schedule_self(run_at: str, message: str, name: str = "") -> dict[str, Any]:
-                """Schedule a one-time internal follow-up for this agent (ISO datetime). Does not message the customer."""
+                """Schedule a one-time follow-up for this agent (ISO datetime)."""
+                if cursor_state["finished"]:
+                    return {
+                        "ok": False,
+                        "skipped": True,
+                        "reason": (
+                            "Cursor already finished (done=true). Do not schedule another check. "
+                            "Write the result to the original Telegram chat."
+                        ),
+                    }
                 try:
                     target = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
                 except ValueError as exc:
@@ -612,12 +635,18 @@ class AgentRuntime:
                 target = target.astimezone(timezone.utc)
                 if target <= datetime.now(timezone.utc):
                     raise ValueError("run_at must be in the future")
+                source = context or {}
+                chat_id = source.get("reply_chat_id") or source.get("chat_id") or source.get("entity")
                 payload = {
                     "message": message,
                     "run_once_at": target.isoformat(),
                     "timezone": runtime_settings.timezone,
                     "source": "scheduled",
-                    "employee_tick": True,
+                    "reply_to_chat": bool(chat_id),
+                    "reply_phone": phone or source.get("reply_phone") or source.get("phone"),
+                    "reply_chat_id": chat_id,
+                    "sender_id": source.get("sender_id"),
+                    "sender_username": source.get("sender_username"),
                 }
                 job = CronJob(
                     name=name.strip() or f"once-{agent.id}-{uuid4().hex[:12]}",
@@ -642,9 +671,9 @@ class AgentRuntime:
                 "schedule_self",
                 (
                     "Schedule yourself a one-time internal task at an ISO datetime. "
-                    "Use this instead of hour/day/week/month plans. "
-                    "Typical: if Cursor is still running, schedule cursorremote_check in ~2 minutes. "
-                    "The job does not auto-write to the customer — you telegram them after verifying."
+                    "If Cursor is still running (done=false), schedule cursorremote_check in ~2 minutes. "
+                    "If done=true, do not schedule — message the requester instead. "
+                    "The follow-up keeps the original Telegram chat so you can write back when finished."
                 ),
             )
 
@@ -930,6 +959,17 @@ class AgentRuntime:
             client_options["http_proxy"] = profile.http_proxy
         client = LLMClient(**client_options)
         try:
+            attachments = [
+                item
+                for item in (context.get("_attachments") or context.get("attachments") or [])
+                if isinstance(item, dict)
+            ]
+            if attachments:
+                message, attachments = await ingest_attachments_for_llm(
+                    client, message, attachments
+                )
+                context["_attachments"] = attachments
+                context["_user_message"] = message
             is_telegram = context.get("source") == "telegram" and account is not None
 
             async def summarize(prompt: str) -> str:
@@ -1049,6 +1089,8 @@ class AgentRuntime:
                     "After a successful sip_dial the platform already suppresses the Telegram reply — "
                     "do not describe the call. "
                     "Never describe silence in a message. "
+                    "Photos in the current user message are visible to you — describe and use them. "
+                    "Voice notes are transcribed into the user text; treat that transcript as what they said. "
                     f"If that tool is unavailable, return exactly {NO_TELEGRAM_REPLY}.\n"
                     + (
                         manager_telegram_instruction()
@@ -1084,7 +1126,12 @@ class AgentRuntime:
             ]
             if employee_block:
                 messages.append({"role": "system", "content": employee_block})
-            messages.append({"role": "user", "content": message})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": llm_user_content(message, attachments),
+                }
+            )
             permissions = resolve_tool_permissions(
                 agent.config,
                 employee_autonomy=bool(employee_profile.autonomy_enabled),
@@ -1140,13 +1187,14 @@ class AgentRuntime:
                 agent_name=agent.name,
                 audit=registry.audit,
                 user_message=message,
-                chat_id=context.get("chat_id"),
+                chat_id=context.get("chat_id") or context.get("reply_chat_id"),
                 sender_id=context.get("sender_id"),
                 sender_username=(
                     str(context["sender_username"])
                     if context.get("sender_username")
                     else None
                 ),
+                source=context.get("source"),
             )
             if admin_report:
                 context["_admin_action_report"] = admin_report
@@ -1266,6 +1314,8 @@ class AgentRuntime:
                 )
                 await db.commit()
             await self.events.publish("agent.completed", {"agent_id": agent.id, "text": result})
+            if cursor_finished_in_audit(registry.audit) and not suppressed:
+                context["_deliver_origin_reply"] = True
             return result
         finally:
             close = getattr(client, "aclose", None)

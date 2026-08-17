@@ -188,3 +188,65 @@ async def test_runtime_injects_and_records_memory(monkeypatch: pytest.MonkeyPatc
     assert "prefers concise replies" in captured["messages"][1]["content"]
     exchanges = await memory.search("remembered response", "user-7", "7")
     assert exchanges[0]["metadata"]["kind"] == "exchange"
+
+
+@pytest.mark.asyncio
+async def test_runtime_passes_image_and_voice_to_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeLLM:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        async def transcribe_audio(self, data: bytes, *, filename: str = "voice.ogg") -> str:
+            captured["transcribed"] = filename
+            return "голосом: перезвони"
+
+        async def complete(self, messages: list[dict[str, Any]], tools: Any, permissions: set[str]) -> str:
+            captured["messages"] = messages
+            return "ok"
+
+    monkeypatch.setattr("app.runtime.LLMClient", FakeLLM)
+    runtime = AgentRuntime(Settings(), MemoryStore(Settings(mem0_enabled=False)), FakeSearch(), FakeEvents())
+    agent = Agent(
+        id=7,
+        name="media-agent",
+        prompt="Be useful",
+        model_provider="openai",
+        model_name="test",
+        llm_profile_id=1,
+        enabled=True,
+        config={},
+    )
+    result = await runtime.run(
+        FakeDB(),
+        agent,
+        "",
+        {
+            "user_id": "user-7",
+            "_attachments": [
+                {
+                    "kind": "image",
+                    "mime_type": "image/png",
+                    "filename": "shot.png",
+                    "data_b64": "cG5n",
+                    "size": 3,
+                },
+                {
+                    "kind": "voice",
+                    "mime_type": "audio/ogg",
+                    "filename": "voice.ogg",
+                    "data_b64": "b2dn",
+                    "size": 3,
+                },
+            ],
+        },
+    )
+    assert result == "ok"
+    assert captured["transcribed"] == "voice.ogg"
+    user = captured["messages"][-1]
+    assert user["role"] == "user"
+    content = user["content"]
+    assert isinstance(content, list)
+    assert any(part.get("type") == "image_url" for part in content)
+    assert "голосом: перезвони" in content[0]["text"]

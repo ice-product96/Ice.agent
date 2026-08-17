@@ -65,3 +65,25 @@ def test_tick_instruction_uses_scheduler() -> None:
     assert "schedule_self" in text
     assert "cursorremote_check" in text
     assert "планы (час/день" not in text
+    assert "НЕ ставь новый schedule_self" in text
+
+
+def test_once_job_status_is_completed_after_run() -> None:
+    from app.contract import cron_job_status
+
+    done = SimpleNamespace(
+        cron="@once",
+        enabled=False,
+        last_run_at=datetime.now(timezone.utc),
+        payload={"run_once_at": "2026-08-17T14:00:00+00:00"},
+    )
+    paused = SimpleNamespace(
+        cron="*/15 * * * *",
+        enabled=False,
+        last_run_at=None,
+        payload={},
+    )
+    active = SimpleNamespace(cron="@once", enabled=True, last_run_at=None, payload={})
+    assert cron_job_status(done) == "completed"
+    assert cron_job_status(paused) == "paused"
+    assert cron_job_status(active) == "active"

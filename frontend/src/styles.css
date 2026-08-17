@@ -104,7 +104,7 @@ main { padding-left: 250px; min-height: 100vh; }
 .service-icon.error { color: var(--red); background: #ff6f8310; }.service-icon.offline { color: #697185; background: #69718510; }
 .status { display: inline-flex; align-items: center; gap: 6px; padding: 4px 7px; border-radius: 6px; color: #8f98a9; background: #1a1f2a; font-size: 9px; text-transform: capitalize; white-space: nowrap; }
 .status i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
-.status.online, .status.active { color: #65d8ad; background: #3cca9410; }.status.error { color: var(--red); background: #ff6f8310; }.status.pending { color: var(--amber); background: #f8b95c10; }.status.paused { color: #a5a9b4; }
+.status.online, .status.active, .status.completed { color: #65d8ad; background: #3cca9410; }.status.error { color: var(--red); background: #ff6f8310; }.status.pending { color: var(--amber); background: #f8b95c10; }.status.paused { color: #a5a9b4; }
 .quick-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
 .quick-action { min-height: 68px; display: flex; align-items: center; gap: 10px; text-align: left; color: #cdd2de; border: 1px solid #202633; background: #121721; border-radius: 9px; padding: 10px; }
 .quick-action:hover { border-color: #3c3a60; background: #151a27; }.quick-action > span { width: 31px; height: 31px; display: grid; place-items: center; border-radius: 8px; color: #9b8cff; background: #8c7cff12; }.quick-action div { flex: 1; }.quick-action strong, .quick-action small { display: block; }.quick-action strong { font-size: 10px; }.quick-action small { color: #6d7587; font-size: 9px; margin-top: 4px; }.quick-action > svg { color: #51596b; }
@@ -120,6 +120,8 @@ main { padding-left: 250px; min-height: 100vh; }
 .inline-result { display: block; margin-top: 9px; color: #aeb5c5; font-size: 9px; }.inline-result.standalone { margin-top: 13px; padding: 9px 11px; border-radius: 7px; background: #171c27; }
 .chip-row { min-height: 29px; margin: 13px 0; display: flex; flex-wrap: wrap; gap: 5px; }
 .chip { display: inline-flex; align-items: center; padding: 4px 7px; color: #a5adbe; background: #1a202b; border: 1px solid #282f3c; border-radius: 5px; font-size: 9px; white-space: nowrap; }
+button.chip { cursor: pointer; font: inherit; }
+.chip.on { color: #d7deea; border-color: #4a5568; background: #222a38; }
 .entity-meta { color: #71798c; display: flex; gap: 15px; font-size: 9px; }.entity-meta span { display: flex; align-items: center; gap: 4px; }
 .card-actions { margin-top: 15px; padding-top: 14px; border-top: 1px solid #202532; display: flex; gap: 8px; }.card-actions .secondary { flex: 1; height: 33px; }
 .list-panel { overflow: hidden; padding: 0 18px; }.account-row, .server-row { min-height: 70px; }.grow { flex: 1; min-width: 0; }

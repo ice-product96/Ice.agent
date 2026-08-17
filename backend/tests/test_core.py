@@ -131,7 +131,32 @@ def test_admin_action_report_only_for_side_effects() -> None:
     assert "Sales" in report
     assert "ice_tracker_move_card" in report
     assert "web_search" not in report
-    assert "@client" in report
+    assert format_admin_action_report(
+        agent_name="Max",
+        audit=[
+            {
+                "tool": "cursorremote_check",
+                "status": "success",
+                "result": {"ok": True, "done": True},
+            },
+            {
+                "tool": "schedule_self",
+                "status": "success",
+                "arguments": {"run_at": "2026-08-17T14:13:30Z"},
+                "result": {"ok": True},
+            },
+        ],
+        source="scheduled",
+        user_message="Повторно проверить CursorRemote",
+    ) is None
+    from app.action_reports import cursor_finished_in_audit
+
+    assert cursor_finished_in_audit(
+        [{"tool": "cursorremote_check", "status": "success", "result": {"done": True}}]
+    )
+    assert not cursor_finished_in_audit(
+        [{"tool": "cursorremote_check", "status": "success", "result": {"done": False}}]
+    )
 
 
 def test_normalize_contact_phone_and_tool_registration() -> None:
@@ -287,3 +312,132 @@ async def test_gpt56_chat_tools_set_reasoning_effort_none() -> None:
     assert result == "ok"
     assert captured["reasoning_effort"] == "none"
     assert captured["tools"]
+
+
+def test_classify_telegram_photo_and_voice() -> None:
+    from types import SimpleNamespace
+
+    from app.telegram import attachment_label, classify_telegram_media, public_attachment
+
+    photo = SimpleNamespace(
+        media=object(),
+        photo=object(),
+        voice=None,
+        audio=None,
+        video=None,
+        sticker=None,
+        document=None,
+        file=SimpleNamespace(mime_type="image/jpeg", name="p.jpg", ext=".jpg", size=12),
+    )
+    voice = SimpleNamespace(
+        media=object(),
+        photo=None,
+        voice=object(),
+        audio=None,
+        video=None,
+        sticker=None,
+        document=object(),
+        file=SimpleNamespace(mime_type="audio/ogg", name="voice.ogg", ext=".ogg", size=80),
+    )
+    assert classify_telegram_media(photo)["kind"] == "image"
+    assert classify_telegram_media(voice)["kind"] == "voice"
+    assert attachment_label([{"kind": "image"}, {"kind": "voice"}]) == (
+        "[Вложение: изображение, голосовое сообщение]"
+    )
+    assert public_attachment({"kind": "image", "data_b64": "xx", "size": 2}) == {
+        "kind": "image",
+        "size": 2,
+    }
+
+
+def test_llm_user_content_attaches_image_and_wav() -> None:
+    from app.integrations import llm_user_content
+
+    content = llm_user_content(
+        "смотри",
+        [
+            {
+                "kind": "image",
+                "mime_type": "image/jpeg",
+                "data_b64": "abc",
+                "filename": "a.jpg",
+            },
+            {
+                "kind": "voice",
+                "mime_type": "audio/ogg",
+                "data_b64": "def",
+                "filename": "voice.ogg",
+            },
+            {
+                "kind": "audio",
+                "mime_type": "audio/mpeg",
+                "data_b64": "ghi",
+                "filename": "clip.mp3",
+            },
+        ],
+    )
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "смотри"}
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,abc")
+    assert content[2] == {
+        "type": "input_audio",
+        "input_audio": {"data": "ghi", "format": "mp3"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_ingest_transcribes_voice() -> None:
+    from app.integrations import ingest_attachments_for_llm
+
+    class FakeClient:
+        async def transcribe_audio(self, data: bytes, *, filename: str = "voice.ogg") -> str:
+            assert filename == "voice.ogg"
+            assert data == b"ogg"
+            return "привет из голосового"
+
+    text, attachments = await ingest_attachments_for_llm(
+        FakeClient(),  # type: ignore[arg-type]
+        "",
+        [
+            {
+                "kind": "voice",
+                "filename": "voice.ogg",
+                "data_b64": "b2dn",
+            }
+        ],
+    )
+    assert "привет из голосового" in text
+    assert attachments[0]["transcript"] == "привет из голосового"
+
+
+@pytest.mark.asyncio
+async def test_collect_telegram_attachments_downloads_bytes() -> None:
+    from types import SimpleNamespace
+
+    from app.telegram import collect_telegram_attachments
+
+    class FakeMessage:
+        def __init__(self) -> None:
+            self.media = object()
+            self.photo = object()
+            self.voice = None
+            self.audio = None
+            self.video = None
+            self.sticker = None
+            self.document = None
+            self.file = SimpleNamespace(
+                mime_type="image/jpeg", name="p.jpg", ext=".jpg", size=4
+            )
+
+    class FakeEvent:
+        async def download_media(self, message: object, file: object = None) -> bytes:
+            return b"jpeg"
+
+        client = None
+
+    event = FakeEvent()
+    event.client = event
+    attachments = await collect_telegram_attachments(event, [FakeMessage()])
+    assert attachments[0]["kind"] == "image"
+    assert attachments[0]["data_b64"]

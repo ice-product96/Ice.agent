@@ -1,5 +1,5 @@
 export type ID = string
-export type Status = 'online' | 'offline' | 'error' | 'pending' | 'active' | 'paused'
+export type Status = 'online' | 'offline' | 'error' | 'pending' | 'active' | 'paused' | 'completed'
 export type AgentLinkRef = ID | {
   id?: ID
   agent_id?: ID

@@ -1654,6 +1654,16 @@ async def delete_mcp(server_id: str, request: Request, db: AsyncSession = Depend
     return Response(status_code=204)
 
 
+def cron_job_status(job: CronJob) -> str:
+    payload = job.payload or {}
+    once = job.cron == "@once" or bool(payload.get("run_once_at"))
+    if job.enabled:
+        return "active"
+    if once and job.last_run_at is not None:
+        return "completed"
+    return "paused"
+
+
 def cron_json(job: CronJob) -> dict[str, Any]:
     payload = job.payload or {}
     return {
@@ -1668,6 +1678,7 @@ def cron_json(job: CronJob) -> dict[str, Any]:
         "last_run_at": iso(job.last_run_at),
         "created_at": iso(job.created_at),
         "updated_at": iso(job.updated_at),
+        "status": cron_job_status(job),
     }
 
 
