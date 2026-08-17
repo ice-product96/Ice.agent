@@ -46,12 +46,32 @@ EMPLOYEE_OPERATIONAL_PERMISSIONS = {
     "schedule_self_cancel",
 }
 
+# Granted when agent has tool_permissions "cursorremote" or MCP server `cursorremote` attached.
+CURSORREMOTE_OPERATIONAL_PERMISSIONS = {
+    "mcp_cursorremote_send_prompt",
+    "mcp_cursorremote_approve",
+    "mcp_cursorremote_reject",
+    "mcp_cursorremote_approve_all",
+    "mcp_cursorremote_click_action",
+    "mcp_cursorremote_new_chat",
+    "mcp_cursorremote_switch_tab",
+    "mcp_cursorremote_switch_window",
+    "mcp_cursorremote_set_mode",
+    "mcp_cursorremote_set_model",
+    "mcp_cursorremote_set_plan_model",
+}
+
 # Dangerous tools that require a fresh manager approval while autonomy is on.
 APPROVAL_REQUIRED_TOOLS = {
     "telegram_delete_messages",
     "telegram_delete_dialog",
     "telegram_leave_channel",
     "sip_dial",
+    "mcp_cursorremote_send_prompt",
+    "mcp_cursorremote_approve",
+    "mcp_cursorremote_click_action",
+    "mcp_cursorremote_new_chat",
+    "mcp_cursorremote_switch_window",
 }
 
 
@@ -59,6 +79,7 @@ def resolve_tool_permissions(
     agent_config: dict[str, Any] | None,
     *,
     employee_autonomy: bool = False,
+    cursorremote_attached: bool = False,
 ) -> set[str]:
     config = agent_config or {}
     permissions = {str(item) for item in (config.get("tool_permissions") or [])}
@@ -69,6 +90,8 @@ def resolve_tool_permissions(
         permissions |= SIP_OPERATIONAL_PERMISSIONS
     if employee_autonomy or "employee" in tools or "autonomy" in tools:
         permissions |= EMPLOYEE_OPERATIONAL_PERMISSIONS
+    if cursorremote_attached or "cursorremote" in permissions or "cursorremote" in tools:
+        permissions |= CURSORREMOTE_OPERATIONAL_PERMISSIONS
     return permissions
 
 
@@ -79,6 +102,11 @@ class ToolPolicy:
         "leave_channel", "reaction", "draft", "escalate", "ban", "kick",
         "change_permissions", "schedule_self", "sip_dial", "sip_hangup",
         "request_approval", "self_configure",
+        # CursorRemote MCP mutating tools (matched as substrings of mcp_cursorremote_*)
+        "cursorremote_send_prompt", "cursorremote_approve", "cursorremote_reject",
+        "cursorremote_approve_all", "cursorremote_click_action", "cursorremote_new_chat",
+        "cursorremote_switch_tab", "cursorremote_switch_window",
+        "cursorremote_set_mode", "cursorremote_set_model", "cursorremote_set_plan_model",
     }
 
     def check(self, tool_name: str, arguments: dict[str, Any], allowed: set[str] | None = None) -> None:

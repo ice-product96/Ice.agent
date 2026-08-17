@@ -63,13 +63,16 @@ class ConversationContextService:
         account_id: int,
         chat_id: str,
         user_id: str,
+        thread_id: str = "",
     ) -> ConversationState:
+        normalized_thread = str(thread_id or "").strip()
         state = await db.scalar(
             select(ConversationState).where(
                 ConversationState.agent_id == agent_id,
                 ConversationState.account_id == account_id,
                 ConversationState.chat_id == chat_id,
                 ConversationState.user_id == user_id,
+                ConversationState.thread_id == normalized_thread,
             )
         )
         if state is None:
@@ -78,6 +81,7 @@ class ConversationContextService:
                 account_id=account_id,
                 chat_id=chat_id,
                 user_id=user_id,
+                thread_id=normalized_thread,
             )
             db.add(state)
             await db.flush()
@@ -269,12 +273,14 @@ class ConversationContextService:
     ) -> tuple[str, ConversationState, MessageLog]:
         chat_id = str(context.get("chat_id") or context.get("sender_id") or "")
         user_id = str(context.get("user_id") or context.get("sender_id") or chat_id)
+        thread_id = str(context.get("thread_id") or context.get("topic_id") or "")
         state = await self._state(
             db,
             agent_id=agent_id,
             account_id=account_id,
             chat_id=chat_id,
             user_id=user_id,
+            thread_id=thread_id,
         )
         await self.synchronize(db, state, context.get("telegram_history") or [])
         message_id = str(context.get("message_id") or "") or None

@@ -29,7 +29,6 @@ from .db import (
 from .action_reports import format_admin_action_report
 from .employee import (
     AGENT_EDITABLE_SECTIONS,
-    EMPLOYEE_TICK_INSTRUCTION,
     HORIZONS,
     NEED_KINDS,
     PROMPT_SECTION_KEYS,
@@ -46,8 +45,22 @@ from .employee import (
 )
 from .events import EventHub
 from .integrations import LLMClient, McpManager, MemoryStore, WebSearch
+from .employee_policy import (
+    approval_required_for_tool,
+    build_employee_tick_instruction,
+    customer_telegram_instruction,
+    manager_telegram_instruction,
+    normalize_action_name,
+)
+from .memory_scope import (
+    bind_conversation_from_config,
+    build_memory_metadata,
+    format_memory_hits,
+    memory_scope_prompt,
+    prefetch_memories,
+    resolve_memory_scope,
+)
 from .tools import (
-    APPROVAL_REQUIRED_TOOLS,
     ToolRegistry,
     common_registry,
     resolve_tool_permissions,
@@ -281,7 +294,105 @@ class AgentRuntime:
                 "To open or read a specific page, use an MCP browser tool when available."
             ),
         )
-        if memory_enabled:
+        if memory_enabled and context is not None:
+            async def memory_add(
+                text: str,
+                category: str = "note",
+                project_id: str = "",
+                customer_id: str = "",
+                global_scope: bool = False,
+            ) -> dict[str, Any]:
+                """Store a structured long-term memory for the current user and project scope."""
+                active = context.get("_memory_scope") or resolve_memory_scope(
+                    context,
+                    agent,
+                    state=context.get("_conversation_state"),
+                )
+                metadata = build_memory_metadata(
+                    active,
+                    category=category,
+                    global_scope=global_scope,
+                )
+                if project_id.strip():
+                    metadata["project_id"] = project_id.strip()
+                if customer_id.strip():
+                    metadata["customer_id"] = customer_id.strip()
+                if global_scope:
+                    metadata.pop("project_id", None)
+                item = await self.memory.add(
+                    text,
+                    user_id=active.user_id,
+                    agent_id=active.agent_id,
+                    metadata=metadata,
+                )
+                return {"ok": True, "id": item.get("id"), "metadata": metadata}
+
+            async def memory_search(
+                query: str,
+                category: str = "",
+                project_id: str = "",
+                include_global: bool = True,
+                limit: int = 10,
+            ) -> list[dict[str, Any]]:
+                """Search long-term memory for the current user, optionally filtered by project/category."""
+                active = context.get("_memory_scope") or resolve_memory_scope(
+                    context,
+                    agent,
+                    state=context.get("_conversation_state"),
+                )
+                filters: dict[str, Any] = {}
+                if category.strip():
+                    filters["category"] = category.strip().lower()
+                target_project = project_id.strip() or active.project_id
+                return await self.memory.search_scoped(
+                    query,
+                    user_id=active.user_id,
+                    agent_id=active.agent_id,
+                    project_id=target_project,
+                    filters=filters or None,
+                    include_global=include_global,
+                    limit=limit,
+                )
+
+            async def memory_set_project(
+                project_id: str,
+                customer_id: str = "",
+            ) -> dict[str, Any]:
+                """Bind the current conversation to a project/customer for scoped memory."""
+                state = context.get("_conversation_state")
+                if state is None:
+                    raise RuntimeError("memory_set_project requires an active conversation")
+                if db is None:
+                    raise RuntimeError("Database session is required for memory_set_project")
+                normalized_project = project_id.strip()
+                if not normalized_project:
+                    raise ValueError("project_id must not be empty")
+                state.project_id = normalized_project
+                if customer_id.strip():
+                    state.customer_id = customer_id.strip()
+                await db.flush()
+                context["project_id"] = normalized_project
+                if customer_id.strip():
+                    context["customer_id"] = customer_id.strip()
+                context["_memory_scope"] = resolve_memory_scope(context, agent, state=state)
+                return {
+                    "ok": True,
+                    "project_id": state.project_id,
+                    "customer_id": state.customer_id,
+                }
+
+            registry.register(memory_add, "memory_add", "Store a structured long-term memory fact")
+            registry.register(
+                memory_search,
+                "memory_search",
+                "Search long-term memory scoped to the current project and user",
+            )
+            registry.register(
+                memory_set_project,
+                "memory_set_project",
+                "Bind the current conversation to a project/customer for scoped memory",
+            )
+        elif memory_enabled:
             registry.register(self.memory.search, "memory_search", "Search long-term memory")
             registry.register(self.memory.add, "memory_add", "Store long-term memory")
         if phone and self.telegram:
@@ -604,14 +715,15 @@ class AgentRuntime:
             )
 
         async def request_approval(action_name: str, reason: str, context: str = "") -> dict[str, Any]:
-            """Request manager approval before a dangerous action (telegram deletes, sip_dial, etc.)."""
+            """Request manager approval before a dangerous action. action_name must be a tool id (e.g. sip_dial)."""
+            tool_name = normalize_action_name(action_name)
             return await self.employee.create_consultation(
                 db,
                 agent,
-                question=f"Approve action `{action_name}`: {reason}",
+                question=f"Approve action `{tool_name}`: {reason}",
                 context=context,
                 requires_approval=True,
-                action_name=action_name.strip(),
+                action_name=tool_name,
                 need_kind="decision",
             )
 
@@ -692,7 +804,7 @@ class AgentRuntime:
             "tick_reason": reason,
             "user_id": f"employee:{agent.id}",
         }
-        message = EMPLOYEE_TICK_INSTRUCTION
+        message = build_employee_tick_instruction(profile)
         result = await self.run(db, agent, message, context)
         try:
             await self.employee.maybe_send_daily_digest(db, agent, profile)
@@ -731,18 +843,9 @@ class AgentRuntime:
         context = context or {}
         await self.events.publish("agent.started", {"agent_id": agent.id})
         user_id = str(context.get("user_id") or context.get("sender_id") or context.get("chat_id") or "global")
-        if runtime_settings.memory_enabled:
-            try:
-                memories = await self.memory.search(
-                    message, user_id=user_id, agent_id=str(agent.id), limit=8
-                )
-            except Exception:
-                memories = []
-        else:
-            memories = []
-        memory_context = "\n".join(
-            f"- {item.get('memory', item.get('text', ''))}" for item in memories
-        )
+        memories: list[dict[str, Any]] = []
+        memory_scope = None
+        memory_context = ""
         account = (
             await db.get(TelegramAccount, agent.telegram_account_id)
             if agent.telegram_account_id is not None
@@ -756,12 +859,14 @@ class AgentRuntime:
                 McpServer.enabled.is_(True),
             )
         ))
-        # If no explicit attach rows, enable all connected MCP servers when agent has the mcp tool
+        # If no explicit attach rows, enable all connected MCP servers when agent has the mcp tool.
+        # Exception: `cursorremote` must always be explicitly attached (project-scoped IDE control).
         tools = set((agent.config or {}).get("tools") or [])
         if not mcp_server_names and "mcp" in tools:
             mcp_server_names = {
                 name
                 for name in (self.mcp.sessions if self.mcp else {})
+                if name != "cursorremote"
             }
         client_options: dict[str, Any] = dict(
             api_key=api_key,
@@ -803,6 +908,10 @@ class AgentRuntime:
                     settings=runtime_settings,
                     summarizer=summarize,
                 )
+                bind_conversation_from_config(state, agent.config, context)
+                context["_conversation_state"] = state
+                memory_scope = resolve_memory_scope(context, agent, state=state)
+                context["_memory_scope"] = memory_scope
                 inbound_at = as_utc(inbound.message_at or inbound.created_at)
             else:
                 inbound_at = as_utc(context.get("message_at") or context.get("date"))
@@ -817,6 +926,20 @@ class AgentRuntime:
                 )
                 await db.commit()
                 conversation_context = self.conversations.temporal_context(runtime_settings)
+                memory_scope = resolve_memory_scope(context, agent)
+                context["_memory_scope"] = memory_scope
+            if runtime_settings.memory_enabled and memory_scope is not None:
+                try:
+                    memories = await prefetch_memories(
+                        self.memory,
+                        message,
+                        memory_scope,
+                        limit=8,
+                    )
+                except Exception:
+                    memories = []
+            memory_context = format_memory_hits(memories)
+            scope_line = memory_scope_prompt(memory_scope) if memory_scope else ""
             employee_profile = await get_or_create_profile(db, agent.id)
             system_prompt = await assemble_system_prompt(db, agent)
             employee_block = ""
@@ -830,45 +953,61 @@ class AgentRuntime:
                     await list_open_consultations(db, agent.id),
                 )
             is_employee_tick = bool(context.get("employee_tick") or context.get("source") == "employee_tick")
+            phone_hint = ""
+            if is_telegram and not context.get("is_admin"):
+                digits = "".join(ch for ch in message if ch.isdigit())
+                if len(digits) >= 10:
+                    phone_hint = (
+                        f"The customer sent a phone number ({digits}). "
+                        "If they asked for a call, invoke sip_dial immediately with this number."
+                    )
+            if is_employee_tick:
+                role_instruction = build_employee_tick_instruction(employee_profile)
+            elif is_telegram:
+                role_instruction = (
+                    "Your final assistant message is delivered ONLY to the Telegram interlocutor. "
+                    "Write a natural conversational reply for them. "
+                    "Do not narrate internal tool calls, MCP/tracker operations, schedules, "
+                    "channel joins, deletions, or other system actions to the interlocutor. "
+                    "Never say things like 'я передвинул карточку', 'я выполнил действие', "
+                    "or dump tool JSON into the chat. "
+                    "The platform automatically reports mutating tool outcomes to administrators. "
+                    "If a tool failure affects the answer, say briefly that you could not complete "
+                    "the request — without technical internals. "
+                    "Never claim an external action succeeded unless its tool call returned successfully. "
+                    "When no Telegram reply should be sent, call telegram_suppress_reply. "
+                    "Never describe silence in a message. "
+                    f"If that tool is unavailable, return exactly {NO_TELEGRAM_REPLY}.\n"
+                    + (
+                        manager_telegram_instruction()
+                        if context.get("is_admin")
+                        else customer_telegram_instruction()
+                    )
+                    + (f"\n{phone_hint}" if phone_hint else "")
+                )
+            else:
+                role_instruction = (
+                    "Never claim that an external action succeeded unless its tool call "
+                    "returned successfully. Report tool errors truthfully and explicitly."
+                )
             messages = [
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "system",
                     "content": (
-                        "Relevant long-term memories:\n" + memory_context
-                        if memory_context
-                        else "No relevant long-term memories were found."
-                    ),
-                },
-                {
-                    "role": "system",
-                    "content": (
-                        EMPLOYEE_TICK_INSTRUCTION
-                        if is_employee_tick
-                        else (
-                            (
-                                "Your final assistant message is delivered ONLY to the Telegram interlocutor. "
-                                "Write a natural conversational reply for them. "
-                                "Do not narrate internal tool calls, MCP/tracker operations, schedules, "
-                                "channel joins, deletions, or other system actions to the interlocutor. "
-                                "Never say things like 'я передвинул карточку', 'я выполнил действие', "
-                                "or dump tool JSON into the chat. "
-                                "The platform automatically reports mutating tool outcomes to administrators. "
-                                "If a tool failure affects the answer, say briefly that you could not complete "
-                                "the request — without technical internals. "
-                                "Never claim an external action succeeded unless its tool call returned successfully. "
-                                "When no Telegram reply should be sent, call telegram_suppress_reply. "
-                                "Never describe silence in a message. "
-                                f"If that tool is unavailable, return exactly {NO_TELEGRAM_REPLY}."
-                            )
-                            if is_telegram
-                            else (
-                                "Never claim that an external action succeeded unless its tool call "
-                                "returned successfully. Report tool errors truthfully and explicitly."
-                            )
+                        (
+                            scope_line + "\n"
+                            if scope_line
+                            else ""
+                        )
+                        + (
+                            "Relevant long-term memories:\n" + memory_context
+                            if memory_context
+                            else "No relevant long-term memories were found."
                         )
                     ),
                 },
+                {"role": "system", "content": role_instruction},
                 {"role": "system", "content": conversation_context},
             ]
             if employee_block:
@@ -877,6 +1016,7 @@ class AgentRuntime:
             permissions = resolve_tool_permissions(
                 agent.config,
                 employee_autonomy=bool(employee_profile.autonomy_enabled),
+                cursorremote_attached="cursorremote" in mcp_server_names,
             )
             registry = await self.registry(
                 agent,
@@ -889,7 +1029,7 @@ class AgentRuntime:
             )
             if employee_profile.autonomy_enabled:
                 async def _approval_gate(tool_name: str, arguments: dict[str, Any]) -> None:
-                    if tool_name not in APPROVAL_REQUIRED_TOOLS:
+                    if not approval_required_for_tool(employee_profile, tool_name, context):
                         return
                     ok = await self.employee.has_approval(db, agent.id, tool_name)
                     if not ok:
@@ -994,6 +1134,22 @@ class AgentRuntime:
                 )
             if runtime_settings.memory_enabled:
                 try:
+                    exchange_metadata = {
+                        "kind": "exchange",
+                        "category": "exchange",
+                        "agent_name": agent.name,
+                        "chat_id": str(context.get("chat_id") or ""),
+                        "inbound_at": iso_utc(inbound_at),
+                        "outbound_at": iso_utc(outbound_at),
+                        "last_message_at": iso_utc(outbound_at),
+                    }
+                    if memory_scope is not None:
+                        exchange_metadata.update(
+                            build_memory_metadata(
+                                memory_scope,
+                                category="exchange",
+                            )
+                        )
                     await self.memory.add(
                         (
                             f"User: {message}\nAssistant: [no reply sent]"
@@ -1002,14 +1158,7 @@ class AgentRuntime:
                         ),
                         user_id=user_id,
                         agent_id=str(agent.id),
-                        metadata={
-                            "kind": "exchange",
-                            "agent_name": agent.name,
-                            "chat_id": str(context.get("chat_id") or ""),
-                            "inbound_at": iso_utc(inbound_at),
-                            "outbound_at": iso_utc(outbound_at),
-                            "last_message_at": iso_utc(outbound_at),
-                        },
+                        metadata=exchange_metadata,
                     )
                 except Exception:
                     pass

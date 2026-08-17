@@ -28,7 +28,7 @@ from .employee import (
 from .events import events
 from .integrations import exception_text
 from .memory_clear import clear_journals
-from .schemas import LlmProfileBody, RuntimeSettingsBody
+from .schemas import ConversationPatch, LlmProfileBody, RuntimeSettingsBody
 from .secrets import SecretStore, masked_secret
 from .security import issue_token, require_admin, valid_password, verify_token
 
@@ -598,6 +598,14 @@ class EmployeeProfileBody(BaseModel):
     role_title: str | None = None
     mission: str | None = None
     prompt_sections: dict[str, str] | None = None
+    policy: dict[str, Any] | None = None
+
+
+@router.get("/employees/policy-catalog", dependencies=auth)
+async def employee_policy_catalog() -> dict[str, Any]:
+    from .employee_policy import policy_catalog
+
+    return policy_catalog()
 
 
 class ConsultationResolveBody(BaseModel):
@@ -656,9 +664,14 @@ async def patch_employee(
     profile = await get_or_create_profile(db, agent.id)
     data = payload.model_dump(exclude_unset=True)
     sections_payload = data.pop("prompt_sections", None)
+    policy_payload = data.pop("policy", None)
     for key, value in data.items():
         if value is not None:
             setattr(profile, key, value)
+    if policy_payload is not None:
+        current = dict(profile.config_json or {})
+        current["policy"] = policy_payload
+        profile.config_json = current
     if sections_payload:
         await ensure_prompt_sections(db, agent)
         for key, content in sections_payload.items():
@@ -1221,7 +1234,7 @@ async def register_sip_account(
     if sip is None:
         raise HTTPException(status_code=503, detail="SIP gateway is not available")
     try:
-        await sip.register_account(account)
+        await sip.register_account(account, force=True)
     except Exception as exc:
         detail = str(exc).strip() or exception_text(exc)
         raise HTTPException(status_code=503, detail=f"SIP register failed: {detail}") from exc
@@ -1320,6 +1333,8 @@ async def memory_search(
     request: Request,
     search: str = "",
     agent_id: str | None = None,
+    project_id: str | None = None,
+    category: str | None = None,
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
     memory = request.app.state.memory
@@ -1333,13 +1348,25 @@ async def memory_search(
             ).all()
         ]
     )
+    filters: dict[str, Any] = {}
+    if project_id and project_id.strip():
+        filters["project_id"] = project_id.strip()
+    if category and category.strip():
+        filters["category"] = category.strip().lower()
     items: list[dict[str, Any]] = []
     try:
         for current_agent_id in agent_ids:
             scoped = (
-                await memory.search(search, agent_id=current_agent_id)
+                await memory.search(
+                    search,
+                    agent_id=current_agent_id,
+                    filters=filters or None,
+                )
                 if search
-                else await memory.get_all(agent_id=current_agent_id)
+                else await memory.get_all(
+                    agent_id=current_agent_id,
+                    filters=filters or None,
+                )
             )
             items.extend(scoped)
         # Fallback may contain old global entries which have no agent scope.
@@ -1365,6 +1392,9 @@ async def memory_search(
             "id": str(item.get("id", "")),
             "agent_id": item.get("agent_id", metadata.get("agent_id")),
             "scope": str(item.get("user_id", metadata.get("user_id", "global"))),
+            "project_id": metadata.get("project_id"),
+            "customer_id": metadata.get("customer_id"),
+            "category": metadata.get("category") or metadata.get("kind"),
             "key": str(metadata.get("kind") or item.get("key") or item.get("id", "memory")),
             "content": str(item.get("memory", item.get("text", item.get("content", "")))),
             "metadata": metadata,
@@ -1929,6 +1959,10 @@ def conversation_json(state: ConversationState) -> dict[str, Any]:
         "account_id": state.account_id,
         "chat_id": state.chat_id,
         "user_id": state.user_id,
+        "thread_id": state.thread_id,
+        "thread_id": state.thread_id,
+        "project_id": state.project_id,
+        "customer_id": state.customer_id,
         "rolling_summary": state.rolling_summary,
         "summary_through_message_id": state.summary_through_message_id,
         "summary_through_message_at": iso(state.summary_through_message_at),
@@ -1948,17 +1982,25 @@ async def conversations(
     db: AsyncSession = Depends(get_db),
     agent_id: int | None = None,
     search: str = "",
+    project_id: str | None = None,
+    customer_id: str | None = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     filters = []
     if agent_id is not None:
         filters.append(ConversationState.agent_id == agent_id)
+    if project_id and project_id.strip():
+        filters.append(ConversationState.project_id.ilike(f"%{project_id.strip()}%"))
+    if customer_id and customer_id.strip():
+        filters.append(ConversationState.customer_id.ilike(f"%{customer_id.strip()}%"))
     if search.strip():
         pattern = f"%{search.strip()}%"
         filters.append(or_(
             ConversationState.chat_id.ilike(pattern),
             ConversationState.user_id.ilike(pattern),
+            ConversationState.project_id.ilike(pattern),
+            ConversationState.customer_id.ilike(pattern),
             ConversationState.rolling_summary.ilike(pattern),
         ))
     total = int(
@@ -2012,6 +2054,28 @@ async def conversation_detail(
         **conversation_json(state),
         "messages": [row(item) for item in reversed(messages)],
     }
+
+
+@router.patch("/conversations/{conversation_id}", dependencies=auth)
+async def patch_conversation(
+    conversation_id: int,
+    payload: ConversationPatch,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    state = await one(db, ConversationState, conversation_id)
+    if payload.clear_project:
+        state.project_id = None
+    elif payload.project_id is not None:
+        normalized = payload.project_id.strip()
+        state.project_id = normalized or None
+    if payload.clear_customer:
+        state.customer_id = None
+    elif payload.customer_id is not None:
+        normalized = payload.customer_id.strip()
+        state.customer_id = normalized or None
+    await db.commit()
+    await db.refresh(state)
+    return conversation_json(state)
 
 
 @router.delete("/conversations/{conversation_id}", dependencies=auth, status_code=204)

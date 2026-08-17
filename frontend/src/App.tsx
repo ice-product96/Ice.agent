@@ -10,6 +10,7 @@ import { agentModelPresets, profileModelPresets } from './llmModels'
 import type {
   AdminSettings, Agent, AgentTask, Consultation, CronJob, Dashboard, EmployeeState, LogEntry, McpServer,
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, RuntimeSettings,
+  EmployeePolicy, EmployeePolicyCatalog,
   SipAccount, SipCall, Status, TelegramAccount,
 } from './types'
 
@@ -51,6 +52,24 @@ const title: Record<Page, [string, string]> = {
   logs: ['Системные логи', 'Трассировка событий runtime между сервисами'],
   tasks: ['Межагентные задачи', 'Координация и делегирование работ в реальном времени'],
 }
+
+const PM_SKILLS_TEMPLATE = `Память (Mem0):
+- Факты по проекту: memory_add(..., category="project"|"decision"|"contact")
+- Глобальные предпочтения (язык, стиль): memory_add(..., global_scope=true)
+- Новый клиент/проект в чате: memory_set_project("project-slug", customer_id="client")
+- ice_tracker — задачи и статусы; memory — решения, контакты, договорённости
+
+ice_tracker (MCP):
+- Карточки, статусы, дедлайны — только через ice_tracker
+- Не дублируй задачи в память, если они уже в трекере
+
+playwright (MCP):
+- Открытие страниц, формы, скриншоты — для проверки сайтов клиентов
+
+Cursor IDE (mcp_CursorRemote_*):
+- get_status / get_state → send_prompt → wait(idle|needs_input)
+- Управление только привязанным workspace; mutating — через request_approval в автономии
+`
 
 const statusLabel: Record<string, string> = {
   online: 'онлайн', offline: 'офлайн', pending: 'ожидание', paused: 'пауза',
@@ -801,23 +820,75 @@ function relativeDate(value?: string | null) {
   return months < 12 ? `${months} мес назад` : `${Math.floor(months / 12)} г назад`
 }
 
-function ConversationDetailModal({ id, agentName, onClose, onClear }: {
+function ConversationDetailModal({ id, agentName, onClose, onClear, onUpdated }: {
   id: string; agentName: string; onClose: () => void; onClear: (conversation: Conversation) => void
+  onUpdated?: () => void
 }) {
   const loaded = useLoad(() => api.conversations.get(id), [id])
   const conversation = loaded.data
+  const [projectId, setProjectId] = useState('')
+  const [customerId, setCustomerId] = useState('')
+  const [scopeBusy, setScopeBusy] = useState(false)
+  const [scopeError, setScopeError] = useState('')
+  useEffect(() => {
+    if (conversation) {
+      setProjectId(conversation.project_id || '')
+      setCustomerId(conversation.customer_id || '')
+    }
+  }, [conversation])
   const messages = useMemo(() => [...(conversation?.messages || [])].sort((a, b) =>
     new Date(a.message_at || a.created_at).getTime() - new Date(b.message_at || b.created_at).getTime()
   ), [conversation])
+  async function saveScope(clear = false) {
+    if (!conversation) return
+    setScopeBusy(true); setScopeError('')
+    try {
+      const updated = await api.conversations.update(conversation.id, clear ? {
+        clear_project: true,
+        clear_customer: true,
+      } : {
+        project_id: projectId.trim(),
+        customer_id: customerId.trim(),
+      })
+      loaded.setData({ ...conversation, ...updated })
+      setProjectId(updated.project_id || '')
+      setCustomerId(updated.customer_id || '')
+      onUpdated?.()
+    } catch (err) {
+      setScopeError(err instanceof Error ? err.message : 'Не удалось сохранить scope')
+    } finally {
+      setScopeBusy(false)
+    }
+  }
   return <Modal title="Детали диалога" subtitle={`${agentName} · Диалог ${id}`} onClose={onClose}>
     {loaded.error && <><Alert message={loaded.error}/><button className="secondary" onClick={loaded.refresh}><RefreshCw size={15}/>Повторить</button></>}
     {loaded.loading && !conversation ? <Loading/> : conversation && <>
       <div className="conversation-facts">
         <span><small>Пользователь</small><strong>{conversation.user_id}</strong></span>
         <span><small>Чат</small><strong>{conversation.chat_id}</strong></span>
+        <span><small>Топик</small><strong>{conversation.thread_id || '—'}</strong></span>
         <span><small>Сообщения</small><strong>{conversation.message_count}</strong></span>
+        <span><small>Project</small><strong>{conversation.project_id || '—'}</strong></span>
+        <span><small>Customer</small><strong>{conversation.customer_id || '—'}</strong></span>
         <span><small>Последняя активность</small><strong>{exactDate(conversation.last_message_at)}</strong></span>
       </div>
+      <section className="summary-box">
+        <span>Scope памяти (опционально)</span>
+        <p>Привязка диалога к проекту/клиенту для изолированной долговременной памяти агента.</p>
+        <div className="form-grid" style={{ marginTop: 10 }}>
+          <Field label="Project ID"><input value={projectId} onChange={event => setProjectId(event.target.value)} placeholder="acme-site"/></Field>
+          <Field label="Customer ID"><input value={customerId} onChange={event => setCustomerId(event.target.value)} placeholder="acme-corp"/></Field>
+        </div>
+        {scopeError && <Alert message={scopeError}/>}
+        <div className="head-actions" style={{ marginTop: 10 }}>
+          <button className="primary compact" type="button" disabled={scopeBusy} onClick={() => void saveScope()}>
+            {scopeBusy ? <LoaderCircle className="spin" size={15}/> : null}Сохранить scope
+          </button>
+          {(conversation.project_id || conversation.customer_id) && (
+            <button className="secondary compact" type="button" disabled={scopeBusy} onClick={() => void saveScope(true)}>Сбросить</button>
+          )}
+        </div>
+      </section>
       <section className="summary-box">
         <span>Сводка</span>
         <p>{conversation.rolling_summary || 'Сводка ещё не сформирована.'}</p>
@@ -857,7 +928,21 @@ function ConversationsScreen() {
   const [search, setSearch] = useState('')
   const [query, setQuery] = useState('')
   const [agentId, setAgentId] = useState('')
-  const loaded = useLoad(() => api.conversations.list(agentId || undefined, query || undefined), [agentId, query])
+  const [projectFilter, setProjectFilter] = useState('')
+  const [customerFilter, setCustomerFilter] = useState('')
+  const [projectQuery, setProjectQuery] = useState('')
+  const [customerQuery, setCustomerQuery] = useState('')
+  const loaded = useLoad(
+    () => api.conversations.list(
+      agentId || undefined,
+      query || undefined,
+      100,
+      0,
+      projectQuery || undefined,
+      customerQuery || undefined,
+    ),
+    [agentId, query, projectQuery, customerQuery],
+  )
   const agents = useLoad(api.agents.list, [])
   const items = Array.isArray(loaded.data) ? loaded.data : loaded.data?.items || []
   const total = Array.isArray(loaded.data) ? loaded.data.length : loaded.data?.total ?? items.length
@@ -871,21 +956,32 @@ function ConversationsScreen() {
   const agentName = (id: string) => agents.data?.find(agent => String(agent.id) === String(id))?.name || id
   return <>
     <SectionHead title={`${total} диалогов`} text={total > items.length ? `Показаны последние ${items.length}; обновление каждые 30 секунд` : 'Контекст обновляется каждые 30 секунд'} action={<div className="head-actions"><button className="danger" onClick={() => setClearingAll(true)}><Trash2 size={16}/>Удалить всё</button><button className="secondary compact" disabled={loaded.loading} onClick={loaded.refresh}><RefreshCw className={loaded.loading ? 'spin' : ''} size={15}/>Обновить</button></div>}/>
-    <form className="filter-bar conversation-filters" onSubmit={event => { event.preventDefault(); setQuery(search.trim()) }}>
+    <form className="filter-bar conversation-filters" onSubmit={event => {
+      event.preventDefault()
+      setQuery(search.trim())
+      setProjectQuery(projectFilter.trim())
+      setCustomerQuery(customerFilter.trim())
+    }}>
       <div className="search-box"><Search size={17}/><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Поиск по пользователю, чату или сводке…"/></div>
+      <input aria-label="Фильтр project_id" value={projectFilter} onChange={event => setProjectFilter(event.target.value)} placeholder="project_id"/>
+      <input aria-label="Фильтр customer_id" value={customerFilter} onChange={event => setCustomerFilter(event.target.value)} placeholder="customer_id"/>
       <select aria-label="Фильтр по агенту" value={agentId} onChange={event => setAgentId(event.target.value)}><option value="">Все агенты</option>{agents.data?.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select>
       <button className="secondary">Поиск</button>
-      {(query || agentId) && <button type="button" className="secondary" onClick={() => { setSearch(''); setQuery(''); setAgentId('') }}>Сбросить</button>}
+      {(query || agentId || projectQuery || customerQuery) && <button type="button" className="secondary" onClick={() => {
+        setSearch(''); setQuery(''); setAgentId('')
+        setProjectFilter(''); setProjectQuery('')
+        setCustomerFilter(''); setCustomerQuery('')
+      }}>Сбросить</button>}
     </form>
     {(loaded.error || agents.error) && <Alert message={loaded.error || agents.error}/>}
     {loaded.loading && !loaded.data ? <Loading/> : items.length === 0 ? <Empty icon={MessagesSquare} title="Диалоги не найдены" text="Контекст диалогов появится после обмена сообщениями агентов."/> :
       <div className="conversation-list">{items.map(conversation => <button className="conversation-card" key={conversation.id} onClick={() => setSelected(conversation)}>
         <div className="conversation-primary"><span className="entity-avatar"><MessagesSquare/></span><div><strong>{agentName(conversation.agent_id)}</strong><small>Агент {conversation.agent_id}</small></div></div>
-        <div className="conversation-identity"><span><small>Пользователь</small><strong>{conversation.user_id}</strong></span><span><small>Чат</small><strong>{conversation.chat_id}</strong></span><span><small>Аккаунт</small><strong>{conversation.account_id}</strong></span></div>
+        <div className="conversation-identity"><span><small>Пользователь</small><strong>{conversation.user_id}</strong></span><span><small>Чат</small><strong>{conversation.chat_id}</strong></span><span><small>Project</small><strong>{conversation.project_id || '—'}</strong></span></div>
         <div className="conversation-summary"><span>{conversation.rolling_summary || 'Сводки пока нет.'}</span></div>
         <div className="conversation-activity"><strong>{conversation.message_count}</strong><small>сообщений</small><time>{exactDate(conversation.last_message_at)}</time><span>{relativeDate(conversation.last_message_at)}</span><ChevronRight size={17}/></div>
       </button>)}</div>}
-    {selected && <ConversationDetailModal id={selected.id} agentName={agentName(selected.agent_id)} onClose={() => setSelected(null)} onClear={conversation => setClearing(conversation)}/>}
+    {selected && <ConversationDetailModal id={selected.id} agentName={agentName(selected.agent_id)} onClose={() => setSelected(null)} onClear={conversation => setClearing(conversation)} onUpdated={() => void loaded.refresh()}/>}
     {clearing && <ClearConversationModal conversation={clearing} onClose={() => setClearing(null)} onCleared={() => { setClearing(null); setSelected(null); void loaded.refresh() }}/>}
     {clearingAll && <ConfirmClearJournals agentId={agentId || undefined} agentName={agentId ? agentName(agentId) : undefined} onClose={() => setClearingAll(false)} onCleared={() => { setClearingAll(false); setSelected(null); void loaded.refresh() }}/>}
   </>
@@ -910,6 +1006,34 @@ function EmployeeScreen() {
   const [timezone, setTimezone] = useState('UTC')
   const [budget, setBudget] = useState(48)
   const [autonomy, setAutonomy] = useState(false)
+  const [policy, setPolicy] = useState<EmployeePolicy>({
+    approval_required_tools: [],
+    manager_orders_without_approval: true,
+    customer_requests_without_approval: true,
+    consult_manager_on_idle_tick: false,
+    tick_instruction_extra: '',
+  })
+  const policyCatalog = useLoad(api.employees.policyCatalog, [])
+
+  function applyPolicy(raw?: EmployeePolicy) {
+    const defaults = policyCatalog.data?.defaults
+    setPolicy({
+      approval_required_tools: raw?.approval_required_tools ?? defaults?.approval_required_tools ?? [],
+      manager_orders_without_approval: raw?.manager_orders_without_approval ?? defaults?.manager_orders_without_approval ?? true,
+      customer_requests_without_approval: raw?.customer_requests_without_approval ?? defaults?.customer_requests_without_approval ?? true,
+      consult_manager_on_idle_tick: raw?.consult_manager_on_idle_tick ?? defaults?.consult_manager_on_idle_tick ?? false,
+      tick_instruction_extra: raw?.tick_instruction_extra ?? defaults?.tick_instruction_extra ?? '',
+    })
+  }
+
+  function toggleApprovalTool(toolId: string) {
+    setPolicy(current => {
+      const selected = new Set(current.approval_required_tools)
+      if (selected.has(toolId)) selected.delete(toolId)
+      else selected.add(toolId)
+      return { ...current, approval_required_tools: [...selected].sort() }
+    })
+  }
 
   useEffect(() => {
     if (!agentId && agents.data?.length) setAgentId(String(agents.data[0].id))
@@ -930,6 +1054,7 @@ function EmployeeScreen() {
       setTimezone(data.profile.timezone || 'UTC')
       setBudget(data.profile.budget_ticks_per_day || 48)
       setAutonomy(Boolean(data.profile.autonomy_enabled))
+      applyPolicy(data.profile.policy)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Не удалось загрузить сотрудника')
     } finally {
@@ -953,6 +1078,7 @@ function EmployeeScreen() {
         role_title: roleTitle,
         mission,
         prompt_sections: sections,
+        policy,
       })
       setState(data)
       await overview.refresh()
@@ -1006,6 +1132,26 @@ function EmployeeScreen() {
           <Field label="Часовой пояс"><input value={timezone} onChange={e => setTimezone(e.target.value)} placeholder="Asia/Yekaterinburg"/></Field>
           <Field label="Миссия" wide><textarea rows={3} value={mission} onChange={e => setMission(e.target.value)} placeholder="Что сотрудник должен достигать"/></Field>
         </div>
+        <SectionHead title="Политика автономии" text="Когда спрашивать руководителя и какие действия требуют approve"/>
+        <div className="form-grid">
+          <div className="toggle-box"><Toggle label="Поручения руководителя без approve" checked={policy.manager_orders_without_approval} onChange={value => setPolicy(p => ({ ...p, manager_orders_without_approval: value }))}/></div>
+          <div className="toggle-box"><Toggle label="Запросы заказчика (звонок/SIP) без approve" checked={policy.customer_requests_without_approval} onChange={value => setPolicy(p => ({ ...p, customer_requests_without_approval: value }))}/></div>
+          <div className="toggle-box"><Toggle label="Спрашивать руководителя на heartbeat если нечего делать" checked={policy.consult_manager_on_idle_tick} onChange={value => setPolicy(p => ({ ...p, consult_manager_on_idle_tick: value }))}/></div>
+          <Field label="Доп. инструкция для heartbeat" wide hint="Добавляется к системному тексту тика">
+            <textarea rows={2} value={policy.tick_instruction_extra} onChange={e => setPolicy(p => ({ ...p, tick_instruction_extra: e.target.value }))}/>
+          </Field>
+        </div>
+        <div className="policy-tools">
+          <span className="policy-tools-label">Требуют approve (если не сработали bypass выше):</span>
+          <div className="policy-tools-grid">
+            {(policyCatalog.data?.approval_tool_options || []).map(option => (
+              <label className="policy-tool" key={option.id}>
+                <input type="checkbox" checked={policy.approval_required_tools.includes(option.id)} onChange={() => toggleApprovalTool(option.id)}/>
+                <span>{option.label}</span>
+              </label>
+            ))}
+          </div>
+        </div>
         <div className="form-grid" style={{ marginTop: 12 }}>
           {([
             ['identity', 'Личность', 'Только руководитель'],
@@ -1016,6 +1162,16 @@ function EmployeeScreen() {
             ['self_notes', 'Заметки сотрудника', 'Сотрудник может править сам'],
           ] as const).map(([key, label, hint]) => (
             <Field key={key} label={label} wide hint={hint}>
+              {key === 'skills' && (
+                <div className="head-actions" style={{ marginBottom: 8 }}>
+                  <button type="button" className="secondary compact" onClick={() => setSections(s => ({
+                    ...s,
+                    skills: s.skills?.trim()
+                      ? `${s.skills.trim()}\n\n${PM_SKILLS_TEMPLATE}`
+                      : PM_SKILLS_TEMPLATE,
+                  }))}>Вставить шаблон PM</button>
+                </div>
+              )}
               <textarea rows={key === 'identity' || key === 'rules' ? 5 : 3} value={sections[key] || ''} onChange={e => setSections(s => ({ ...s, [key]: e.target.value }))}/>
             </Field>
           ))}
@@ -1067,8 +1223,24 @@ function EmployeeScreen() {
 }
 
 function MemoryScreen() {
-  const [search, setSearch] = useState(''); const [query, setQuery] = useState('')
-  const loaded = useLoad(() => api.memory.list(query), [query])
+  const [search, setSearch] = useState('')
+  const [query, setQuery] = useState('')
+  const [agentId, setAgentId] = useState('')
+  const [projectId, setProjectId] = useState('')
+  const [category, setCategory] = useState('')
+  const [agentQuery, setAgentQuery] = useState('')
+  const [projectQuery, setProjectQuery] = useState('')
+  const [categoryQuery, setCategoryQuery] = useState('')
+  const agents = useLoad(api.agents.list, [])
+  const loaded = useLoad(
+    () => api.memory.list(
+      query || undefined,
+      agentQuery || undefined,
+      projectQuery || undefined,
+      categoryQuery || undefined,
+    ),
+    [query, agentQuery, projectQuery, categoryQuery],
+  )
   const items = Array.isArray(loaded.data) ? loaded.data : loaded.data?.items || []
   const [deleting, setDeleting] = useState<MemoryItem | null>(null)
   const [migrateMsg, setMigrateMsg] = useState('')
@@ -1089,10 +1261,30 @@ function MemoryScreen() {
   return <>
     <SectionHead title="Сохранённый контекст" text="Поиск семантической и структурированной памяти агентов" action={<div className="head-actions"><button className="danger" onClick={() => setClearing(true)}><Trash2 size={16}/>Удалить всё</button><button className="secondary" disabled={migrating} onClick={() => void migrate()}>{migrating ? <LoaderCircle className="spin" size={16}/> : null}Перенести RAM → Qdrant</button></div>}/>
     {migrateMsg && <Alert message={migrateMsg}/>}
-    <form className="filter-bar" onSubmit={e => { e.preventDefault(); setQuery(search) }}><div className="search-box"><Search size={17}/><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Поиск по содержимому, ключам или области…"/></div><button className="secondary">Поиск</button></form>
-    {loaded.error && <Alert message={loaded.error}/>}
+    <form className="filter-bar" onSubmit={e => {
+      e.preventDefault()
+      setQuery(search.trim())
+      setAgentQuery(agentId)
+      setProjectQuery(projectId.trim())
+      setCategoryQuery(category.trim())
+    }}>
+      <div className="search-box"><Search size={17}/><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Поиск по содержимому…"/></div>
+      <select aria-label="Агент" value={agentId} onChange={e => setAgentId(e.target.value)}><option value="">Все агенты</option>{agents.data?.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select>
+      <input aria-label="project_id" value={projectId} onChange={e => setProjectId(e.target.value)} placeholder="project_id"/>
+      <input aria-label="category" value={category} onChange={e => setCategory(e.target.value)} placeholder="category"/>
+      <button className="secondary">Поиск</button>
+      {(query || agentQuery || projectQuery || categoryQuery) && (
+        <button type="button" className="secondary" onClick={() => {
+          setSearch(''); setQuery('')
+          setAgentId(''); setAgentQuery('')
+          setProjectId(''); setProjectQuery('')
+          setCategory(''); setCategoryQuery('')
+        }}>Сбросить</button>
+      )}
+    </form>
+    {(loaded.error || agents.error) && <Alert message={loaded.error || agents.error}/>}
     {loaded.loading ? <Loading/> : items.length === 0 ? <Empty icon={BrainCircuit} title="Подходящих записей нет" text="Записи памяти агентов появятся по мере создания."/> :
-      <div className="memory-list">{items.map(item => <article className="memory-card" key={item.id}><div className="memory-head"><div><span className="scope">{item.scope}</span><strong>{item.key}</strong></div><button className="icon-button danger-ghost" onClick={() => setDeleting(item)}><Trash2 size={16}/></button></div><p>{item.content}</p><div className="entity-meta"><span>{item.agent_id ? `Агент ${item.agent_id}` : 'Глобально'}</span>{item.created_at && <time>{new Date(item.created_at).toLocaleString()}</time>}</div></article>)}</div>}
+      <div className="memory-list">{items.map(item => <article className="memory-card" key={item.id}><div className="memory-head"><div><span className="scope">{item.scope}</span><strong>{item.key}</strong>{item.category && <span className="chip">{item.category}</span>}</div><button className="icon-button danger-ghost" onClick={() => setDeleting(item)}><Trash2 size={16}/></button></div><p>{item.content}</p><div className="entity-meta"><span>{item.agent_id ? `Агент ${item.agent_id}` : 'Глобально'}</span>{item.project_id && <span>Project {item.project_id}</span>}{item.customer_id && <span>Customer {item.customer_id}</span>}{item.created_at && <time>{new Date(item.created_at).toLocaleString()}</time>}</div></article>)}</div>}
     {deleting && <ConfirmDelete name={deleting.key} onClose={() => setDeleting(null)} onDelete={async () => { await api.memory.remove(deleting.id); loaded.setData(Array.isArray(loaded.data) ? loaded.data.filter(i => i.id !== deleting.id) : loaded.data ? { ...loaded.data, items: loaded.data.items.filter(i => i.id !== deleting.id) } : loaded.data) }}/>}
     {clearing && <ConfirmClearJournals onClose={() => setClearing(false)} onCleared={() => void loaded.refresh()}/>}
   </>

@@ -102,6 +102,9 @@ export interface MemoryItem {
   scope: string
   key: string
   content: string
+  project_id?: string | null
+  customer_id?: string | null
+  category?: string | null
   metadata?: Record<string, unknown>
   created_at: string
 }
@@ -252,6 +255,9 @@ export interface Conversation {
   account_id: ID
   chat_id: string
   user_id: string
+  thread_id?: string
+  project_id?: string | null
+  customer_id?: string | null
   message_count: number
   last_message_at?: string | null
   last_user_message_at?: string | null
@@ -274,6 +280,19 @@ export interface ConversationDetail extends Conversation {
   messages: ConversationMessage[]
 }
 
+export interface EmployeePolicy {
+  approval_required_tools: string[]
+  manager_orders_without_approval: boolean
+  customer_requests_without_approval: boolean
+  consult_manager_on_idle_tick: boolean
+  tick_instruction_extra: string
+}
+
+export interface EmployeePolicyCatalog {
+  approval_tool_options: Array<{ id: string; label: string }>
+  defaults: EmployeePolicy
+}
+
 export interface EmployeeProfile {
   id: ID
   agent_id: ID
@@ -290,6 +309,7 @@ export interface EmployeeProfile {
   last_digest_at?: string | null
   role_title: string
   mission: string
+  policy?: EmployeePolicy
 }
 
 export interface EmployeePlan {

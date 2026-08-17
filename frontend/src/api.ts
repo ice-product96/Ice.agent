@@ -1,6 +1,6 @@
 import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
-  Conversation, ConversationDetail, Consultation, EmployeeProfile, EmployeeState,
+  Conversation, ConversationDetail, Consultation, EmployeePolicy, EmployeePolicyCatalog, EmployeeProfile, EmployeeState,
   LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
   RuntimeSettings, SipAccount, SipCall, TelegramAccount,
 } from './types'
@@ -80,7 +80,7 @@ export const api = {
     update: (id: string, data: Partial<Agent>) => request<Agent>(`/agents/${id}`, { method: 'PATCH', ...body(data) }),
     remove: (id: string) => request<void>(`/agents/${id}`, { method: 'DELETE' }),
     employee: (id: string) => request<EmployeeState>(`/agents/${id}/employee`),
-    updateEmployee: (id: string, data: Partial<EmployeeProfile> & { prompt_sections?: Record<string, string> }) =>
+    updateEmployee: (id: string, data: Partial<EmployeeProfile> & { prompt_sections?: Record<string, string>; policy?: EmployeePolicy }) =>
       request<EmployeeState>(`/agents/${id}/employee`, { method: 'PATCH', ...body(data) }),
     pauseEmployee: (id: string, paused = true) =>
       request<{ ok: boolean; paused: boolean }>(`/agents/${id}/employee/pause?paused=${paused ? 'true' : 'false'}`, { method: 'POST' }),
@@ -88,6 +88,7 @@ export const api = {
   },
   employees: {
     list: () => request<{ items: EmployeeProfile[]; open_consultations: number; paused_agents: number; autonomous_agents: number }>('/employees'),
+    policyCatalog: () => request<EmployeePolicyCatalog>('/employees/policy-catalog'),
   },
   consultations: {
     list: (agentId?: string, status = 'open') =>
@@ -153,17 +154,40 @@ export const api = {
       }),
   },
   memory: {
-    list: (search?: string, agentId?: string) =>
-      request<Paginated<MemoryItem> | MemoryItem[]>(`/memory${qs({ search, agent_id: agentId })}`),
+    list: (search?: string, agentId?: string, projectId?: string, category?: string) =>
+      request<Paginated<MemoryItem> | MemoryItem[]>(`/memory${qs({
+        search, agent_id: agentId, project_id: projectId, category,
+      })}`),
     migrate: () => request<{ ok: boolean; migrated: number; failed: number; remaining: number; pending_before: number }>('/memory/migrate', { method: 'POST' }),
     remove: (id: string) => request<void>(`/memory/${id}`, { method: 'DELETE' }),
   },
   conversations: {
-    list: (agentId?: string, search?: string, limit = 100, offset = 0) =>
+    list: (
+      agentId?: string,
+      search?: string,
+      limit = 100,
+      offset = 0,
+      projectId?: string,
+      customerId?: string,
+    ) =>
       request<Paginated<Conversation> | Conversation[]>(`/conversations${qs({
-        agent_id: agentId, search, limit, offset,
+        agent_id: agentId,
+        search,
+        project_id: projectId,
+        customer_id: customerId,
+        limit,
+        offset,
       })}`),
     get: (id: string) => request<ConversationDetail>(`/conversations/${id}`),
+    update: (
+      id: string,
+      data: {
+        project_id?: string | null
+        customer_id?: string | null
+        clear_project?: boolean
+        clear_customer?: boolean
+      },
+    ) => request<Conversation>(`/conversations/${id}`, { method: 'PATCH', ...body(data) }),
     clear: (id: string) => request<void>(`/conversations/${id}`, { method: 'DELETE' }),
   },
   mcp: {

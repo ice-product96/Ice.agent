@@ -110,6 +110,16 @@ def _exc_text(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
+def outbound_fail_message(status: int, headers: dict[str, str], body: str = "") -> str:
+    reason = (headers.get("Reason-Phrase") or "").strip()
+    warning = (headers.get("Warning") or "").strip()
+    extra = warning or (body.strip().replace("\n", " ")[:180] if body.strip() else "")
+    text = f"SIP {status}" + (f" {reason}" if reason else "")
+    if extra:
+        text = f"{text}: {extra}"
+    return f"Outbound call failed ({text})"
+
+
 def _sip_uri(user: str, host: str, port: int | None = None) -> str:
     if port and port not in (5060, 5061):
         return f"sip:{user}@{host}:{port}"
@@ -395,6 +405,9 @@ class SipUserAgent:
         self._from_tag = f"{random.randint(10**6, 10**9)}"
         self._reg_task: asyncio.Task[None] | None = None
         self._keep_task: asyncio.Task[None] | None = None
+        self._reg_lock = asyncio.Lock()
+        self._digest_nonce = ""
+        self._digest_nc = 0
         self._pending: dict[str, asyncio.Future[tuple[int, dict[str, str], str]]] = {}
         self.calls: dict[str, ActiveCall] = {}
         self._rtp_ports = set(range(config.rtp_port_min, config.rtp_port_max + 1, 2))
@@ -403,6 +416,14 @@ class SipUserAgent:
     @property
     def auth_user(self) -> str:
         return self.config.auth_username or self.config.login
+
+    @property
+    def transport_alive(self) -> bool:
+        return (
+            not self._closed
+            and self._transport is not None
+            and not self._transport.is_closing()
+        )
 
     async def _resolve_ipv4(self, host: str) -> str:
         if _is_ipv4(host):
@@ -542,7 +563,12 @@ class SipUserAgent:
         ha1 = _md5(username, realm, self.config.password)
         ha2 = _md5(method, uri)
         if qop:
-            nc = "00000001"
+            if nonce == self._digest_nonce:
+                self._digest_nc += 1
+            else:
+                self._digest_nonce = nonce
+                self._digest_nc = 1
+            nc = f"{self._digest_nc:08x}"
             cnonce = f"{random.randint(10**8, 10**10)}"
             response = _md5(ha1, nonce, nc, cnonce, qop.split(",")[0].strip(), ha2)
             parts = [
@@ -578,6 +604,7 @@ class SipUserAgent:
         body: str = "",
         addr: tuple[str, int] | None = None,
         auth_retry: bool = True,
+        timeout: float | None = None,
     ) -> tuple[int, dict[str, str], str]:
         branch = f"z9hG4bK{random.randint(10**8, 10**12)}"
         headers = dict(headers)
@@ -598,7 +625,7 @@ class SipUserAgent:
         interval = 0.5
         t2 = 4.0
         started = loop.time()
-        timeout_total = 32.0
+        timeout_total = 32.0 if timeout is None else max(1.0, float(timeout))
         try:
             while True:
                 remaining = timeout_total - (loop.time() - started)
@@ -628,6 +655,8 @@ class SipUserAgent:
             raise RuntimeError(f"SIP {method} to {dest[0]}:{dest[1]} failed: {_exc_text(exc)}") from exc
         finally:
             self._pending.pop(branch, None)
+        if method == "INVITE" and status >= 300:
+            self._send_non2xx_ack(request_uri, headers, resp_headers, addr)
         if auth_retry and status in {401, 407}:
             auth_key = "WWW-Authenticate" if status == 401 else "Proxy-Authenticate"
             auth_hdr = "Authorization" if status == 401 else "Proxy-Authorization"
@@ -650,10 +679,46 @@ class SipUserAgent:
             else:
                 self._cseq = num
             headers.pop("Via", None)
-            return await self._request(method, request_uri, headers, body, addr, auth_retry=False)
+            return await self._request(
+                method,
+                request_uri,
+                headers,
+                body,
+                addr,
+                auth_retry=False,
+                timeout=timeout,
+            )
         return status, resp_headers, resp_body
 
+    def _send_non2xx_ack(
+        self,
+        request_uri: str,
+        req_headers: dict[str, str],
+        resp_headers: dict[str, str],
+        addr: tuple[str, int] | None,
+    ) -> None:
+        """RFC 3261: INVITE 3xx-6xx must be ACKed in the same transaction before retry."""
+        cseq_num = str(req_headers.get("CSeq") or "1 INVITE").split()[0]
+        ack = (
+            f"ACK {request_uri} SIP/2.0\r\n"
+            f"Via: {req_headers.get('Via', '')}\r\n"
+            f"From: {req_headers.get('From', '')}\r\n"
+            f"To: {resp_headers.get('To') or req_headers.get('To', '')}\r\n"
+            f"Call-ID: {req_headers.get('Call-ID', '')}\r\n"
+            f"CSeq: {cseq_num} ACK\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"Content-Length: 0\r\n\r\n"
+        )
+        try:
+            self._send(ack, addr)
+        except Exception as exc:
+            logger.info("SIP ACK for INVITE %s failed: %s", cseq_num, exc)
+
     async def register(self, expires: int = 600, *, recover_dialog: bool = True) -> None:
+        async with self._reg_lock:
+            await self._register_unlocked(expires, recover_dialog=recover_dialog)
+
+    async def _register_unlocked(self, expires: int = 600, *, recover_dialog: bool = True) -> None:
         self.registration_status = "registering"
         request_uri = f"sip:{self.config.domain}"
         self._reg_cseq += 1
@@ -678,11 +743,11 @@ class SipUserAgent:
         if status in {401, 407} and recover_dialog:
             # Auth retry in _request should have consumed 401; leftover 401 means nonce/dialog is stale.
             self._new_register_dialog()
-            return await self.register(expires, recover_dialog=False)
+            return await self._register_unlocked(expires, recover_dialog=False)
         if status == 481 and recover_dialog:
             logger.warning("SIP REGISTER 481 Unknown Dialog — new Call-ID for %s", self.config.login)
             self._new_register_dialog()
-            return await self.register(expires, recover_dialog=False)
+            return await self._register_unlocked(expires, recover_dialog=False)
         if status in {200, 202}:
             self.registered = True
             self.registration_status = "registered"
@@ -726,19 +791,27 @@ class SipUserAgent:
         self.registration_status = "unregistered"
 
     async def _reregister_loop(self, expires: int) -> None:
-        interval = max(30, int(expires) - 30)
+        interval = max(30, int(expires) // 2)
         while not self._closed:
             await asyncio.sleep(interval)
             if self._closed:
                 return
+            if self._active_calls():
+                interval = 15
+                continue
             try:
                 await self.register(expires)
-                interval = max(30, int(expires) - 30)
+                interval = max(30, int(expires) // 2)
             except Exception as exc:
                 logger.warning("SIP re-REGISTER failed for %s: %s", self.config.login, exc)
                 self.registered = False
                 self.registration_status = f"error:{exc}"
-                interval = 15
+                if self.on_reg_state:
+                    try:
+                        await self.on_reg_state(False, self.registration_status)
+                    except Exception:
+                        pass
+                interval = 8
 
     async def _keepalive_loop(self) -> None:
         """UDP NAT hole-punch: OPTIONS to the proxy while registered."""
@@ -757,9 +830,20 @@ class SipUserAgent:
                         "Call-ID": f"{random.randint(10**10, 10**12)}@ice-opt",
                         "CSeq": f"{self._cseq} OPTIONS",
                     },
+                    timeout=6.0,
                 )
             except Exception as exc:
                 logger.info("SIP OPTIONS keepalive failed for %s: %s", self.config.login, exc)
+                if self._closed or self._active_calls():
+                    continue
+                try:
+                    await self.register()
+                except Exception as reg_exc:
+                    logger.warning(
+                        "SIP re-REGISTER after OPTIONS failure for %s: %s",
+                        self.config.login,
+                        reg_exc,
+                    )
 
     def _parse_message(self, text: str) -> tuple[str, dict[str, str], str]:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -1279,12 +1363,17 @@ class SipUserAgent:
         body: str,
         addr: tuple[str, int],
     ) -> None:
+        if status in {401, 407}:
+            # Digest challenge is consumed by _request; hanging up here aborted authenticated INVITE.
+            return
         if status in {180, 183}:
             call.state = "ringing"
             if self.on_call_state:
                 await self.on_call_state(call.call_id, {"status": "ringing"})
             return
         if status == 200:
+            if call.state == "answered":
+                return
             to_tag = re.search(r"tag=([^;]+)", headers.get("To", ""))
             call.remote_tag = to_tag.group(1) if to_tag else call.remote_tag
             call.to_header = headers.get("To", call.to_header)
@@ -1368,16 +1457,30 @@ class SipUserAgent:
             "Content-Type": "application/sdp",
             "Allow": "INVITE, ACK, CANCEL, BYE, OPTIONS, INFO",
         }
-        # fire INVITE with auth retry; responses also drive call state via handle_message
-        status, resp_headers, resp_body = await self._request(
-            "INVITE",
-            request_uri,
-            headers,
-            body=sdp,
-        )
-        await self._handle_outbound_response(call, status, resp_headers, resp_body, (self._proxy_ip, self._proxy_port))
-        if call.state == "failed":
-            raise RuntimeError(f"Outbound call failed ({call.state})")
+        # fire INVITE with auth retry; provisional/200 also update state via handle_message
+        try:
+            status, resp_headers, resp_body = await self._request(
+                "INVITE",
+                request_uri,
+                headers,
+                body=sdp,
+            )
+        except Exception:
+            if call.call_id in self.calls:
+                await self.hangup(call.call_id, cause="invite_failed", send_bye=False)
+            raise
+        if call.state != "answered":
+            await self._handle_outbound_response(
+                call,
+                status,
+                resp_headers,
+                resp_body,
+                (self._proxy_ip, self._proxy_port),
+            )
+        if status >= 400 or call.state in {"failed", "ended"}:
+            if call.call_id in self.calls:
+                await self.hangup(call.call_id, cause=f"sip_{status}", send_bye=False)
+            raise RuntimeError(outbound_fail_message(status, resp_headers, resp_body))
         return call
 
     async def hangup(self, call_id: str, cause: str = "local_hangup", send_bye: bool = True) -> None:

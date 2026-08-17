@@ -98,6 +98,35 @@ Playwright MCP поднимается вместе со стеком. Если �
 
 У агента включите инструмент **MCP**. После этого агент сможет открывать сайты, делать snapshot страницы и извлекать данные через Playwright.
 
+### CursorRemote MCP (управление локальным Cursor IDE)
+
+Плагин [CursorRemote](https://github.com/len5ky/CursorRemote) умеет отдавать streamable-http MCP на `/mcp` с Bearer-токеном и allowlist workspace. Агент ice.agent может ставить задачи Cursor-агенту, читать статус и жать Approve — только в разрешённом проекте.
+
+**На стороне CursorRemote** (extension settings или `.env`):
+
+- `cursorRemote.mcp.enabled` / `MCP_ENABLED=true`
+- `MCP_TOKEN` — длинный секрет (не равен webapp password); в extension — SecretStorage
+- `cursorRemote.mcp.allowedWorkspaces` / `MCP_ALLOWED_WORKSPACES=D:\projects\ice.agent`
+- Cursor запущен с `--remote-debugging-port=9222`, окно открыто на allowlist-пути
+
+**В панели ice.agent → MCP** добавьте сервер:
+
+| Поле | Значение |
+|------|----------|
+| Имя | `cursorremote` (важно: именно так — иначе fallback «все MCP» его не исключит) |
+| Транспорт | `streamable-http` |
+| URL | с хоста: `http://127.0.0.1:3000/mcp`; из Docker API: `http://host.docker.internal:3000/mcp` |
+| Заголовки | `Authorization=Bearer <MCP_TOKEN>` |
+
+У агента:
+
+1. Включите инструмент **MCP**.
+2. **Явно приаттачьте** сервер `cursorremote` к агенту (`PUT /api/agents/{id}/mcp-servers/{server_id}` или UI attach). Без attach агент **не** получит CursorRemote даже если у него включён MCP (в отличие от Playwright).
+3. В `tool_permissions` можно добавить флаг `cursorremote` (выдаёт mutating-права); при attach это делается автоматически.
+4. В autonomy mutating-вызовы (`send_prompt`, `approve`, `click_action`, `new_chat`, `switch_window`) требуют `request_approval`.
+
+Если Docker не достучится до `127.0.0.1:3000` на хосте — поставьте `cursorRemote.serverHost=0.0.0.0` и обязательно держите MCP-токен.
+
 В production замените `ICE_SECRET_KEY` и `ICE_ADMIN_PASSWORD`. Это единственные
 bootstrap-секреты: рабочие ключи настраиваются в веб-панели и шифруются в БД.
 
@@ -118,8 +147,33 @@ Telegram-аккаунта либо переиспользовать нужные
 
 Перед каждым ответом агент получает текущее время (в выбранном часовом поясе и
 UTC), время последнего сообщения, недавнюю переписку, сохранённую сводку старой
-части диалога и релевантные факты Mem0. Контексты разных пользователей и
-агентов не смешиваются.
+части диалога и релевантные факты Mem0. Контексты разных пользователей, проектов и агентов не смешиваются.
+В панели **Диалоги** можно опционально привязать `project_id` / `customer_id` к conversation;
+в **Память** — фильтровать записи по проекту и категории.
+Автопривязка топиков Telegram-форума — через `agent.config.memory.thread_projects`.
+
+**Текст для секции skills PM-агента** (Employee → skills → «Вставить шаблон PM» или вручную):
+
+```
+Память (Mem0):
+- Факты по проекту: memory_add(..., category="project"|"decision"|"contact")
+- Глобальные предпочтения: memory_add(..., global_scope=true)
+- Новый проект в чате: memory_set_project("project-slug", customer_id="client")
+- ice_tracker — задачи; memory — решения, контакты, договорённости
+
+Cursor IDE: инструменты mcp_CursorRemote_*.
+Сначала get_status или get_state; для долгой работы — wait(for=idle|needs_input).
+```
+
+**Текст для секции skills агента с CursorRemote** (вставить в Employee → skills):
+
+```
+Cursor IDE: инструменты mcp_cursorremote_*.
+Сначала get_status или get_state; для долгой работы — wait(for=idle|needs_input).
+Задачи — send_prompt; апрувы — approve/click_action по selectorPath из get_state.
+Не пытайся управлять чужими окнами: сервер сам режет allowlist.
+После send_prompt дождись wait(needs_input) или wait(idle), прежде чем отвечать пользователю.
+```
 
 ## Безопасность
 

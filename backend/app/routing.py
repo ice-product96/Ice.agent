@@ -200,6 +200,12 @@ class TelegramEventRouter:
                 "sender_username": payload.get("sender_username"),
                 "sender_is_bot": payload.get("sender_is_bot", False),
                 "chat_id": payload.get("chat_id"),
+                "topic_id": payload.get("topic_id"),
+                "thread_id": (
+                    str(payload["topic_id"])
+                    if payload.get("topic_id") is not None
+                    else ""
+                ),
                 "message_id": payload.get("message_id"),
                 "message_at": payload.get("date"),
                 "is_admin": is_admin,

@@ -240,6 +240,7 @@ class ConversationState(TimestampMixin, Base):
             "account_id",
             "chat_id",
             "user_id",
+            "thread_id",
             name="uq_conversation_states_identity",
         ),
         Index("ix_conversation_states_last_message_at", "last_message_at"),
@@ -251,6 +252,9 @@ class ConversationState(TimestampMixin, Base):
     )
     chat_id: Mapped[str] = mapped_column(String(64), index=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
+    thread_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    project_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    customer_id: Mapped[str | None] = mapped_column(String(120), index=True)
     rolling_summary: Mapped[str] = mapped_column(Text, default="")
     summary_through_message_id: Mapped[str | None] = mapped_column(String(64))
     summary_through_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -290,6 +294,7 @@ class EmployeeProfile(TimestampMixin, Base):
     last_digest_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     role_title: Mapped[str] = mapped_column(String(200), default="")
     mission: Mapped[str] = mapped_column(Text, default="")
+    config_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class PromptSection(TimestampMixin, Base):

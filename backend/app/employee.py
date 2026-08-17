@@ -34,13 +34,11 @@ NEED_KINDS = ("info", "access", "decision", "resource", "rest")
 
 HEARTBEAT_JOB_PREFIX = "employee-heartbeat-"
 
-EMPLOYEE_TICK_INSTRUCTION = (
-    "Ты автономный сотрудник. Это твой рабочий тик (heartbeat), не сообщение клиента. "
-    "Просмотри миссию, планы (час/день/неделя/месяц), потребности и открытые консультации. "
-    "Сделай один полезный шаг: обнови план, выполни шаг, спроси руководителя через consult_manager "
-    "или request_approval если нужно одобрение опасного действия, сохрани заметки через self_configure. "
-    "Если делать нечего — кратко зафиксируй статус и отдохни. "
-    "Не пиши длинные отчёты клиентам; финальный текст — краткий внутренний журнал тика."
+from .employee_policy import (
+    build_employee_tick_instruction,
+    employee_policy,
+    normalize_action_name,
+    action_matches_tool,
 )
 
 CONSULT_CMD_RE = re.compile(
@@ -114,6 +112,7 @@ def profile_json(profile: EmployeeProfile) -> dict[str, Any]:
         "last_digest_at": profile.last_digest_at.isoformat() if profile.last_digest_at else None,
         "role_title": profile.role_title,
         "mission": profile.mission,
+        "policy": employee_policy(profile),
         "created_at": profile.created_at.isoformat() if profile.created_at else None,
         "updated_at": profile.updated_at.isoformat() if profile.updated_at else None,
     }
@@ -320,7 +319,7 @@ async def sync_heartbeat_job(
     cron = heartbeat_cron(profile.heartbeat_minutes)
     payload = {
         "kind": "employee_tick",
-        "message": EMPLOYEE_TICK_INSTRUCTION,
+        "message": build_employee_tick_instruction(profile),
         "source": "employee_heartbeat",
         "timezone": profile.timezone or "UTC",
     }
@@ -360,6 +359,7 @@ async def schedule_immediate_tick(
     *,
     reason: str = "consult_resolved",
 ) -> CronJob:
+    profile = await get_or_create_profile(db, agent_id)
     run_at = utcnow() + timedelta(seconds=3)
     job = CronJob(
         name=f"employee-tick-once-{agent_id}-{uuid.uuid4().hex[:10]}",
@@ -367,7 +367,7 @@ async def schedule_immediate_tick(
         cron="@once",
         payload={
             "kind": "employee_tick",
-            "message": EMPLOYEE_TICK_INSTRUCTION,
+            "message": build_employee_tick_instruction(profile),
             "source": reason,
             "run_once_at": run_at.isoformat(),
             "timezone": "UTC",
@@ -438,7 +438,7 @@ class EmployeeService:
             context=(context or "").strip(),
             status="open",
             requires_approval=requires_approval,
-            action_name=(action_name or "").strip() or None,
+            action_name=(normalize_action_name(action_name) if action_name else None) or None,
             telegram_message_ids=[],
         )
         db.add(item)
@@ -562,13 +562,12 @@ class EmployeeService:
                     Consultation.agent_id == agent_id,
                     Consultation.requires_approval.is_(True),
                     Consultation.status == "approved",
-                    Consultation.action_name == action_name,
                     Consultation.answered_at.is_not(None),
                     Consultation.answered_at >= cutoff,
                 )
             )
         ).all()
-        return bool(rows)
+        return any(action_matches_tool(row.action_name, tool_name) for row in rows)
 
     async def ensure_period_plans(
         self,

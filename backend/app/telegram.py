@@ -20,7 +20,24 @@ EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 logger = logging.getLogger(__name__)
 
 
-def telegram_json(value: Any) -> Any:
+def telegram_topic_id(message: Any) -> int | None:
+    reply_to = getattr(message, "reply_to", None)
+    if reply_to is not None:
+        top_id = getattr(reply_to, "reply_to_top_id", None)
+        if top_id:
+            return int(top_id)
+        if getattr(reply_to, "forum_topic", False):
+            msg_id = getattr(reply_to, "reply_to_msg_id", None)
+            if msg_id:
+                return int(msg_id)
+    action = getattr(message, "action", None)
+    if action is not None and getattr(action, "title", None):
+        message_id = getattr(message, "id", None)
+        if message_id:
+            return int(message_id)
+    return None
+
+
     if hasattr(value, "to_dict"):
         return telegram_json(value.to_dict())
     if isinstance(value, dict):
@@ -310,6 +327,7 @@ class TelegramGateway:
             "sender_username": getattr(sender, "username", None),
             "is_admin": self.is_admin_sender(sender_id),
             "chat_id": getattr(event, "chat_id", None) or getattr(message, "chat_id", None),
+            "topic_id": telegram_topic_id(message),
             "message_id": getattr(event, "id", None) or getattr(message, "id", None),
             "date": telegram_datetime(
                 getattr(message, "date", None) or getattr(event, "date", None)
@@ -459,7 +477,20 @@ class TelegramGateway:
         return await self.get_history(phone, entity, limit=limit)
 
     async def get_messages(self, phone: str, entity: str | int, ids: int | list[int]) -> Any:
-        return telegram_json(await self._get(phone).get_messages(entity, ids=ids))
+        return telegram_json(await self._get(phone).get_messages(self._coerce_entity(entity), ids=ids))
+
+    @staticmethod
+    def _coerce_entity(entity: str | int) -> str | int:
+        if isinstance(entity, int):
+            return entity
+        text = str(entity).strip()
+        if not text:
+            return entity
+        if text.startswith("@"):
+            return text
+        if text.lstrip("-").isdigit():
+            return int(text)
+        return entity
 
     async def send_message(
         self,
@@ -472,11 +503,12 @@ class TelegramGateway:
     ) -> Any:
         await self.limiters.setdefault(phone, AsyncLimiter(20, 60)).acquire()
         client = self._get(phone)
+        peer = self._coerce_entity(entity)
         sent = []
         for index, chunk in enumerate(self._split(text)):
             if humanize:
-                await self._humanize(client, entity, chunk)
-            sent.append(await client.send_message(entity, chunk, reply_to=reply_to if index == 0 else None))
+                await self._humanize(client, peer, chunk)
+            sent.append(await client.send_message(peer, chunk, reply_to=reply_to if index == 0 else None))
         normalized = [normalized_message(message) for message in sent]
         return normalized[0] if len(normalized) == 1 else normalized
 

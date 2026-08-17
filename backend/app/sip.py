@@ -111,6 +111,7 @@ class SipGateway:
         self._desired: dict[int, SipAccount] = {}
         self._remembered_calls: set[str] = set()
         self._keeper_task: asyncio.Task[None] | None = None
+        self._account_locks: dict[int, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -163,8 +164,77 @@ class SipGateway:
                     {"account_id": account.id, "error": detail},
                 )
         if self._keeper_task is None or self._keeper_task.done():
-            self._keeper_task = asyncio.create_task(self._registration_keeper(), name="sip-keeper")
+            self._ensure_keeper()
         return results
+
+    def _account_lock(self, account_id: int) -> asyncio.Lock:
+        lock = self._account_locks.get(account_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._account_locks[account_id] = lock
+        return lock
+
+    def _ensure_keeper(self) -> None:
+        if self._keeper_task is None or self._keeper_task.done():
+            self._keeper_task = asyncio.create_task(self._registration_keeper(), name="sip-keeper")
+
+    def _build_config(self, account: SipAccount, password: str, local_port: int) -> SipEndpointConfig:
+        return SipEndpointConfig(
+            account_id=account.id,
+            login=account.login,
+            password=password,
+            domain=account.domain,
+            sip_server=account.sip_server,
+            auth_username=account.auth_username,
+            transport=account.transport or "udp",
+            sip_proxy=account.sip_proxy,
+            display_name=account.display_name or account.name,
+            caller_id=account.caller_id,
+            stun_server=account.stun_server or self.settings.sip_stun_server or None,
+            public_ip=account.public_ip or self.settings.sip_public_ip or None,
+            max_concurrent_calls=max(1, account.max_concurrent_calls or 1),
+            ring_delay_seconds=_ring_delay_seconds(
+                getattr(account, "ring_delay_seconds", None),
+                self.settings.sip_ring_delay_seconds,
+            ),
+            wait_first_rtp_seconds=max(
+                0.0,
+                float(getattr(self.settings, "sip_wait_first_rtp_seconds", 5.0) or 5.0),
+            ),
+            local_sip_port=local_port,
+            rtp_port_min=self.settings.sip_rtp_port_min,
+            rtp_port_max=self.settings.sip_rtp_port_max,
+        )
+
+    def _ua_matches(self, ua: SipUserAgent, config: SipEndpointConfig) -> bool:
+        cur = ua.config
+        return (
+            cur.login == config.login
+            and cur.password == config.password
+            and cur.domain == config.domain
+            and cur.sip_server == config.sip_server
+            and (cur.auth_username or "") == (config.auth_username or "")
+            and (cur.transport or "udp").lower() == (config.transport or "udp").lower()
+            and (cur.sip_proxy or "") == (config.sip_proxy or "")
+            and (cur.public_ip or "") == (config.public_ip or "")
+            and (cur.stun_server or "") == (config.stun_server or "")
+        )
+
+    def _apply_reg_status(self, account_id: int, ua: SipUserAgent, error: str | None = None) -> None:
+        self._reg_status[account_id] = {
+            "registered": ua.registered,
+            "status": ua.registration_status,
+            "error": error,
+        }
+
+    async def _drop_ua(self, account_id: int) -> None:
+        ua = self._agents.pop(account_id, None)
+        if ua is None:
+            return
+        try:
+            await ua.close()
+        except Exception:
+            logger.exception("SIP UA close failed for account %s", account_id)
 
     async def _registration_keeper(self) -> None:
         """Keep enabled SIP accounts registered across restarts, NAT drops, and calls."""
@@ -174,26 +244,15 @@ class SipGateway:
                 if not account.enabled:
                     continue
                 ua = self._agents.get(account_id)
-                if ua is not None and ua.registered:
+                if ua is not None and ua.transport_alive and ua.registered:
                     continue
                 logger.info("SIP keeper: registering %s", account.login)
                 try:
-                    if ua is not None:
-                        try:
-                            await ua.register()
-                            self._reg_status[account_id] = {
-                                "registered": ua.registered,
-                                "status": ua.registration_status,
-                                "error": None,
-                            }
-                            continue
-                        except Exception:
-                            logger.warning("SIP keeper: in-place REGISTER failed for %s — rebuilding UA", account.login)
                     await self.register_account(account)
                 except Exception as exc:
                     logger.warning("SIP keeper retry failed for %s: %s", account.login, exc)
 
-    async def register_account(self, account: SipAccount) -> None:
+    async def register_account(self, account: SipAccount, *, force: bool = False) -> None:
         password = self.secrets.decrypt(account.password_ciphertext)
         if not password:
             self._reg_status[account.id] = {
@@ -204,40 +263,33 @@ class SipGateway:
             raise RuntimeError("SIP account has no password")
         if account.enabled:
             self._desired[account.id] = account
-            if self._keeper_task is None or self._keeper_task.done():
-                self._keeper_task = asyncio.create_task(self._registration_keeper(), name="sip-keeper")
-        async with self._lock:
-            existing = self._agents.pop(account.id, None)
-            if existing:
-                await existing.close()
-            local_port = 0 if self._agents else self.settings.sip_bind_port
-            config = SipEndpointConfig(
-                account_id=account.id,
-                login=account.login,
-                password=password,
-                domain=account.domain,
-                sip_server=account.sip_server,
-                auth_username=account.auth_username,
-                transport=account.transport or "udp",
-                sip_proxy=account.sip_proxy,
-                display_name=account.display_name or account.name,
-                caller_id=account.caller_id,
-                stun_server=account.stun_server or self.settings.sip_stun_server or None,
-                public_ip=account.public_ip or self.settings.sip_public_ip or None,
-                max_concurrent_calls=max(1, account.max_concurrent_calls or 1),
-                ring_delay_seconds=_ring_delay_seconds(
-                    getattr(account, "ring_delay_seconds", None),
-                    self.settings.sip_ring_delay_seconds,
-                ),
-                wait_first_rtp_seconds=max(
-                    0.0,
-                    float(getattr(self.settings, "sip_wait_first_rtp_seconds", 5.0) or 5.0),
-                ),
-                local_sip_port=local_port,
-                rtp_port_min=self.settings.sip_rtp_port_min,
-                rtp_port_max=self.settings.sip_rtp_port_max,
-            )
+            self._ensure_keeper()
+        async with self._account_lock(account.id):
+            ua = self._agents.get(account.id)
+            if ua is not None and ua.transport_alive and not force:
+                probe = self._build_config(account, password, ua.config.local_sip_port)
+                if self._ua_matches(ua, probe):
+                    try:
+                        await ua.register()
+                        self._apply_reg_status(account.id, ua)
+                        await self.events.publish(
+                            "sip.registered",
+                            {"account_id": account.id, "status": ua.registration_status},
+                        )
+                        return
+                    except Exception as exc:
+                        logger.warning(
+                            "SIP in-place REGISTER failed for %s — rebuilding UA: %s",
+                            account.login,
+                            exc,
+                        )
+            await self._rebuild_ua(account, password)
 
+    async def _rebuild_ua(self, account: SipAccount, password: str) -> None:
+        await self._drop_ua(account.id)
+        async with self._lock:
+            local_port = 0 if self._agents else self.settings.sip_bind_port
+            config = self._build_config(account, password, local_port)
             ua = SipUserAgent(
                 config,
                 on_incoming=lambda call, aid=account.id: self._on_incoming(aid, call),
@@ -246,7 +298,6 @@ class SipGateway:
             )
             try:
                 await ua.start()
-                await ua.register()
             except Exception as exc:
                 try:
                     await ua.close()
@@ -264,24 +315,44 @@ class SipGateway:
                 )
                 raise
             self._agents[account.id] = ua
-            if account.enabled:
-                self._desired[account.id] = account
-            self._reg_status[account.id] = {
-                "registered": ua.registered,
-                "status": ua.registration_status,
-                "error": None,
-            }
+        try:
+            await ua.register()
+        except Exception as exc:
+            detail = str(exc).strip() or exception_text(exc)
+            self._apply_reg_status(account.id, ua, error=detail)
             await self.events.publish(
-                "sip.registered",
-                {"account_id": account.id, "status": ua.registration_status},
+                "sip.register_failed",
+                {"account_id": account.id, "error": detail},
             )
+            raise
+        if account.enabled:
+            self._desired[account.id] = account
+        self._apply_reg_status(account.id, ua)
+        await self.events.publish(
+            "sip.registered",
+            {"account_id": account.id, "status": ua.registration_status},
+        )
+
+    async def _ensure_registered(self, account: SipAccount) -> SipUserAgent:
+        ua = self._agents.get(account.id)
+        if ua is not None and ua.transport_alive and ua.registered:
+            return ua
+        logger.info("SIP ensuring REGISTER for %s before outbound call", account.login)
+        await self.register_account(account)
+        ua = self._agents.get(account.id)
+        if ua is None or not ua.transport_alive:
+            raise RuntimeError("SIP transport is not running")
+        if not ua.registered:
+            status = self.registration(account.id)
+            detail = status.get("error") or status.get("status") or "offline"
+            raise RuntimeError(f"SIP account is not registered ({detail})")
+        return ua
 
     async def unregister_account(self, account_id: int) -> None:
         self._desired.pop(account_id, None)
-        async with self._lock:
-            ua = self._agents.pop(account_id, None)
-            if ua:
-                await ua.close()
+        async with self._account_lock(account_id):
+            async with self._lock:
+                await self._drop_ua(account_id)
             self._reg_status[account_id] = {"registered": False, "status": "offline"}
 
     async def close(self) -> None:
@@ -492,10 +563,7 @@ class SipGateway:
         agent: Agent,
         number: str,
     ) -> dict[str, Any]:
-        ua = self._agents.get(account.id)
-        if ua is None:
-            await self.register_account(account)
-            ua = self._agents[account.id]
+        ua = await self._ensure_registered(account)
 
         # Prepare Realtime first so media callbacks are ready when RTP starts.
         # Temporary call id until dial returns the real SIP Call-ID.
@@ -964,16 +1032,19 @@ class SipGateway:
         )
 
     async def _refresh_register(self, account_id: int) -> None:
+        account = self._desired.get(account_id)
+        if account is not None:
+            try:
+                await self.register_account(account)
+            except Exception as exc:
+                logger.warning("SIP re-REGISTER after call failed for account %s: %s", account_id, exc)
+            return
         ua = self._agents.get(account_id)
         if ua is None:
             return
         try:
             await ua.register()
-            self._reg_status[account_id] = {
-                "registered": ua.registered,
-                "status": ua.registration_status,
-                "error": None,
-            }
+            self._apply_reg_status(account_id, ua)
         except Exception as exc:
             logger.warning("SIP re-REGISTER after call failed for account %s: %s", account_id, exc)
 

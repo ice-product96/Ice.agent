@@ -354,6 +354,67 @@ class MemoryStore:
         self._history[key] = [{"event": "ADD", "memory": text}]
         return self._fallback[key]
 
+    async def search_scoped(
+        self,
+        query: str,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        project_id: str | None = None,
+        filters: dict[str, Any] | None = None,
+        include_global: bool = True,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit or 10), 50))
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add_items(items: list[dict[str, Any]]) -> None:
+            for item in items:
+                identity = str(item.get("id") or id(item))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                merged.append(item)
+
+        extra_filters = dict(filters or {})
+        normalized_project = str(project_id or "").strip()
+        if normalized_project:
+            add_items(
+                await self.search(
+                    query,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    filters={**extra_filters, "project_id": normalized_project},
+                    limit=limit,
+                )
+            )
+        if include_global:
+            broad = await self.search(
+                query,
+                user_id=user_id,
+                agent_id=agent_id,
+                filters=extra_filters or None,
+                limit=max(limit, limit * 2),
+            )
+            global_items = [
+                item
+                for item in broad
+                if not str((item.get("metadata") or {}).get("project_id") or "").strip()
+            ]
+            add_items(global_items)
+        elif not normalized_project:
+            add_items(
+                await self.search(
+                    query,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    filters=extra_filters or None,
+                    limit=limit,
+                )
+            )
+        return merged[:limit]
+
     async def search(
         self,
         query: str,

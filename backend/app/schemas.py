@@ -195,6 +195,13 @@ class MessageLogOut(ORMModel, MessageLogIn):
     created_at: datetime
 
 
+class ConversationPatch(BaseModel):
+    project_id: str | None = None
+    customer_id: str | None = None
+    clear_project: bool = False
+    clear_customer: bool = False
+
+
 class AgentTaskIn(BaseModel):
     source_agent_id: int | None = None
     target_agent_id: int

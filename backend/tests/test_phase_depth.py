@@ -108,6 +108,16 @@ class FakeDB:
     async def commit(self) -> None:
         return None
 
+    async def flush(self) -> None:
+        return None
+
+    async def refresh(self, value: Any) -> None:
+        if getattr(value, "id", None) is None:
+            value.id = 1
+
+    async def scalar(self, statement: Any) -> Any:
+        return None
+
     async def get(self, model: type[Any], item_id: int) -> Any:
         if model is RuntimeSettings:
             return RuntimeSettings(id=1, memory_enabled=True, max_tool_rounds=8)
@@ -124,8 +134,15 @@ class FakeDB:
             )
         return None
 
-    async def scalars(self, statement: Any) -> list[Any]:
-        return []
+    async def scalars(self, statement: Any) -> Any:
+        class _ScalarResult:
+            def __iter__(self) -> Any:
+                return iter([])
+
+            def all(self) -> list[Any]:
+                return []
+
+        return _ScalarResult()
 
 
 class FakeEvents:

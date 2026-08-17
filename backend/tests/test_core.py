@@ -74,6 +74,27 @@ def test_resolve_tool_permissions_grants_telegram_ops() -> None:
     assert resolve_tool_permissions({"tools": ["memory"], "tool_permissions": []}) == set()
 
 
+def test_resolve_tool_permissions_grants_cursorremote() -> None:
+    assert "mcp_cursorremote_send_prompt" not in resolve_tool_permissions(
+        {"tools": ["mcp"], "tool_permissions": []}
+    )
+    by_flag = resolve_tool_permissions(
+        {"tools": ["mcp"], "tool_permissions": ["cursorremote"]}
+    )
+    assert "mcp_cursorremote_send_prompt" in by_flag
+    assert "mcp_cursorremote_approve" in by_flag
+    by_attach = resolve_tool_permissions(
+        {"tools": ["mcp"], "tool_permissions": []},
+        cursorremote_attached=True,
+    )
+    assert "mcp_cursorremote_click_action" in by_attach
+    policy = ToolPolicy()
+    with pytest.raises(DangerousActionError):
+        policy.check("mcp_cursorremote_send_prompt", {}, set())
+    policy.check("mcp_cursorremote_send_prompt", {}, by_attach)
+    policy.check("mcp_cursorremote_get_status", {}, set())
+
+
 def test_admin_action_report_only_for_side_effects() -> None:
     from app.action_reports import format_admin_action_report, is_side_effect_tool
 
