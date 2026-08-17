@@ -14,8 +14,10 @@ from .db import (
     AdminSettings, Agent, LlmProfile, McpServer, RuntimeSettings, SessionLocal,
     SipAccount, TelegramAccount, create_schema,
 )
+from .employee import list_agent_jobs
 from .events import events
 from .integrations import McpManager, MemoryStore, WebSearch, exception_text
+from .job_result import collect_origin_from_jobs, origin_chat_id, origin_phone, send_origin_reply
 from .routing import TelegramEventRouter
 from .runtime import AgentRuntime, TaskBus
 from .scheduler import CronManager
@@ -166,32 +168,70 @@ async def lifespan(app: FastAPI):
             agent = await db.get(Agent, agent_id)
             if not agent:
                 return {"ok": False, "skipped": True, "reason": "agent_missing"}
+
+            async def deliver_result(
+                text: Any,
+                *,
+                already_sent: bool = False,
+                extra: dict[str, Any] | None = None,
+            ) -> dict[str, Any]:
+                if already_sent:
+                    return {"sent": True, "reason": "агент уже отправил сообщение в Telegram."}
+                body = str(text or "").strip()
+                merged = {**(payload or {}), **(extra or {})}
+                account_phone = None
+                if agent.telegram_account_id is not None:
+                    account = await db.get(TelegramAccount, agent.telegram_account_id)
+                    account_phone = account.phone if account else None
+                phone = origin_phone(merged, account_phone)
+                chat_id = origin_chat_id(merged)
+                if chat_id in (None, "", False):
+                    recovered = collect_origin_from_jobs(
+                        await list_agent_jobs(db, agent.id, enabled_only=False)
+                    )
+                    phone = origin_phone(recovered, phone)
+                    chat_id = origin_chat_id(recovered)
+                return await send_origin_reply(telegram, phone, chat_id, body)
+
             kind = str(payload.get("kind") or "")
             if kind == "employee_tick" or payload.get("source") in {
                 "employee_heartbeat",
                 "consult_resolved",
                 "employee_tick",
             }:
-                return await runtime.tick(
+                tick_result = await runtime.tick(
                     db,
                     agent,
                     force=bool(payload.get("force")),
                     reason=str(payload.get("source") or kind or "heartbeat"),
                 )
+                if tick_result.get("deliver_origin"):
+                    delivery = await deliver_result(
+                        tick_result.get("result"),
+                        already_sent=bool(tick_result.get("origin_already_sent")),
+                        extra={
+                            "reply_phone": tick_result.get("reply_phone"),
+                            "reply_chat_id": tick_result.get("reply_chat_id"),
+                        },
+                    )
+                    tick_result["delivery"] = delivery
+                    tick_result["notified"] = bool(delivery.get("sent"))
+                return tick_result
             result = await runtime.run(db, agent, str(payload.get("message", "")), payload)
-            if payload.get("_deliver_origin_reply"):
-                phone = payload.get("reply_phone")
-                chat_id = payload.get("reply_chat_id")
-                text = (result or "").strip()
-                if phone and chat_id and text:
-                    entity = int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
-                    await telegram.send_message(str(phone), entity, text)
-            return {
+            outcome = {
                 "ok": True,
                 "result": result,
-                "notified": bool(payload.get("_deliver_origin_reply")),
+                "notified": False,
                 "notes": list(payload.get("_job_notes") or []),
             }
+            if payload.get("_deliver_origin_reply"):
+                delivery = await deliver_result(
+                    result,
+                    already_sent=bool(payload.get("_origin_already_sent")),
+                )
+                outcome["delivery"] = delivery
+                outcome["notified"] = bool(delivery.get("sent"))
+            return outcome
 
     scheduler = CronManager(SessionLocal, run_scheduled)
     runtime.bind_scheduler(scheduler)

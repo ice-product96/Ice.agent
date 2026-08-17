@@ -1,3 +1,5 @@
+import pytest
+
 from app.contract import cron_json
 from app.job_result import (
     describe_value,
@@ -33,15 +35,66 @@ def test_humanize_error() -> None:
     assert "MCP" in outcome["summary"]
 
 
-def test_humanize_agent_reply_and_notes() -> None:
+def test_humanize_does_not_claim_sent_from_intent_flag() -> None:
     outcome = humanize_job_outcome(
-        {"ok": True, "result": "Сводка отправлена.", "notified": True},
-        payload={"_job_notes": ["Сообщение отправлено в Telegram."]},
+        {"ok": True, "result": "Карусель обновлена."},
+        payload={"_deliver_origin_reply": True, "reply_chat_id": None},
     )
-    assert outcome["status"] == "completed"
-    assert outcome["title"] == "Выполнено"
-    assert outcome["summary"] == "Сводка отправлена."
-    assert "Telegram" in " ".join(outcome["details"])
+    joined = " ".join(outcome["details"])
+    assert "отправлен" not in joined
+    assert outcome["summary"] == "Карусель обновлена."
+
+
+def test_humanize_reports_failed_customer_delivery() -> None:
+    outcome = humanize_job_outcome(
+        {
+            "ok": True,
+            "result": "Карусель обновлена.",
+            "delivery": {"sent": False, "reason": "не сохранён исходный чат заказчика."},
+        }
+    )
+    assert any("Заказчику не отправлено" in item for item in outcome["details"])
+    assert not any("Результат отправлен" in item for item in outcome["details"])
+
+
+def test_followup_payload_keeps_origin_chat() -> None:
+    from app.job_result import build_followup_payload, collect_origin_from_jobs, origin_chat_id
+
+    payload = build_followup_payload(
+        message="cursorremote_check",
+        run_at_iso="2026-08-17T15:00:00+00:00",
+        timezone="Asia/Yekaterinburg",
+        context={"chat_id": 123456, "phone": "+79001112233", "sender_id": 99},
+        account_phone="+79001112233",
+    )
+    assert payload["reply_chat_id"] == 123456
+    assert payload["chat_id"] == 123456
+    assert payload["reply_phone"] == "+79001112233"
+    recovered = collect_origin_from_jobs([type("Job", (), {"payload": payload})()])
+    assert origin_chat_id(recovered) == 123456
+
+
+@pytest.mark.asyncio
+async def test_send_origin_reply_only_marks_sent_after_success() -> None:
+    from app.job_result import send_origin_reply
+
+    class FakeTelegram:
+        def __init__(self) -> None:
+            self.sent: list[tuple] = []
+
+        async def send_message(self, phone: str, entity: object, text: str) -> dict:
+            self.sent.append((phone, entity, text))
+            return {"ok": True}
+
+    telegram = FakeTelegram()
+    skipped = await send_origin_reply(telegram, "+7900", None, "готово")
+    assert skipped["sent"] is False
+    assert "чат" in skipped["reason"]
+    assert telegram.sent == []
+
+    delivered = await send_origin_reply(telegram, "+7900", "123", "готово")
+    assert delivered["sent"] is True
+    assert telegram.sent == [("+7900", 123, "готово")]
 
 
 def test_public_job_result_strips_internal_keys() -> None:

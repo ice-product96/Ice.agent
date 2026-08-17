@@ -1760,6 +1760,21 @@ async def update_cron(job_id: str, request: Request, db: AsyncSession = Depends(
     schedule, job_payload = cron_values(payload)
     if previous.get("last_result"):
         job_payload["last_result"] = previous["last_result"]
+    for key in (
+        "kind",
+        "source",
+        "reply_to_chat",
+        "reply_chat_id",
+        "reply_phone",
+        "chat_id",
+        "phone",
+        "sender_id",
+        "sender_username",
+        "is_admin",
+        "message_id",
+    ):
+        if key not in job_payload and previous.get(key) not in (None, ""):
+            job_payload[key] = previous[key]
     job.name = payload.name
     job.agent_id = as_int(payload.agent_id, "agent_id")
     job.cron = schedule

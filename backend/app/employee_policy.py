@@ -108,7 +108,8 @@ def build_employee_tick_instruction(profile: Any) -> str:
         "Просмотри миссию, расписание (schedule_self_list), потребности и открытые консультации.",
         "Следующие шаги ставь себе через schedule_self — не используй hour/day/week/month планы.",
         "Если ждёшь Cursor: cursorremote_check. Пока done=false — снова schedule_self через ~2 минуты, "
-        "заказчику не пиши что готово. Если done=true — сразу напиши заказчику результат и НЕ ставь новый schedule_self.",
+        "заказчику не пиши что готово. Если done=true — финальный текст это сообщение заказчику "
+        "(платформа отправит его в исходный чат), новый schedule_self не ставь.",
         "Сделай один полезный шаг и при необходимости сохрани заметки через self_configure.",
     ]
     if policy.get("consult_manager_on_idle_tick"):
@@ -125,7 +126,7 @@ def build_employee_tick_instruction(profile: Any) -> str:
         "request_approval используй только для действительно опасных операций из списка политики. "
         "action_name передавай как имя инструмента (например sip_dial), не человекочитаемый текст."
     )
-    parts.append("Финальный текст — краткий внутренний журнал тика, не сообщение клиенту.")
+    parts.append("Финальный текст — краткий внутренний журнал тика, не сообщение клиенту. Исключение: Cursor done=true — тогда финальный текст для заказчика.")
     extra = str(policy.get("tick_instruction_extra") or "").strip()
     if extra:
         parts.append(extra)

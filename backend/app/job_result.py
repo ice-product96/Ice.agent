@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from .action_reports import audit_tool_result
 from .integrations import exception_text
+
+logger = logging.getLogger(__name__)
 
 SKIP_REASONS = {
     "agent_missing": "Агент не найден.",
@@ -20,6 +23,113 @@ SKIP_REASONS = {
 }
 
 PUBLIC_RESULT_KEYS = ("ok", "status", "title", "summary", "details", "ran_at")
+ORIGIN_CHAT_KEYS = ("reply_chat_id", "chat_id", "entity", "sender_id")
+
+
+def origin_chat_id(payload: dict[str, Any] | None) -> Any:
+    source = payload or {}
+    for key in ORIGIN_CHAT_KEYS:
+        value = source.get(key)
+        if value not in (None, "", False):
+            return value
+    return None
+
+
+def origin_phone(payload: dict[str, Any] | None, account_phone: str | None = None) -> str | None:
+    source = payload or {}
+    for value in (source.get("reply_phone"), source.get("phone"), account_phone):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def build_followup_payload(
+    *,
+    message: str,
+    run_at_iso: str,
+    timezone: str,
+    context: dict[str, Any] | None,
+    account_phone: str | None,
+) -> dict[str, Any]:
+    source = context or {}
+    chat_id = origin_chat_id(source)
+    phone = origin_phone(source, account_phone)
+    return {
+        "message": message,
+        "run_once_at": run_at_iso,
+        "timezone": timezone,
+        "source": "scheduled",
+        "reply_to_chat": bool(chat_id),
+        "reply_phone": phone,
+        "reply_chat_id": chat_id,
+        "chat_id": chat_id,
+        "phone": phone,
+        "sender_id": source.get("sender_id") or chat_id,
+        "sender_username": source.get("sender_username"),
+        "is_admin": bool(source.get("is_admin")),
+        "message_id": source.get("message_id"),
+    }
+
+
+def collect_origin_from_jobs(jobs: list[Any]) -> dict[str, Any]:
+    for job in jobs:
+        payload = getattr(job, "payload", None) or {}
+        chat_id = origin_chat_id(payload)
+        if chat_id in (None, "", False):
+            continue
+        phone = origin_phone(payload)
+        return {
+            "reply_chat_id": chat_id,
+            "chat_id": payload.get("chat_id") or chat_id,
+            "reply_phone": phone,
+            "phone": phone,
+            "sender_id": payload.get("sender_id") or chat_id,
+            "sender_username": payload.get("sender_username"),
+            "is_admin": payload.get("is_admin"),
+            "message_id": payload.get("message_id"),
+        }
+    return {}
+
+
+def telegram_already_sent(audit: list[dict[str, Any]] | None) -> bool:
+    for call in audit or []:
+        if not isinstance(call, dict):
+            continue
+        if str(call.get("tool") or "") == "telegram_send_message" and call.get("status") == "success":
+            return True
+    return False
+
+
+def coerce_telegram_entity(chat_id: Any) -> Any:
+    raw = str(chat_id).strip()
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    return raw
+
+
+async def send_origin_reply(
+    telegram: Any,
+    phone: str | None,
+    chat_id: Any,
+    text: str,
+) -> dict[str, Any]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return {"sent": False, "reason": "нет текста результата."}
+    if telegram is None:
+        return {"sent": False, "reason": "Telegram не подключён."}
+    if not phone:
+        return {"sent": False, "reason": "нет Telegram-аккаунта агента."}
+    if chat_id in (None, "", False):
+        return {"sent": False, "reason": "не сохранён исходный чат заказчика."}
+    try:
+        entity = coerce_telegram_entity(chat_id)
+        await telegram.send_message(str(phone), entity, cleaned)
+        return {"sent": True, "chat_id": entity, "phone": str(phone)}
+    except Exception as exc:
+        logger.exception("Failed to deliver scheduled result to origin Telegram chat")
+        return {"sent": False, "reason": exception_text(exc)}
 
 
 def _utc_now() -> str:
@@ -148,8 +258,6 @@ def humanize_job_outcome(
         }
 
     details = list(payload.get("_job_notes") or [])
-    if payload.get("_deliver_origin_reply"):
-        details.append("Результат отправлен в исходный чат Telegram.")
 
     if isinstance(raw, dict) and raw.get("skipped"):
         reason = str(raw.get("reason") or "skipped")
@@ -167,7 +275,14 @@ def humanize_job_outcome(
         extra_notes = raw.get("notes")
         if isinstance(extra_notes, list):
             details.extend(str(item) for item in extra_notes if str(item).strip())
-        if raw.get("notified"):
+        delivery = raw.get("delivery")
+        if isinstance(delivery, dict):
+            if delivery.get("sent"):
+                details.append("Результат отправлен в исходный чат Telegram.")
+            else:
+                reason = str(delivery.get("reason") or "").strip()
+                details.append("Заказчику не отправлено" + (f": {reason}" if reason else "."))
+        elif raw.get("notified"):
             details.append("Результат отправлен в исходный чат Telegram.")
         text = describe_value(raw.get("result") if "result" in raw else raw)
     elif raw not in (None, ""):

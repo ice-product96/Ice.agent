@@ -26,7 +26,13 @@ from .db import (
     utcnow,
 )
 from .action_reports import cursor_finished_in_audit, format_admin_action_report
-from .job_result import notes_from_audit
+from .job_result import (
+    build_followup_payload,
+    collect_origin_from_jobs,
+    notes_from_audit,
+    origin_chat_id,
+    telegram_already_sent,
+)
 from .employee import (
     AGENT_EDITABLE_SECTIONS,
     NEED_KINDS,
@@ -636,19 +642,13 @@ class AgentRuntime:
                 target = target.astimezone(timezone.utc)
                 if target <= datetime.now(timezone.utc):
                     raise ValueError("run_at must be in the future")
-                source = context or {}
-                chat_id = source.get("reply_chat_id") or source.get("chat_id") or source.get("entity")
-                payload = {
-                    "message": message,
-                    "run_once_at": target.isoformat(),
-                    "timezone": runtime_settings.timezone,
-                    "source": "scheduled",
-                    "reply_to_chat": bool(chat_id),
-                    "reply_phone": phone or source.get("reply_phone") or source.get("phone"),
-                    "reply_chat_id": chat_id,
-                    "sender_id": source.get("sender_id"),
-                    "sender_username": source.get("sender_username"),
-                }
+                payload = build_followup_payload(
+                    message=message,
+                    run_at_iso=target.isoformat(),
+                    timezone=runtime_settings.timezone,
+                    context=context,
+                    account_phone=phone,
+                )
                 job = CronJob(
                     name=name.strip() or f"once-{agent.id}-{uuid4().hex[:12]}",
                     agent_id=agent.id,
@@ -878,12 +878,16 @@ class AgentRuntime:
         if prepared.get("skip"):
             return {"ok": True, "skipped": True, "reason": prepared.get("reason")}
         await self.employee.mark_tick(db, profile)
+        origin = collect_origin_from_jobs(
+            await list_agent_jobs(db, agent.id, enabled_only=False)
+        )
         context = {
             "source": "employee_tick",
             "employee_tick": True,
             "force_tick": force,
             "tick_reason": reason,
             "user_id": f"employee:{agent.id}",
+            **{key: value for key, value in origin.items() if value not in (None, "")},
         }
         message = build_employee_tick_instruction(profile)
         result = await self.run(db, agent, message, context)
@@ -900,6 +904,10 @@ class AgentRuntime:
             "skipped": False,
             "result": result,
             "notes": list(context.get("_job_notes") or []),
+            "deliver_origin": bool(context.get("_deliver_origin_reply")),
+            "origin_already_sent": bool(context.get("_origin_already_sent")),
+            "reply_phone": context.get("reply_phone") or context.get("phone"),
+            "reply_chat_id": origin_chat_id(context),
         }
 
     async def run(
@@ -1052,8 +1060,9 @@ class AgentRuntime:
                 )
             is_employee_tick = bool(
                 context.get("employee_tick")
-                or context.get("source") in {"employee_tick", "scheduled", "employee_heartbeat"}
+                or context.get("source") in {"employee_tick", "employee_heartbeat"}
             )
+            origin_followup = context.get("source") == "scheduled" and origin_chat_id(context) is not None
             phone_hint = ""
             if is_telegram and not context.get("is_admin"):
                 lower = message.lower()
@@ -1077,7 +1086,19 @@ class AgentRuntime:
                         "If they asked for a call, invoke sip_dial with the full mobile number "
                         "(79XXXXXXXXX). Never use sender_id or chat_id."
                     )
-            if is_employee_tick:
+            if origin_followup:
+                chat = origin_chat_id(context)
+                role_instruction = (
+                    "This is a scheduled follow-up for a customer request. "
+                    f"The original Telegram chat is {chat}. "
+                    "Your FINAL assistant message is delivered to that chat by the platform — "
+                    "write the result for the customer, not an internal journal and not JSON. "
+                    "Do not claim that a Telegram message was already sent. "
+                    "If Cursor done=true, summarize what was done. "
+                    "If done=false, do not tell the customer it is ready. "
+                    + customer_telegram_instruction()
+                )
+            elif is_employee_tick:
                 role_instruction = build_employee_tick_instruction(employee_profile)
             elif is_telegram:
                 role_instruction = (
@@ -1321,6 +1342,7 @@ class AgentRuntime:
                 await db.commit()
             await self.events.publish("agent.completed", {"agent_id": agent.id, "text": result})
             context["_job_notes"] = notes_from_audit(registry.audit)
+            context["_origin_already_sent"] = telegram_already_sent(registry.audit)
             if cursor_finished_in_audit(registry.audit) and not suppressed:
                 context["_deliver_origin_reply"] = True
             return result

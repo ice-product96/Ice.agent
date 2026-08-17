@@ -70,7 +70,7 @@ def test_tick_instruction_uses_scheduler() -> None:
     assert "schedule_self" in text
     assert "cursorremote_check" in text
     assert "планы (час/день" not in text
-    assert "НЕ ставь новый schedule_self" in text
+    assert "новый schedule_self не ставь" in text
 
 
 def test_once_job_status_is_completed_after_run() -> None:
