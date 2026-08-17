@@ -20,6 +20,7 @@ from .employee import (
     consultation_json,
     ensure_prompt_sections,
     get_or_create_profile,
+    list_agent_jobs,
     need_json,
     plan_json,
     profile_json,
@@ -635,6 +636,7 @@ async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depen
             .limit(40)
         )
     ).all()
+    jobs = await list_agent_jobs(db, agent.id, enabled_only=False)
     consults = (
         await db.scalars(
             select(Consultation)
@@ -649,6 +651,7 @@ async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depen
         "profile": profile_json(profile),
         "prompt_sections": sections,
         "plans": [plan_json(p) for p in plans],
+        "jobs": [cron_json(job) for job in jobs[:40]],
         "needs": [need_json(n) for n in needs],
         "consultations": [consultation_json(c) for c in consults],
     }

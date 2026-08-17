@@ -25,12 +25,10 @@ TELEGRAM_SURFACE_TOOLS = frozenset(
 
 SIP_SURFACE_TOOLS = frozenset({"sip_dial", "sip_hangup", "sip_status"})
 
-CURSORREMOTE_SURFACE_TOOLS = frozenset({"cursorremote_do"})
+CURSORREMOTE_SURFACE_TOOLS = frozenset({"cursorremote_do", "cursorremote_check"})
 
 EMPLOYEE_SURFACE_TOOLS = frozenset(
     {
-        "plan_get",
-        "plan_upsert",
         "need_upsert",
         "consult_manager",
         "request_approval",
@@ -58,7 +56,7 @@ def tool_namespace(name: str) -> str:
         return "telegram"
     if tool.startswith("sip_"):
         return "sip"
-    if tool.startswith(("plan_", "need_", "consult_", "request_", "self_", "employee_")):
+    if tool.startswith(("need_", "consult_", "request_", "self_", "employee_")):
         return "employee"
     if tool.startswith("schedule_self"):
         return "scheduler"
@@ -109,7 +107,7 @@ def _tool_sort_key(name: str) -> tuple[int, str]:
     if name.startswith("sip_"):
         return (3, name)
     if name.startswith(
-        ("plan_", "need_", "consult_manager", "request_approval", "self_configure", "employee_")
+        ("need_", "consult_manager", "request_approval", "self_configure", "employee_")
     ):
         return (4, name)
     if name.startswith("schedule_self"):

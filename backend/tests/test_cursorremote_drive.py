@@ -1,4 +1,51 @@
-from app.cursorremote_drive import _approval_actions, parse_mcp_payload
+import asyncio
+import json
+
+from app.cursorremote_drive import (
+    _approval_actions,
+    check_and_drive,
+    cursor_is_busy,
+    drive_until_done,
+    parse_mcp_payload,
+    summarize_cursor_state,
+)
+
+
+class _Item:
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+
+    def model_dump(self) -> dict:
+        if isinstance(self.payload, str):
+            return {"type": "text", "text": self.payload}
+        return {"type": "text", "text": json.dumps(self.payload)}
+
+
+class _Resp:
+    def __init__(self, payload: object, is_error: bool = False) -> None:
+        self.content = [_Item(payload)]
+        self.isError = is_error
+
+
+class ScriptSession:
+    def __init__(self, queues: dict[str, list], default: dict | None = None) -> None:
+        self.queues = {key: list(values) for key, values in queues.items()}
+        self.calls: list[tuple[str, dict]] = []
+        self.default = default or {
+            "agentStatus": "idle",
+            "pendingApprovalCount": 0,
+            "agentActivityLive": False,
+        }
+
+    async def call_tool(self, tool: str, arguments: dict | None = None):
+        self.calls.append((tool, dict(arguments or {})))
+        queue = self.queues.setdefault(tool, [])
+        if not queue:
+            return _Resp(self.default)
+        item = queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return _Resp(item)
 
 
 def test_parse_mcp_json_text() -> None:
@@ -19,3 +66,91 @@ def test_approval_actions_skip_reject() -> None:
     actions = _approval_actions(pending)
     assert len(actions) == 1
     assert actions[0]["selectorPath"] == "#allow"
+
+
+def test_cursor_is_busy_statuses() -> None:
+    assert cursor_is_busy({"agentStatus": "thinking"})
+    assert cursor_is_busy({"agentStatus": "idle", "agentActivityLive": True})
+    assert cursor_is_busy({"agentStatus": "idle", "pendingApprovalCount": 2})
+    assert not cursor_is_busy({"agentStatus": "idle", "pendingApprovalCount": 0})
+
+
+def test_summarize_cursor_state_uses_assistant_text() -> None:
+    summary = summarize_cursor_state(
+        {
+            "messages": [
+                {"type": "human", "text": "do LAVVE"},
+                {"type": "assistant", "text": "Workspace ready, changes applied."},
+            ]
+        }
+    )
+    assert "Workspace ready" in summary
+    assert "do LAVVE" not in summary
+
+
+def test_drive_does_not_treat_immediate_idle_as_done() -> None:
+    session = ScriptSession({})
+    result = asyncio.run(
+        drive_until_done(session, timeout_ms=500, start_grace_ms=0, idle_debounce_ms=0, require_busy=True)
+    )
+    assert result["done"] is False
+    assert result["status"] == "not_started"
+    assert result["ok"] is True
+    assert "next" in result
+
+
+def test_drive_returns_done_after_busy_then_idle() -> None:
+    session = ScriptSession(
+        {
+            "get_status": [
+                {"agentStatus": "thinking", "pendingApprovalCount": 0},
+                {"agentStatus": "thinking", "pendingApprovalCount": 0},
+                {"agentStatus": "idle", "pendingApprovalCount": 0},
+                {"agentStatus": "idle", "pendingApprovalCount": 0},
+                {"agentStatus": "idle", "pendingApprovalCount": 0},
+                {"agentStatus": "idle", "pendingApprovalCount": 0},
+            ],
+            "wait": [{"status": "needs_input", "pendingApprovalCount": 0}],
+            "get_state": [
+                {
+                    "pendingApprovals": [],
+                    "messages": [{"type": "assistant", "text": "LAVVE changes applied."}],
+                }
+            ],
+        }
+    )
+    result = asyncio.run(
+        drive_until_done(session, timeout_ms=2000, start_grace_ms=0, idle_debounce_ms=0, require_busy=True)
+    )
+    assert result["done"] is True
+    assert result["status"] == "idle"
+    assert "LAVVE changes applied" in result["summary"]
+
+
+def test_drive_timeout_while_working() -> None:
+    busy = {"agentStatus": "generating", "pendingApprovalCount": 0, "agentActivityLive": True}
+    session = ScriptSession({"wait": [{"status": "timeout"} for _ in range(20)]}, default=busy)
+    result = asyncio.run(
+        drive_until_done(session, timeout_ms=80, start_grace_ms=0, idle_debounce_ms=0, require_busy=True)
+    )
+    assert result["done"] is False
+    assert result["status"] in {"working", "generating", "timeout"}
+    assert "schedule_self" in result["next"]
+
+
+def test_check_idle_is_done() -> None:
+    session = ScriptSession(
+        {
+            "get_status": [
+                {"agentStatus": "idle", "pendingApprovalCount": 0},
+                {"agentStatus": "idle", "pendingApprovalCount": 0},
+                {"agentStatus": "idle", "pendingApprovalCount": 0},
+            ],
+            "get_state": [
+                {"messages": [{"type": "assistant", "text": "Already finished."}]}
+            ],
+        }
+    )
+    result = asyncio.run(check_and_drive(session, timeout_ms=500, idle_debounce_ms=0))
+    assert result["done"] is True
+    assert "Already finished" in result["summary"]

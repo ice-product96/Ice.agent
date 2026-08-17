@@ -178,11 +178,12 @@ async def lifespan(app: FastAPI):
                 )
                 return
             result = await runtime.run(db, agent, str(payload.get("message", "")), payload)
-            phone = payload.get("reply_phone")
-            chat_id = payload.get("reply_chat_id")
-            if phone and chat_id:
-                entity = int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
-                await telegram.send_message(str(phone), entity, result)
+            if payload.get("reply_to_chat"):
+                phone = payload.get("reply_phone")
+                chat_id = payload.get("reply_chat_id")
+                if phone and chat_id:
+                    entity = int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
+                    await telegram.send_message(str(phone), entity, result)
 
     scheduler = CronManager(SessionLocal, run_scheduled)
     runtime.bind_scheduler(scheduler)

@@ -66,10 +66,12 @@ ice_tracker (MCP):
 playwright (MCP):
 - Открытие страниц, формы, скриншоты — для проверки сайтов клиентов
 
-Cursor IDE (cursorremote_do / mcp_cursorremote_*):
-- Задачи в Cursor — cursorremote_do("что сделать"). Allow/Accept/Run нажимает платформа сама.
+Cursor IDE (cursorremote_do / cursorremote_check):
+- Задачу в Cursor отдавай через cursorremote_do("что сделать"). Allow/Accept/Run нажимает платформа сама.
 - Никогда не проси человека нажать Allow в IDE.
-- get_status / get_state / wait — только если нужен статус, не вместо cursorremote_do
+- done=true — Cursor закончил. Проверь summary. Только после этого пиши заказчику, что готово.
+- done=false или один send_prompt — это НЕ готовность. schedule_self через ~2 минуты: cursorremote_check и снова ждать.
+- Не используй hour/day/week/month планы. Следующие шаги — только schedule_self.
 `
 
 const statusLabel: Record<string, string> = {
@@ -1176,13 +1178,16 @@ function EmployeeScreen() {
       </section>
 
       <section className="panel">
-        <SectionHead title={`Планы (${state.plans.length})`} text="Час / день / неделя / месяц"/>
-        {state.plans.length === 0 ? <Empty icon={CalendarClock} title="Планов пока нет" text="Появятся на первом тике или когда сотрудник создаст их сам."/> :
-          <div className="card-grid">{state.plans.map(plan => <article className="entity-card" key={plan.id}>
-            <div className="entity-top"><span className="chip">{plan.horizon}</span><StatusDot status={plan.status === 'active' ? 'online' : plan.status === 'done' ? 'paused' : 'pending'}/></div>
-            <h3>{plan.title || `План #${plan.id}`}</h3>
-            <p style={{ whiteSpace: 'pre-wrap' }}>{(plan.body?.steps || []).map(s => `${s.status === 'done' ? '✓' : '·'} ${s.title}`).join('\n') || 'Шагов нет'}</p>
-          </article>)}</div>}
+        <SectionHead title={`Расписание (${(state.jobs || []).length})`} text="Штатное расписание агента. Следующие шаги сотрудник ставит себе через schedule_self."/>
+        {(state.jobs || []).length === 0 ? <Empty icon={CalendarClock} title="Задач в расписании нет" text="Heartbeat и разовые follow-up (например проверка Cursor) появятся здесь."/> :
+          <div className="list-panel">{(state.jobs || []).map(job => <div className="server-row" key={job.id}>
+            <span className="chip">{job.run_once_at ? 'once' : 'cron'}</span>
+            <div className="grow">
+              <strong>{job.name}</strong>
+              <small>{job.run_once_at ? new Date(job.run_once_at).toLocaleString() : job.schedule}{job.prompt ? ` · ${job.prompt.slice(0, 160)}` : ''}</small>
+            </div>
+            <StatusDot status={job.enabled ? 'online' : 'paused'}/>
+          </div>)}</div>}
       </section>
 
       <section className="panel">

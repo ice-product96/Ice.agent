@@ -32,9 +32,6 @@ SIP_OPERATIONAL_PERMISSIONS = {
 
 # Granted when autonomy/employee mode is enabled on the agent profile or tools include employee.
 EMPLOYEE_OPERATIONAL_PERMISSIONS = {
-    "plan_upsert",
-    "plan_get",
-    "plan_complete_step",
     "need_upsert",
     "need_satisfy",
     "consult_manager",
@@ -62,6 +59,7 @@ CURSORREMOTE_OPERATIONAL_PERMISSIONS = {
     "mcp_cursorremote_set_model",
     "mcp_cursorremote_set_plan_model",
     "cursorremote_do",
+    "cursorremote_check",
 }
 
 # Dangerous tools that require a fresh manager approval while autonomy is on.

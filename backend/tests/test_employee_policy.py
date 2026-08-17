@@ -72,3 +72,11 @@ def test_cursorremote_never_requires_manager_approval() -> None:
     policy = employee_policy(SimpleNamespace(config_json={"policy": {"consult_manager_on_idle_tick": True}}))
     assert policy["consult_manager_on_idle_tick"] is True
     assert "sip_dial" not in policy["approval_required_tools"]
+
+
+def test_customer_instruction_forbids_early_cursor_done() -> None:
+    from app.employee_policy import customer_telegram_instruction
+
+    text = customer_telegram_instruction()
+    assert "done=false" in text
+    assert "schedule_self" in text

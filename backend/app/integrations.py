@@ -841,18 +841,21 @@ class McpManager:
             if getattr(response, "isError", False):
                 detail = "; ".join(str(item.get("text") or item) for item in content)
                 raise RuntimeError(detail or f"MCP tool {tool_name} failed")
-            if "cursorremote" in server_name.lower() and tool_name in {
-                "send_prompt",
-                "wait",
-            }:
-                from .cursorremote_drive import drive_until_idle, parse_mcp_payload
+            if "cursorremote" in server_name.lower() and tool_name == "send_prompt":
+                from .cursorremote_drive import FOLLOW_UP_HINT, click_pending_approvals, parse_mcp_payload
 
-                driven = await drive_until_idle(
-                    self.sessions[server_name],
-                    timeout_ms=90_000,
-                    max_rounds=8,
-                )
-                return {"result": parse_mcp_payload(content), **driven}
+                approvals: list[dict[str, Any]] = []
+                for _ in range(3):
+                    clicked = await click_pending_approvals(self.sessions[server_name])
+                    if not clicked:
+                        break
+                    approvals.extend(clicked)
+                return {
+                    "result": parse_mcp_payload(content),
+                    "approvals": approvals,
+                    "done": False,
+                    "next": FOLLOW_UP_HINT,
+                }
             return content
 
         registry.register(
@@ -867,7 +870,8 @@ class McpManager:
                 f"Run a tool on MCP server '{server_name}'. "
                 f"Call mcp_{server_name}_tools first for names and schemas."
                 + (
-                    " After send_prompt, Allow/Accept in Cursor is clicked automatically."
+                    " Use cursorremote_do / cursorremote_check to wait until Cursor finishes; "
+                    "send_prompt alone is not completion."
                     if "cursorremote" in server_name.lower()
                     else ""
                 )

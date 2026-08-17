@@ -104,9 +104,12 @@ def approval_required_for_tool(
 def build_employee_tick_instruction(profile: Any) -> str:
     policy = employee_policy(profile)
     parts = [
-        "Ты автономный сотрудник. Это твой рабочий тик (heartbeat), не сообщение клиента.",
-        "Просмотри миссию, планы (час/день/неделя/месяц), потребности и открытые консультации.",
-        "Сделай один полезный шаг: обнови план, выполни шаг, сохрани заметки через self_configure.",
+        "Ты автономный сотрудник. Это твой рабочий тик, не сообщение клиента.",
+        "Просмотри миссию, расписание (schedule_self_list), потребности и открытые консультации.",
+        "Следующие шаги ставь себе через schedule_self — не используй hour/day/week/month планы.",
+        "Если ждёшь Cursor: cursorremote_check. Пока done=false — снова schedule_self через ~2 минуты, "
+        "заказчику не пиши что готово. Если done=true — проверь summary, и только тогда напиши заказчику.",
+        "Сделай один полезный шаг и при необходимости сохрани заметки через self_configure.",
     ]
     if policy.get("consult_manager_on_idle_tick"):
         parts.append(
@@ -137,7 +140,10 @@ def customer_telegram_instruction() -> str:
         "NEVER mention manager approval, internal consultations, request_approval, or platform "
         "mechanics to the customer. "
         "NEVER tell the customer to click Allow/Accept in Cursor — you click those yourself "
-        "via cursorremote_do or mcp_cursorremote_run(approve / approve_all / click_action). "
+        "via cursorremote_do / cursorremote_check. "
+        "A successful send_prompt or done=false is NOT completion. Wait until cursorremote_do/"
+        "cursorremote_check returns done=true, verify the summary, then message the customer. "
+        "If Cursor is still running, schedule_self in ~2 minutes to check again. "
         "If they say 'call me' without a number, ask once naturally for their phone number. "
                     "When they send a phone number, call immediately — do not wait for manager confirmation. "
                     "When you call sip_dial, always fill purpose (why you call, what to achieve) and opening. "
@@ -153,7 +159,8 @@ def manager_telegram_instruction() -> str:
         "When they give a direct order (write to someone, call someone, gather requirements), "
         "execute it immediately using the appropriate tools. "
         "Do not use request_approval or consult_manager for routine operational tasks they explicitly requested. "
-        "Cursor Allow/Accept/Run dialogs: click them yourself with cursorremote_do / approve_all / click_action. "
+        "Cursor Allow/Accept/Run dialogs: click them yourself with cursorremote_do / cursorremote_check. "
         "Never ask a human to press Allow in the IDE. "
+        "done=true after cursorremote_check/do means Cursor finished — verify the summary before reporting to anyone. "
         "Use request_approval only for destructive or high-risk actions listed in your approval policy."
     )

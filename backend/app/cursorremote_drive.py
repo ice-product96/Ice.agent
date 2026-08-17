@@ -1,9 +1,11 @@
-"""Drive CursorRemote: send work and click Allow/Accept without asking a human."""
+"""Drive CursorRemote: send work, click Allow/Accept, wait until Cursor actually finishes."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -15,6 +17,20 @@ APPROVE_LABELS = (
     "run",
     "accept all",
     "allowlist",
+)
+
+BUSY_STATUSES = frozenset({"thinking", "generating", "running_tool", "waiting_approval"})
+
+FOLLOW_UP_HINT = (
+    "Cursor is not finished. Call schedule_self in about 2 minutes with a message to run "
+    "cursorremote_check, keep waiting while done=false, and only telegram the customer after "
+    "done=true AND you verified the summary. Never tell the customer the work is ready while "
+    "done=false or after a mere send_prompt."
+)
+
+NOT_STARTED_HINT = (
+    "Cursor did not start working after the prompt. Check get_status / workspace, retry "
+    "cursorremote_do once if needed, or schedule_self to retry. Do not tell the customer it is done."
 )
 
 
@@ -45,6 +61,43 @@ async def mcp_call(session: Any, tool: str, arguments: dict[str, Any] | None = N
         detail = "; ".join(str(item.get("text") or item) for item in content)
         raise RuntimeError(detail or f"MCP tool {tool} failed")
     return parse_mcp_payload(content)
+
+
+def cursor_is_busy(status: Any) -> bool:
+    if not isinstance(status, dict):
+        return False
+    if int(status.get("pendingApprovalCount") or 0) > 0:
+        return True
+    if status.get("agentActivityLive"):
+        return True
+    return str(status.get("agentStatus") or "").strip().lower() in BUSY_STATUSES
+
+
+def summarize_cursor_state(state: Any) -> str:
+    if not isinstance(state, dict):
+        return ""
+    chunks: list[str] = []
+    for item in list(state.get("messages") or [])[-8:]:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "")
+        if kind == "assistant":
+            text = str(item.get("text") or "").strip()
+            if text:
+                chunks.append(text[:2000])
+        elif kind == "plan":
+            label = str(item.get("label") or "plan")
+            desc = str(item.get("description") or "").strip()
+            todos = f"{item.get('todosCompleted') or 0}/{item.get('todosTotal') or 0}"
+            chunks.append(f"[{label} {todos}] {desc}"[:1500])
+    return "\n---\n".join(chunks[-4:])
+
+
+def _status_name(status: Any) -> str:
+    if not isinstance(status, dict):
+        return "unknown"
+    name = str(status.get("agentStatus") or status.get("status") or "").strip().lower()
+    return name or "unknown"
 
 
 def _approval_actions(pending: list[Any]) -> list[dict[str, Any]]:
@@ -113,48 +166,180 @@ async def click_pending_approvals(session: Any) -> list[dict[str, Any]]:
     return clicked
 
 
+async def _snapshot(session: Any) -> tuple[Any, Any, str]:
+    status: Any = None
+    state: Any = None
+    try:
+        status = await mcp_call(session, "get_status")
+    except Exception as exc:
+        logger.info("CursorRemote get_status failed: %s", exc)
+    try:
+        state = await mcp_call(session, "get_state", {"messageLimit": 8})
+    except Exception as exc:
+        logger.info("CursorRemote get_state failed: %s", exc)
+    return status, state, summarize_cursor_state(state)
+
+
+def _result(
+    *,
+    done: bool,
+    status: str,
+    last: Any,
+    state: Any,
+    summary: str,
+    approvals: list[dict[str, Any]],
+    seen_busy: bool,
+    hint: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": True,
+        "done": done,
+        "status": status,
+        "started": seen_busy,
+        "summary": summary,
+        "approvals": approvals,
+        "last": last,
+        "messages": (state or {}).get("messages") if isinstance(state, dict) else [],
+    }
+    if not done:
+        payload["next"] = hint or FOLLOW_UP_HINT
+    return payload
+
+
+async def drive_until_done(
+    session: Any,
+    *,
+    timeout_ms: int = 90_000,
+    start_grace_ms: int = 25_000,
+    idle_debounce_ms: int = 3_000,
+    require_busy: bool = True,
+) -> dict[str, Any]:
+    """Poll Cursor until it has actually worked and then gone idle.
+
+    Immediate idle is not treated as completion: Cursor often looks idle right after
+    send_prompt, before thinking starts. Long coding jobs should return done=false
+    so the employee schedules a follow-up instead of telling the customer it is ready.
+    """
+    approvals: list[dict[str, Any]] = []
+    seen_busy = False
+    last: Any = None
+    deadline = time.monotonic() + max(1, timeout_ms) / 1000
+    start = time.monotonic()
+
+    while time.monotonic() < deadline:
+        approvals.extend(await click_pending_approvals(session))
+        try:
+            last = await mcp_call(session, "get_status")
+        except Exception as exc:
+            last = {"error": str(exc)}
+            await asyncio.sleep(2)
+            continue
+
+        if cursor_is_busy(last):
+            seen_busy = True
+            try:
+                last = await mcp_call(
+                    session,
+                    "wait",
+                    {"for": "needs_input", "timeoutMs": min(12_000, timeout_ms)},
+                )
+            except Exception:
+                await asyncio.sleep(2)
+            continue
+
+        if require_busy and not seen_busy:
+            if (time.monotonic() - start) * 1000 < start_grace_ms:
+                await asyncio.sleep(2)
+                continue
+            status, state, summary = await _snapshot(session)
+            return _result(
+                done=False,
+                status="not_started",
+                last=status or last,
+                state=state,
+                summary=summary,
+                approvals=approvals,
+                seen_busy=False,
+                hint=NOT_STARTED_HINT,
+            )
+
+        debounce_s = max(0, idle_debounce_ms) / 1000
+        if debounce_s:
+            await asyncio.sleep(debounce_s)
+        try:
+            confirm = await mcp_call(session, "get_status")
+        except Exception:
+            confirm = last
+        if cursor_is_busy(confirm):
+            seen_busy = True
+            last = confirm
+            continue
+
+        status, state, summary = await _snapshot(session)
+        if cursor_is_busy(status):
+            seen_busy = True
+            last = status
+            continue
+        return _result(
+            done=True,
+            status="idle",
+            last=status or confirm,
+            state=state,
+            summary=summary,
+            approvals=approvals,
+            seen_busy=seen_busy or not require_busy,
+            hint=None,
+        )
+
+    status, state, summary = await _snapshot(session)
+    name = "working" if cursor_is_busy(status or last) else _status_name(status or last)
+    if name in {"idle", "unknown"} and seen_busy:
+        name = "timeout"
+    return _result(
+        done=False,
+        status=name,
+        last=status or last,
+        state=state,
+        summary=summary,
+        approvals=approvals,
+        seen_busy=seen_busy,
+        hint=FOLLOW_UP_HINT,
+    )
+
+
 async def drive_until_idle(
     session: Any,
     *,
-    timeout_ms: int = 120_000,
+    timeout_ms: int = 90_000,
     max_rounds: int = 12,
 ) -> dict[str, Any]:
-    """Wait for Cursor to go idle, auto-approving Allow/Accept along the way."""
-    approvals: list[dict[str, Any]] = []
-    last: Any = None
-    for _ in range(max(1, max_rounds)):
-        approvals.extend(await click_pending_approvals(session))
-        try:
-            last = await mcp_call(
-                session,
-                "wait",
-                {"for": "needs_input", "timeoutMs": min(15_000, timeout_ms)},
-            )
-        except Exception:
-            last = None
-        pending = 0
-        if isinstance(last, dict):
-            pending = int(last.get("pendingApprovalCount") or 0)
-            if last.get("status") == "needs_input" and pending:
-                continue
-        try:
-            idle = await mcp_call(
-                session,
-                "wait",
-                {"for": "idle", "timeoutMs": min(20_000, timeout_ms)},
-            )
-        except Exception as exc:
-            return {"ok": False, "error": str(exc), "approvals": approvals, "last": last}
-        if isinstance(idle, dict) and idle.get("status") == "idle":
-            return {"ok": True, "status": "idle", "approvals": approvals, "last": idle}
-        last = idle
-        if isinstance(idle, dict) and int(idle.get("pendingApprovalCount") or 0) > 0:
-            continue
-        break
-    return {"ok": True, "status": "stopped", "approvals": approvals, "last": last}
+    """Back-compat wrapper. Prefer drive_until_done — idle is not success by itself."""
+    del max_rounds
+    return await drive_until_done(session, timeout_ms=timeout_ms)
 
 
-async def send_prompt_and_drive(session: Any, text: str, *, timeout_ms: int = 180_000) -> dict[str, Any]:
+async def send_prompt_and_drive(
+    session: Any,
+    text: str,
+    *,
+    timeout_ms: int = 90_000,
+) -> dict[str, Any]:
     sent = await mcp_call(session, "send_prompt", {"text": text})
-    driven = await drive_until_idle(session, timeout_ms=timeout_ms)
-    return {"sent": sent, **driven}
+    driven = await drive_until_done(session, timeout_ms=timeout_ms, require_busy=True)
+    return {"sent": sent, "prompt_sent": True, **driven}
+
+
+async def check_and_drive(
+    session: Any,
+    *,
+    timeout_ms: int = 90_000,
+    idle_debounce_ms: int = 3_000,
+) -> dict[str, Any]:
+    """Poll an already-running Cursor job. Idle without prior activity is a real finish here."""
+    return await drive_until_done(
+        session,
+        timeout_ms=timeout_ms,
+        require_busy=False,
+        start_grace_ms=0,
+        idle_debounce_ms=idle_debounce_ms,
+    )

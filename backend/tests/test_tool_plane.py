@@ -42,6 +42,13 @@ def test_build_catalog_marks_surface() -> None:
     assert by_name["telegram_join_channel"].surface is False
 
 
+def test_plan_tools_are_not_surface() -> None:
+    assert is_surface_tool("plan_get") is False
+    assert is_surface_tool("plan_upsert") is False
+    assert is_surface_tool("schedule_self") is True
+    assert is_surface_tool("cursorremote_check") is True
+
+
 def test_search_catalog_by_namespace() -> None:
     registry = ToolRegistry()
     registry.register(lambda: None, "sip_dial", "Call")

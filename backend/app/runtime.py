@@ -16,7 +16,6 @@ from .db import (
     AgentTask,
     CronJob,
     EmployeeNeed,
-    EmployeePlan,
     LlmProfile,
     McpServer,
     MessageLog,
@@ -29,19 +28,16 @@ from .db import (
 from .action_reports import format_admin_action_report
 from .employee import (
     AGENT_EDITABLE_SECTIONS,
-    HORIZONS,
     NEED_KINDS,
     PROMPT_SECTION_KEYS,
     EmployeeService,
     assemble_system_prompt,
     consultation_json,
     get_or_create_profile,
-    list_active_plans,
+    list_agent_jobs,
     list_open_consultations,
     list_open_needs,
     need_json,
-    period_bounds,
-    plan_json,
 )
 from .events import EventHub
 from .integrations import LLMClient, McpManager, MemoryStore, WebSearch
@@ -559,18 +555,34 @@ class AgentRuntime:
                 None,
             )
             if cursor_session is not None:
-                from .cursorremote_drive import send_prompt_and_drive
+                from .cursorremote_drive import check_and_drive, send_prompt_and_drive
 
                 async def cursorremote_do(prompt: str) -> dict[str, Any]:
-                    """Send a task to Cursor IDE and auto-click Allow/Accept/Run until idle. Never ask a human to press Allow."""
+                    """Send a task to Cursor IDE, auto-click Allow/Accept/Run, wait until it actually finishes or times out."""
                     return await send_prompt_and_drive(cursor_session, prompt)
+
+                async def cursorremote_check() -> dict[str, Any]:
+                    """Poll Cursor for an already sent task: click Allow if needed, return done=true only when idle after work."""
+                    return await check_and_drive(cursor_session)
 
                 registry.register(
                     cursorremote_do,
                     "cursorremote_do",
                     (
                         "Give Cursor a coding task in the attached workspace. "
-                        "Automatically clicks Allow/Accept/Run. Do not tell anyone to confirm in the IDE."
+                        "Clicks Allow/Accept/Run itself. Returns done=true only after Cursor "
+                        "finished (not when it merely started). If done=false, schedule_self "
+                        "in ~2 minutes to cursorremote_check. Do not tell the customer it is ready "
+                        "until done=true and you verified the summary."
+                    ),
+                )
+                registry.register(
+                    cursorremote_check,
+                    "cursorremote_check",
+                    (
+                        "Check an already running Cursor job. Clicks Allow/Accept. "
+                        "done=true means finished — verify summary then write to the customer. "
+                        "done=false means still working — schedule_self again, do not report ready."
                     ),
                 )
         if self.task_bus:
@@ -590,7 +602,7 @@ class AgentRuntime:
             registry.register(agent_notify, "agent_notify", "Notify a linked agent")
         if self.scheduler and db is not None and runtime_settings is not None:
             async def schedule_self(run_at: str, message: str, name: str = "") -> dict[str, Any]:
-                """Schedule this agent to execute a one-time task at an ISO date and time."""
+                """Schedule a one-time internal follow-up for this agent (ISO datetime). Does not message the customer."""
                 try:
                     target = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
                 except ValueError as exc:
@@ -600,14 +612,12 @@ class AgentRuntime:
                 target = target.astimezone(timezone.utc)
                 if target <= datetime.now(timezone.utc):
                     raise ValueError("run_at must be in the future")
-                source = context or {}
                 payload = {
                     "message": message,
                     "run_once_at": target.isoformat(),
                     "timezone": runtime_settings.timezone,
                     "source": "scheduled",
-                    "reply_phone": phone,
-                    "reply_chat_id": source.get("chat_id") or source.get("entity"),
+                    "employee_tick": True,
                 }
                 job = CronJob(
                     name=name.strip() or f"once-{agent.id}-{uuid4().hex[:12]}",
@@ -630,7 +640,12 @@ class AgentRuntime:
             registry.register(
                 schedule_self,
                 "schedule_self",
-                "Schedule this agent to execute a one-time task at an ISO date and time",
+                (
+                    "Schedule yourself a one-time internal task at an ISO datetime. "
+                    "Use this instead of hour/day/week/month plans. "
+                    "Typical: if Cursor is still running, schedule cursorremote_check in ~2 minutes. "
+                    "The job does not auto-write to the customer — you telegram them after verifying."
+                ),
             )
 
             async def schedule_self_list() -> dict[str, Any]:
@@ -688,96 +703,6 @@ class AgentRuntime:
         agent: Agent,
         profile: Any,
     ) -> None:
-        from zoneinfo import ZoneInfo
-
-        async def plan_get(horizon: str = "", plan_id: int = 0) -> dict[str, Any]:
-            """Get active plans; optionally filter by horizon or plan id."""
-            if plan_id:
-                plan = await db.get(EmployeePlan, int(plan_id))
-                if plan is None or plan.agent_id != agent.id:
-                    return {"error": "plan not found"}
-                return {"plan": plan_json(plan)}
-            plans = await list_active_plans(db, agent.id)
-            if horizon:
-                plans = [p for p in plans if p.horizon == horizon]
-            return {"plans": [plan_json(p) for p in plans]}
-
-        async def plan_upsert(
-            horizon: str,
-            title: str,
-            steps_json: str = "[]",
-            plan_id: int = 0,
-            status: str = "active",
-        ) -> dict[str, Any]:
-            """Create or update a plan for horizon hour|day|week|month. steps_json is JSON array of {id,title,status}."""
-            if horizon not in HORIZONS:
-                raise ValueError(f"horizon must be one of {HORIZONS}")
-            try:
-                steps = json.loads(steps_json) if steps_json else []
-            except json.JSONDecodeError as exc:
-                raise ValueError("steps_json must be valid JSON") from exc
-            if not isinstance(steps, list):
-                raise ValueError("steps_json must be a JSON array")
-            normalized = []
-            for idx, step in enumerate(steps[:40]):
-                if not isinstance(step, dict):
-                    continue
-                normalized.append(
-                    {
-                        "id": str(step.get("id") or idx + 1),
-                        "title": str(step.get("title") or "")[:300],
-                        "status": str(step.get("status") or "todo"),
-                        "result": str(step.get("result") or "")[:1000],
-                    }
-                )
-            tz = ZoneInfo(profile.timezone or "UTC")
-            start, end = period_bounds(horizon, utcnow(), tz)
-            plan = await db.get(EmployeePlan, int(plan_id)) if plan_id else None
-            if plan is None or plan.agent_id != agent.id:
-                plan = EmployeePlan(
-                    agent_id=agent.id,
-                    horizon=horizon,
-                    period_start=start,
-                    period_end=end,
-                    title=title.strip()[:300],
-                    body={"steps": normalized},
-                    status=status if status in {"draft", "active", "done", "cancelled"} else "active",
-                )
-                db.add(plan)
-            else:
-                plan.title = title.strip()[:300] or plan.title
-                plan.body = {"steps": normalized}
-                plan.status = status if status in {"draft", "active", "done", "cancelled"} else plan.status
-                plan.horizon = horizon
-            await db.commit()
-            await db.refresh(plan)
-            return {"plan": plan_json(plan)}
-
-        async def plan_complete_step(plan_id: int, step_id: str, result: str = "") -> dict[str, Any]:
-            """Mark a plan step as done."""
-            plan = await db.get(EmployeePlan, int(plan_id))
-            if plan is None or plan.agent_id != agent.id:
-                raise ValueError("plan not found")
-            body = dict(plan.body or {})
-            steps = list(body.get("steps") or [])
-            found = False
-            for step in steps:
-                if isinstance(step, dict) and str(step.get("id")) == str(step_id):
-                    step["status"] = "done"
-                    if result:
-                        step["result"] = result[:1000]
-                    found = True
-                    break
-            if not found:
-                raise ValueError("step not found")
-            body["steps"] = steps
-            plan.body = body
-            if steps and all(isinstance(s, dict) and s.get("status") == "done" for s in steps):
-                plan.status = "done"
-            await db.commit()
-            await db.refresh(plan)
-            return {"plan": plan_json(plan)}
-
         async def need_upsert(
             title: str,
             kind: str = "info",
@@ -872,8 +797,8 @@ class AgentRuntime:
             return {"ok": True, "key": key, "chars": len(row.content)}
 
         async def employee_status() -> dict[str, Any]:
-            """Return current mission, plans summary, needs and open consultations."""
-            plans = await list_active_plans(db, agent.id)
+            """Return current mission, schedule, needs and open consultations."""
+            jobs = await list_agent_jobs(db, agent.id)
             needs = await list_open_needs(db, agent.id)
             consults = await list_open_consultations(db, agent.id)
             return {
@@ -883,14 +808,20 @@ class AgentRuntime:
                 "autonomy_enabled": profile.autonomy_enabled,
                 "ticks_used_today": profile.ticks_used_today,
                 "budget_ticks_per_day": profile.budget_ticks_per_day,
-                "plans": [plan_json(p) for p in plans],
+                "jobs": [
+                    {
+                        "id": job.id,
+                        "name": job.name,
+                        "cron": job.cron,
+                        "enabled": job.enabled,
+                        "payload": job.payload or {},
+                    }
+                    for job in jobs
+                ],
                 "needs": [need_json(n) for n in needs],
                 "consultations": [consultation_json(c) for c in consults],
             }
 
-        registry.register(plan_get, "plan_get", "Get employee plans by horizon or id")
-        registry.register(plan_upsert, "plan_upsert", "Create or update hour/day/week/month plan")
-        registry.register(plan_complete_step, "plan_complete_step", "Complete a step in a plan")
         registry.register(need_upsert, "need_upsert", "Create or update a need/desire")
         registry.register(need_satisfy, "need_satisfy", "Mark a need as satisfied")
         registry.register(consult_manager, "consult_manager", "Ask the manager a question")
@@ -1069,11 +1000,14 @@ class AgentRuntime:
 
                 employee_block = build_employee_context_block(
                     employee_profile,
-                    await list_active_plans(db, agent.id),
+                    await list_agent_jobs(db, agent.id),
                     await list_open_needs(db, agent.id),
                     await list_open_consultations(db, agent.id),
                 )
-            is_employee_tick = bool(context.get("employee_tick") or context.get("source") == "employee_tick")
+            is_employee_tick = bool(
+                context.get("employee_tick")
+                or context.get("source") in {"employee_tick", "scheduled", "employee_heartbeat"}
+            )
             phone_hint = ""
             if is_telegram and not context.get("is_admin"):
                 lower = message.lower()

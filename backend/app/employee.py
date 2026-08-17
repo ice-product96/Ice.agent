@@ -1,4 +1,4 @@
-"""Autonomous employee runtime: heartbeat, plans, needs, consultations, prompt sections."""
+"""Autonomous employee runtime: heartbeat, scheduler, needs, consultations, prompt sections."""
 
 from __future__ import annotations
 
@@ -263,9 +263,37 @@ async def list_open_consultations(db: AsyncSession, agent_id: int) -> list[Consu
     )
 
 
+async def list_agent_jobs(
+    db: AsyncSession,
+    agent_id: int,
+    *,
+    enabled_only: bool = True,
+) -> list[CronJob]:
+    filters = [CronJob.agent_id == agent_id]
+    if enabled_only:
+        filters.append(CronJob.enabled.is_(True))
+    return list(
+        await db.scalars(select(CronJob).where(*filters).order_by(CronJob.id.desc()))
+    )
+
+
+def _job_when(job: CronJob) -> str:
+    payload = job.payload or {}
+    run_once = str(payload.get("run_once_at") or "").strip()
+    if run_once:
+        return f"once {run_once}"
+    return f"cron {job.cron}"
+
+
+def _job_message(job: CronJob) -> str:
+    payload = job.payload or {}
+    text = str(payload.get("message") or payload.get("prompt") or "").strip()
+    return text[:180]
+
+
 def build_employee_context_block(
     profile: EmployeeProfile,
-    plans: list[EmployeePlan],
+    jobs: list[CronJob],
     needs: list[EmployeeNeed],
     consultations: list[Consultation],
 ) -> str:
@@ -277,19 +305,18 @@ def build_employee_context_block(
         f"Рабочий день: {profile.workday_start}-{profile.workday_end} {profile.timezone}",
         f"Тиков сегодня: {profile.ticks_used_today}/{profile.budget_ticks_per_day}",
     ]
-    if plans:
-        lines.append("Активные планы:")
-        for plan in plans:
-            steps = (plan.body or {}).get("steps") or []
-            open_steps = [s for s in steps if isinstance(s, dict) and s.get("status") != "done"]
-            lines.append(
-                f"- [{plan.horizon}] #{plan.id} {plan.title} "
-                f"({len(steps) - len(open_steps)}/{len(steps)} шагов готово)"
-            )
-            for step in open_steps[:5]:
-                lines.append(f"    · {step.get('id')}: {step.get('title')} [{step.get('status', 'todo')}]")
+    if jobs:
+        lines.append("Расписание (штатное — schedule_self / cron, не hour/day/week/month планы):")
+        for job in jobs[:15]:
+            kind = "heartbeat" if job.name.startswith(HEARTBEAT_JOB_PREFIX) else "task"
+            msg = _job_message(job)
+            suffix = f" — {msg}" if msg else ""
+            lines.append(f"- [{kind}] #{job.id} {job.name} ({_job_when(job)}){suffix}")
     else:
-        lines.append("Активные планы: (нет — создайте hour/day/week/month по необходимости)")
+        lines.append(
+            "Расписание: (пусто — следующие шаги ставь себе через schedule_self, "
+            "например проверку Cursor через 2 минуты)"
+        )
     if needs:
         lines.append("Открытые потребности:")
         for need in needs[:10]:
@@ -631,17 +658,17 @@ class EmployeeService:
         today = local.date().isoformat()
         if profile.last_digest_at and profile.last_digest_at.astimezone(tz).date().isoformat() == today:
             return
-        plans = await list_active_plans(db, agent.id)
+        jobs = await list_agent_jobs(db, agent.id)
         needs = await list_open_needs(db, agent.id)
         consults = await list_open_consultations(db, agent.id)
         lines = [
             f"[DIGEST] агент «{agent.name}» · {today}",
             f"Миссия: {profile.mission or '—'}",
             f"Тиков сегодня: {profile.ticks_used_today}/{profile.budget_ticks_per_day}",
-            f"Активных планов: {len(plans)} · needs: {len(needs)} · consults: {len(consults)}",
+            f"Задач в расписании: {len(jobs)} · needs: {len(needs)} · consults: {len(consults)}",
         ]
-        for plan in plans:
-            lines.append(f"- [{plan.horizon}] {plan.title}")
+        for job in jobs[:8]:
+            lines.append(f"- {_job_when(job)} {job.name}")
         for need in needs[:5]:
             lines.append(f"! need #{need.id} {need.title}")
         text = "\n".join(lines)
@@ -666,22 +693,22 @@ class EmployeeService:
         force: bool = False,
     ) -> dict[str, Any]:
         ok, reason = await self.can_tick(profile, force=force)
-        plans = await self.ensure_period_plans(db, agent, profile)
+        jobs = await list_agent_jobs(db, agent.id)
         needs = await list_open_needs(db, agent.id)
         consultations = await list_open_consultations(db, agent.id)
         urgent = any(n.priority <= 2 and n.status in {"open", "waiting"} for n in needs)
         if reason == "off_hours" and not force and not urgent:
-            return {"skip": True, "reason": "off_hours", "plans": plans, "needs": needs}
+            return {"skip": True, "reason": "off_hours", "jobs": jobs, "needs": needs}
         if not ok and not force:
-            return {"skip": True, "reason": reason, "plans": plans, "needs": needs}
+            return {"skip": True, "reason": reason, "jobs": jobs, "needs": needs}
         prompt = await assemble_system_prompt(db, agent)
-        block = build_employee_context_block(profile, plans, needs, consultations)
+        block = build_employee_context_block(profile, jobs, needs, consultations)
         return {
             "skip": False,
             "reason": reason,
             "system_prompt": prompt,
             "context_block": block,
-            "plans": plans,
+            "jobs": jobs,
             "needs": needs,
             "consultations": consultations,
         }

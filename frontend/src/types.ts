@@ -352,7 +352,8 @@ export interface EmployeeState {
   agent_name: string
   profile: EmployeeProfile
   prompt_sections: Record<string, string>
-  plans: EmployeePlan[]
+  plans?: EmployeePlan[]
+  jobs?: CronJob[]
   needs: EmployeeNeed[]
   consultations: Consultation[]
 }
