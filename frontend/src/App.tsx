@@ -1141,17 +1141,16 @@ function EmployeeScreen() {
             <textarea rows={2} value={policy.tick_instruction_extra} onChange={e => setPolicy(p => ({ ...p, tick_instruction_extra: e.target.value }))}/>
           </Field>
         </div>
-        <div className="policy-tools">
-          <span className="policy-tools-label">Требуют approve (если не сработали bypass выше):</span>
-          <div className="policy-tools-grid">
+        <Field label="Требуют approve" hint="Если не сработали bypass выше" wide>
+          <div className="check-grid">
             {(policyCatalog.data?.approval_tool_options || []).map(option => (
-              <label className="policy-tool" key={option.id}>
+              <label className="check" key={option.id}>
                 <input type="checkbox" checked={policy.approval_required_tools.includes(option.id)} onChange={() => toggleApprovalTool(option.id)}/>
                 <span>{option.label}</span>
               </label>
             ))}
           </div>
-        </div>
+        </Field>
         <div className="form-grid" style={{ marginTop: 12 }}>
           {([
             ['identity', 'Личность', 'Только руководитель'],

@@ -143,11 +143,6 @@ main { padding-left: 250px; min-height: 100vh; }
 .conversation-activity strong { font: 700 18px Manrope; }.conversation-activity small { color: #7a8395; font-size: 9px; text-align: left; }
 .conversation-activity time { grid-column: 1 / 3; color: #aab1c0; font-size: 9px; white-space: nowrap; }
 .conversation-activity span { grid-column: 1 / 3; color: #7064cc; font-size: 9px; }.conversation-activity svg { grid-column: 3; grid-row: 1 / 5; color: #555e70; }
-.policy-tools { margin: 12px 0 4px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #10141d; }
-.policy-tools-label { display: block; margin-bottom: 10px; color: #8b93a7; font-size: 10px; text-transform: uppercase; letter-spacing: .6px; }
-.policy-tools-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.policy-tool { display: flex; align-items: flex-start; gap: 8px; color: #bcc3d1; font-size: 11px; line-height: 1.4; cursor: pointer; }
-.policy-tool input { margin-top: 2px; }
 .conversation-filters input[aria-label="Фильтр project_id"],
 .conversation-filters input[aria-label="Фильтр customer_id"],
 .filter-bar input[aria-label="project_id"],
