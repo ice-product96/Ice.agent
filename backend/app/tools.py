@@ -48,6 +48,8 @@ EMPLOYEE_OPERATIONAL_PERMISSIONS = {
 
 # Granted when agent has tool_permissions "cursorremote" or MCP server `cursorremote` attached.
 CURSORREMOTE_OPERATIONAL_PERMISSIONS = {
+    "mcp_cursorremote_tools",
+    "mcp_cursorremote_run",
     "mcp_cursorremote_send_prompt",
     "mcp_cursorremote_approve",
     "mcp_cursorremote_reject",
@@ -95,6 +97,24 @@ def resolve_tool_permissions(
     return permissions
 
 
+MAX_LLM_TOOLS = 128
+
+
+def effective_tool_name(tool_name: str, arguments: dict[str, Any] | None = None) -> str:
+    """Map meta/gateway calls to the underlying tool for policy and approval checks."""
+    name = str(tool_name or "").strip()
+    args = arguments or {}
+    if name == "tools_run":
+        inner = str(args.get("tool_name") or args.get("name") or "").strip()
+        if inner:
+            return inner
+    if name.startswith("mcp_") and name.endswith("_run"):
+        inner = str(args.get("tool") or "").strip()
+        if inner:
+            return f"{name[:-4]}_{inner}"
+    return name
+
+
 class ToolPolicy:
     dangerous_names = {
         "delete", "remove", "shell", "exec", "payment", "purchase", "transfer",
@@ -109,11 +129,16 @@ class ToolPolicy:
         "cursorremote_set_mode", "cursorremote_set_model", "cursorremote_set_plan_model",
     }
 
-    def check(self, tool_name: str, arguments: dict[str, Any], allowed: set[str] | None = None) -> None:
+    def is_dangerous(self, tool_name: str) -> bool:
         normalized = tool_name.lower()
+        return any(part in normalized for part in self.dangerous_names)
+
+    def check(self, tool_name: str, arguments: dict[str, Any], allowed: set[str] | None = None) -> None:
+        effective = effective_tool_name(tool_name, arguments)
+        normalized = effective.lower()
         dangerous = any(part in normalized for part in self.dangerous_names)
-        if dangerous and (allowed is None or tool_name not in allowed):
-            raise DangerousActionError(f"Tool '{tool_name}' requires explicit permission")
+        if dangerous and (allowed is None or effective not in allowed):
+            raise DangerousActionError(f"Tool '{effective}' requires explicit permission")
         if any(key in arguments for key in ("password", "secret", "token")) and "use_secrets" not in (allowed or set()):
             raise DangerousActionError("Passing secrets to tools requires explicit permission")
 
@@ -172,6 +197,7 @@ class ToolRegistry:
         self.tools: dict[str, RegisteredTool] = {}
         self.audit: list[dict[str, Any]] = []
         self.before_call: Callable[[str, dict[str, Any]], Any] | None = None
+        self.llm_permissions: set[str] | None = None
 
     def register(
         self,

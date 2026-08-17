@@ -215,6 +215,27 @@ async def test_mcp_registration_filters_attached_servers() -> None:
     manager.sessions = {"attached": Session(), "detached": Session()}
     registry = ToolRegistry()
     await manager.register_tools(registry, {"attached"})
-    assert set(registry.tools) == {"mcp_attached_lookup"}
-    schema = registry.schemas()[0]["function"]
-    assert schema["parameters"]["required"] == ["query"]
+    assert set(registry.tools) == {"mcp_attached_tools", "mcp_attached_run"}
+    schema = registry.tools["mcp_attached_run"].schema()["function"]
+    assert schema["parameters"]["required"] == ["tool"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_registration_uses_gateway_for_large_servers() -> None:
+    class Session:
+        async def list_tools(self) -> Any:
+            tools = [
+                SimpleNamespace(
+                    name=f"tool_{index}",
+                    description=f"Tool {index}",
+                    inputSchema={"type": "object", "properties": {}},
+                )
+                for index in range(9)
+            ]
+            return SimpleNamespace(tools=tools)
+
+    manager = McpManager()
+    manager.sessions = {"heavy": Session()}
+    registry = ToolRegistry()
+    await manager.register_tools(registry, {"heavy"})
+    assert set(registry.tools) == {"mcp_heavy_tools", "mcp_heavy_run"}

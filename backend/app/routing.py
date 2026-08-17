@@ -311,11 +311,16 @@ class TelegramEventRouter:
                     {"agent_id": agent.id, "error": str(exc)},
                 )
                 if entity is not None:
+                    user_message = (
+                        "Не удалось обработать сообщение. Подробности в логах сервера."
+                        if is_admin
+                        else "Извините, сейчас не могу ответить. Попробуйте чуть позже."
+                    )
                     try:
                         await self.telegram.send_message(
                             phone,
                             entity,
-                            f"Ошибка обработки: {exc}",
+                            user_message,
                             reply_to=payload.get("message_id"),
                             humanize=False,
                         )

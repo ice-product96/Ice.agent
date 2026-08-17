@@ -60,9 +60,11 @@ from .memory_scope import (
     prefetch_memories,
     resolve_memory_scope,
 )
+from .tool_plane import attach_tool_plane
 from .tools import (
     ToolRegistry,
     common_registry,
+    effective_tool_name,
     resolve_tool_permissions,
 )
 from .telegram import TelegramGateway
@@ -559,6 +561,7 @@ class AgentRuntime:
             if profile.autonomy_enabled or "employee" in tools_set or "autonomy" in tools_set:
                 await self._register_employee_tools(registry, db, agent, profile)
 
+        attach_tool_plane(registry)
         return registry
 
     async def _register_employee_tools(
@@ -1029,13 +1032,14 @@ class AgentRuntime:
             )
             if employee_profile.autonomy_enabled:
                 async def _approval_gate(tool_name: str, arguments: dict[str, Any]) -> None:
-                    if not approval_required_for_tool(employee_profile, tool_name, context):
+                    effective = effective_tool_name(tool_name, arguments)
+                    if not approval_required_for_tool(employee_profile, effective, context):
                         return
-                    ok = await self.employee.has_approval(db, agent.id, tool_name)
+                    ok = await self.employee.has_approval(db, agent.id, effective)
                     if not ok:
                         raise PermissionError(
-                            f"Tool '{tool_name}' requires manager approval. "
-                            f"Call request_approval(action_name='{tool_name}', reason=...) first."
+                            f"Tool '{effective}' requires manager approval. "
+                            f"Call request_approval(action_name='{effective}', reason=...) first."
                         )
 
                 registry.before_call = _approval_gate

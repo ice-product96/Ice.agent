@@ -12,7 +12,8 @@ import httpx
 from openai import APIStatusError, AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from .tools import ToolRegistry
+from .tool_plane import schemas_for_tool_plane
+from .tools import MAX_LLM_TOOLS, ToolRegistry
 
 
 def _chat_tools_need_no_reasoning(model: str) -> bool:
@@ -65,7 +66,7 @@ class LLMClient:
         permissions: set[str] | None = None,
     ) -> str:
         conversation = list(messages)
-        tool_schemas = tools.schemas() or None
+        tool_schemas = schemas_for_tool_plane(tools, permissions, limit=MAX_LLM_TOOLS) or None
         reasoning_effort: str | None = "none" if tool_schemas and _chat_tools_need_no_reasoning(self.model) else None
         for _ in range(self.max_rounds):
             response = await self._chat_complete(
@@ -802,22 +803,73 @@ class McpManager:
             if server_names is not None and server_name not in server_names:
                 continue
             result = await session.list_tools()
-            for definition in result.tools:
-                async def invoke(_server=server_name, _tool=definition.name, **kwargs: Any) -> Any:
-                    response = await self.sessions[_server].call_tool(_tool, kwargs)
-                    content = [item.model_dump() for item in response.content]
-                    if getattr(response, "isError", False):
-                        detail = "; ".join(
-                            str(item.get("text") or item) for item in content
-                        )
-                        raise RuntimeError(detail or f"MCP tool {_tool} failed")
-                    return content
-                registry.register(
-                    invoke,
-                    f"mcp_{server_name}_{definition.name}",
-                    definition.description or definition.name,
-                    getattr(definition, "inputSchema", {"type": "object", "properties": {}}),
-                )
+            self._register_mcp_gateway(registry, server_name, list(result.tools))
+
+    def _register_mcp_gateway(
+        self,
+        registry: ToolRegistry,
+        server_name: str,
+        definitions: list[Any] | None = None,
+    ) -> None:
+        catalog: list[Any] = []
+
+        async def list_tools() -> list[dict[str, Any]]:
+            items = definitions
+            if items is None:
+                result = await self.sessions[server_name].list_tools()
+                items = list(result.tools)
+            if not catalog:
+                catalog.extend(items)
+            return [
+                {
+                    "name": item.name,
+                    "description": item.description or item.name,
+                    "input_schema": getattr(
+                        item, "inputSchema", {"type": "object", "properties": {}}
+                    ),
+                }
+                for item in catalog
+            ]
+
+        async def run_tool(tool: str, arguments: dict[str, Any] | None = None) -> Any:
+            tool_name = str(tool or "").strip()
+            if not tool_name:
+                raise ValueError("tool name is required")
+            kwargs = dict(arguments or {})
+            response = await self.sessions[server_name].call_tool(tool_name, kwargs)
+            content = [item.model_dump() for item in response.content]
+            if getattr(response, "isError", False):
+                detail = "; ".join(str(item.get("text") or item) for item in content)
+                raise RuntimeError(detail or f"MCP tool {tool_name} failed")
+            return content
+
+        registry.register(
+            list_tools,
+            f"mcp_{server_name}_tools",
+            f"List tools on MCP server '{server_name}' (name, description, input_schema).",
+        )
+        registry.register(
+            run_tool,
+            f"mcp_{server_name}_run",
+            (
+                f"Run a tool on MCP server '{server_name}'. "
+                f"Call mcp_{server_name}_tools first for names and schemas."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "tool": {
+                        "type": "string",
+                        "description": "Tool name returned by list_tools",
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "Arguments object for the MCP tool",
+                    },
+                },
+                "required": ["tool"],
+            },
+        )
 
     async def close(self) -> None:
         names = set(self.sessions) | set(self._tasks)

@@ -227,6 +227,40 @@ def test_reflective_tool_schema() -> None:
     assert schema["parameters"]["required"] == ["a"]
 
 
+def test_effective_tool_name_maps_mcp_gateway_calls() -> None:
+    from app.tools import effective_tool_name
+
+    assert effective_tool_name(
+        "mcp_cursorremote_run",
+        {"tool": "send_prompt", "arguments": {"text": "hi"}},
+    ) == "mcp_cursorremote_send_prompt"
+    assert effective_tool_name("telegram_send_message", {}) == "telegram_send_message"
+
+
+def test_schemas_for_llm_respects_openai_limit() -> None:
+    from app.tool_plane import attach_tool_plane, schemas_for_tool_plane
+
+    registry = ToolRegistry()
+    for index in range(140):
+        registry.register(lambda i=index: i, f"tool_{index:03d}")
+    attach_tool_plane(registry)
+    schemas = schemas_for_tool_plane(registry, set(), limit=128)
+    assert len(schemas) <= 128
+
+
+def test_tool_plane_search_finds_catalog_tools() -> None:
+    from app.tool_plane import attach_tool_plane, search_catalog, build_catalog
+
+    registry = ToolRegistry()
+    registry.register(lambda: None, "telegram_delete_messages", "Delete Telegram messages")
+    registry.register(lambda: None, "telegram_send_message", "Send Telegram message")
+    attach_tool_plane(registry)
+    hits = search_catalog(build_catalog(registry), "delete telegram")
+    names = {item["name"] for item in hits}
+    assert "telegram_delete_messages" in names
+    assert "telegram_send_message" not in names or "telegram_delete_messages" in names
+
+
 @pytest.mark.asyncio
 async def test_gpt56_chat_tools_set_reasoning_effort_none() -> None:
     from types import SimpleNamespace
