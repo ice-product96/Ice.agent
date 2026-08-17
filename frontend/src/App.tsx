@@ -1129,7 +1129,7 @@ function EmployeeScreen() {
           <Field label="Бюджет тиков/день"><input type="number" min={1} max={500} value={budget} onChange={e => setBudget(Number(e.target.value) || 48)}/></Field>
           <Field label="Начало дня"><input value={workStart} onChange={e => setWorkStart(e.target.value)} placeholder="09:00"/></Field>
           <Field label="Конец дня"><input value={workEnd} onChange={e => setWorkEnd(e.target.value)} placeholder="18:00"/></Field>
-          <Field label="Часовой пояс"><input value={timezone} onChange={e => setTimezone(e.target.value)} placeholder="Asia/Yekaterinburg"/></Field>
+          <Field label="Часовой пояс" hint="IANA, например Asia/Yekaterinburg (не UTC+5)"><input value={timezone} onChange={e => setTimezone(e.target.value)} placeholder="Asia/Yekaterinburg"/></Field>
           <Field label="Миссия" wide><textarea rows={3} value={mission} onChange={e => setMission(e.target.value)} placeholder="Что сотрудник должен достигать"/></Field>
         </div>
         <SectionHead title="Политика автономии" text="Когда спрашивать руководителя и какие действия требуют approve"/>

@@ -378,6 +378,10 @@ async def create_schema() -> None:
             "ALTER TABLE agents ADD COLUMN IF NOT EXISTS sip_account_id INTEGER",
             "ALTER TABLE sip_accounts ADD COLUMN IF NOT EXISTS ring_delay_seconds FLOAT",
             "ALTER TABLE sip_calls ALTER COLUMN hangup_cause TYPE VARCHAR(500)",
+            "ALTER TABLE employee_profiles ADD COLUMN IF NOT EXISTS config_json JSON DEFAULT '{}'",
+            "ALTER TABLE conversation_states ADD COLUMN IF NOT EXISTS thread_id VARCHAR(64) DEFAULT ''",
+            "ALTER TABLE conversation_states ADD COLUMN IF NOT EXISTS project_id VARCHAR(120)",
+            "ALTER TABLE conversation_states ADD COLUMN IF NOT EXISTS customer_id VARCHAR(120)",
         ):
             try:
                 async with connection.begin_nested():

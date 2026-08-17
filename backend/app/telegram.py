@@ -411,15 +411,18 @@ class TelegramGateway:
             if not account.enabled or not account.authorized:
                 continue
             try:
-                client = self._client(account)
-                await client.connect()
-                if await client.is_user_authorized():
-                    self.clients[account.phone] = client
-                    self._register_handlers(account.phone, client)
-                    results[account.phone] = "restored"
-                else:
-                    await client.disconnect()
-                    results[account.phone] = "unauthorized"
+                async with asyncio.timeout(20):
+                    client = self._client(account)
+                    await client.connect()
+                    if await client.is_user_authorized():
+                        self.clients[account.phone] = client
+                        self._register_handlers(account.phone, client)
+                        results[account.phone] = "restored"
+                    else:
+                        await client.disconnect()
+                        results[account.phone] = "unauthorized"
+            except TimeoutError:
+                results[account.phone] = "error: connect timeout"
             except Exception as exc:
                 results[account.phone] = f"error: {exc}"
         return results

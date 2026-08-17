@@ -31,6 +31,7 @@ from .memory_clear import clear_journals
 from .schemas import ConversationPatch, LlmProfileBody, RuntimeSettingsBody
 from .secrets import SecretStore, masked_secret
 from .security import issue_token, require_admin, valid_password, verify_token
+from .timezones import normalize_timezone
 
 router = APIRouter(prefix="/api/v1")
 auth = [Depends(require_admin)]
@@ -667,6 +668,8 @@ async def patch_employee(
     policy_payload = data.pop("policy", None)
     for key, value in data.items():
         if value is not None:
+            if key == "timezone":
+                value = normalize_timezone(str(value))
             setattr(profile, key, value)
     if policy_payload is not None:
         current = dict(profile.config_json or {})

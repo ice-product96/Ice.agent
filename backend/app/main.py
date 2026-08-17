@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -21,6 +22,9 @@ from .scheduler import CronManager
 from .sip import SipGateway
 from .telegram import TelegramGateway
 from .secrets import SecretStore
+
+logger = logging.getLogger(__name__)
+STARTUP_TIMEOUT_SECONDS = 25
 
 
 @asynccontextmanager
@@ -105,11 +109,23 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         await events.publish("memory.startup_failed", {"error": str(exc)})
     try:
-        await telegram.restore(accounts)
+        async with asyncio.timeout(STARTUP_TIMEOUT_SECONDS):
+            await telegram.restore(accounts)
+    except TimeoutError:
+        await events.publish(
+            "telegram.startup_failed",
+            {"error": f"restore timed out after {STARTUP_TIMEOUT_SECONDS}s"},
+        )
     except Exception as exc:
         await events.publish("telegram.startup_failed", {"error": str(exc)})
     try:
-        await sip.restore(list(sip_accounts))
+        async with asyncio.timeout(STARTUP_TIMEOUT_SECONDS):
+            await sip.restore(list(sip_accounts))
+    except TimeoutError:
+        await events.publish(
+            "sip.startup_failed",
+            {"error": f"restore timed out after {STARTUP_TIMEOUT_SECONDS}s"},
+        )
     except Exception as exc:
         await events.publish("sip.startup_failed", {"error": str(exc)})
     mcp_startup_stops: dict[int, asyncio.Event] = {}
@@ -170,7 +186,11 @@ async def lifespan(app: FastAPI):
 
     scheduler = CronManager(SessionLocal, run_scheduled)
     runtime.bind_scheduler(scheduler)
-    await scheduler.load()
+    try:
+        await scheduler.load()
+    except Exception as exc:
+        logger.exception("scheduler.load failed: %s", exc)
+        await events.publish("scheduler.startup_failed", {"error": str(exc)})
     scheduler.start()
     if runtime_settings.task_workers > 0:
         await task_bus.start(runtime_settings.task_workers)

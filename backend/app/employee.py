@@ -7,7 +7,9 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
+
+from .timezones import normalize_timezone, zoneinfo as resolve_zoneinfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,10 +50,7 @@ CONSULT_CMD_RE = re.compile(
 
 
 def _tz(name: str) -> ZoneInfo:
-    try:
-        return ZoneInfo(name or "UTC")
-    except ZoneInfoNotFoundError:
-        return ZoneInfo("UTC")
+    return resolve_zoneinfo(name)
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -321,7 +320,7 @@ async def sync_heartbeat_job(
         "kind": "employee_tick",
         "message": build_employee_tick_instruction(profile),
         "source": "employee_heartbeat",
-        "timezone": profile.timezone or "UTC",
+        "timezone": normalize_timezone(profile.timezone or "UTC"),
     }
     if job is None:
         if not want_enabled:
