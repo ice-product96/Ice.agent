@@ -38,6 +38,7 @@ def telegram_topic_id(message: Any) -> int | None:
     return None
 
 
+def telegram_json(value: Any) -> Any:
     if hasattr(value, "to_dict"):
         return telegram_json(value.to_dict())
     if isinstance(value, dict):
