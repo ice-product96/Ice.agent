@@ -239,6 +239,7 @@ class ActiveCall:
     rtp_learned: asyncio.Event = field(default_factory=asyncio.Event)
     media_tx_enabled: bool = False
     rtp_marker_next: bool = True
+    invite_final: bool = False
     seq: int = field(default_factory=lambda: random.randint(1, 0xFFFF))
     timestamp: int = field(default_factory=lambda: random.randint(1, 0xFFFFFFFF))
     ssrc: int = field(default_factory=lambda: random.randint(1, 0x7FFFFFFF))
@@ -417,6 +418,7 @@ class SipUserAgent:
         self._pending: dict[str, asyncio.Future[tuple[int, dict[str, str], str]]] = {}
         self.calls: dict[str, ActiveCall] = {}
         self._rtp_ports = set(range(config.rtp_port_min, config.rtp_port_max + 1, 2))
+        self._rtp_lock = asyncio.Lock()
         self._closed = False
 
     @property
@@ -545,10 +547,45 @@ class SipUserAgent:
         return port
 
     def _release_rtp_port(self, port: int) -> None:
+        if not port:
+            return
         if self.config.rtp_port_min <= port <= self.config.rtp_port_max:
             self._rtp_ports.add(port)
             if port + 1 <= self.config.rtp_port_max:
                 self._rtp_ports.add(port + 1)
+
+    async def _bind_rtp_socket(self, call: ActiveCall) -> None:
+        """Bind UDP RTP before advertising the port in SDP. Retry if the port is busy."""
+        loop = asyncio.get_running_loop()
+        last_exc: OSError | None = None
+        if not call.local_rtp_port:
+            call.local_rtp_port = self._allocate_rtp_port()
+        for _ in range(24):
+            port = call.local_rtp_port
+            try:
+                transport, protocol = await loop.create_datagram_endpoint(
+                    lambda bound=call: RtpProtocol(bound),
+                    local_addr=("0.0.0.0", port),
+                )
+            except OSError as exc:
+                last_exc = exc
+                logger.warning("RTP bind 0.0.0.0:%s failed: %s — next port", port, exc)
+                self._release_rtp_port(port)
+                call.local_rtp_port = self._allocate_rtp_port()
+                continue
+            sockname = transport.get_extra_info("sockname")
+            actual = int(sockname[1]) if sockname else port
+            if actual != port:
+                self._release_rtp_port(port)
+                call.local_rtp_port = actual
+            call.rtp_transport = transport
+            call.rtp_protocol = protocol
+            call.rtp_marker_next = True
+            logger.info("RTP listening UDP %s for call %s", actual, call.call_id[:24])
+            return
+        raise RuntimeError(
+            f"could not bind RTP UDP port (last tried {call.local_rtp_port}): {last_exc}"
+        ) from last_exc
 
     def _contact(self) -> str:
         transport = (self.config.transport or "udp").lower()
@@ -982,6 +1019,23 @@ class SipUserAgent:
                     codec = "pcmu"
         return host, port, codec
 
+    async def _apply_remote_sdp(self, call: ActiveCall, body: str, addr: tuple[str, int]) -> None:
+        if not (body or "").strip():
+            return
+        remote_rtp_host, remote_rtp_port, codec = self._parse_sdp_media(body)
+        if remote_rtp_host:
+            if not _is_ipv4(remote_rtp_host):
+                remote_rtp_host = await self._resolve_ipv4(remote_rtp_host)
+            if remote_rtp_host in {"0.0.0.0", "127.0.0.1"}:
+                remote_rtp_host = addr[0]
+            call.remote_rtp_host = remote_rtp_host
+            call.remote_rtp_port = remote_rtp_port
+            call.codec = codec
+        elif not call.remote_rtp_host:
+            call.remote_rtp_host = addr[0]
+            if remote_rtp_port:
+                call.remote_rtp_port = remote_rtp_port
+
     def _local_sdp(self, rtp_port: int, codec: Codec = "pcmu") -> str:
         pt = 0 if codec == "pcmu" else 8
         name = "PCMU" if codec == "pcmu" else "PCMA"
@@ -998,22 +1052,20 @@ class SipUserAgent:
         )
 
     async def _setup_rtp(self, call: ActiveCall, *, start_loop: bool = True) -> None:
-        loop = asyncio.get_running_loop()
-        transport, protocol = await loop.create_datagram_endpoint(
-            lambda: RtpProtocol(call),
-            local_addr=("0.0.0.0", call.local_rtp_port),
-        )
-        call.rtp_transport = transport
-        call.rtp_protocol = protocol
-        call.rtp_marker_next = True
+        async with self._rtp_lock:
+            if call.rtp_protocol is None:
+                await self._bind_rtp_socket(call)
         if start_loop:
-            # Send RTP immediately (silence) so NAT hole opens.
             call.media_tx_enabled = True
-            call.media_task = asyncio.create_task(self._media_loop(call), name=f"rtp-tx-{call.call_id}")
+            if call.media_task is None or call.media_task.done():
+                call.media_task = asyncio.create_task(
+                    self._media_loop(call),
+                    name=f"rtp-tx-{call.call_id}",
+                )
 
     async def _media_loop(self, call: ActiveCall) -> None:
         try:
-            while call.state in {"ringing", "answered", "early"} and call.rtp_protocol:
+            while call.state in {"dialing", "ringing", "answered", "early"} and call.rtp_protocol:
                 now = time.time()
                 if call.state == "answered" and call.answered_at is not None:
                     if call.last_rtp_at is None and (now - call.answered_at) > 25:
@@ -1278,6 +1330,7 @@ class SipUserAgent:
         # Outbound RTP creates NAT mapping so media works without publishing every port
         # and without a perfect Public IP in SDP.
         if delay > 0:
+            await self._setup_rtp(call, start_loop=False)
             sdp = self._local_sdp(call.local_rtp_port, call.codec)
             self._reply(
                 183,
@@ -1292,7 +1345,6 @@ class SipUserAgent:
                 body=sdp,
             )
             call.state = "early"
-            await self._setup_rtp(call, start_loop=False)
             call.media_tx_enabled = False
             ring_task = asyncio.create_task(
                 self._stream_early_ringback(call, delay),
@@ -1321,6 +1373,8 @@ class SipUserAgent:
         if call.cancelled is not None and call.cancelled.is_set():
             return
 
+        if call.rtp_protocol is None:
+            await self._setup_rtp(call, start_loop=False)
         sdp = self._local_sdp(call.local_rtp_port, call.codec)
         self._reply(
             200,
@@ -1334,17 +1388,7 @@ class SipUserAgent:
             },
             body=sdp,
         )
-        if call.rtp_protocol is None:
-            await self._setup_rtp(call)
-        else:
-            # Resume normal media loop after early media.
-            call.media_tx_enabled = True
-            call.rtp_marker_next = True
-            if call.media_task is None or call.media_task.done():
-                call.media_task = asyncio.create_task(
-                    self._media_loop(call),
-                    name=f"rtp-tx-{call.call_id}",
-                )
+        await self._setup_rtp(call, start_loop=True)
         call.state = "answered"
         call.answered_at = time.time()
         if self.on_incoming:
@@ -1390,23 +1434,20 @@ class SipUserAgent:
             return
         if status in {180, 183}:
             call.state = "ringing"
+            if status == 183:
+                await self._apply_remote_sdp(call, body, addr)
+                await self._setup_rtp(call, start_loop=True)
             if self.on_call_state:
                 await self.on_call_state(call.call_id, {"status": "ringing"})
             return
         if status == 200:
-            if call.state == "answered":
+            if call.invite_final:
                 return
+            call.invite_final = True
             to_tag = re.search(r"tag=([^;]+)", headers.get("To", ""))
             call.remote_tag = to_tag.group(1) if to_tag else call.remote_tag
             call.to_header = headers.get("To", call.to_header)
-            remote_rtp_host, remote_rtp_port, codec = self._parse_sdp_media(body)
-            if remote_rtp_host:
-                if not _is_ipv4(remote_rtp_host):
-                    remote_rtp_host = await self._resolve_ipv4(remote_rtp_host)
-                call.remote_rtp_host = remote_rtp_host
-                call.remote_rtp_port = remote_rtp_port
-                call.codec = codec
-            # ACK
+            await self._apply_remote_sdp(call, body, addr)
             request_uri = f"sip:{call.remote_number}@{self.config.domain}"
             ack = (
                 f"ACK {request_uri} SIP/2.0\r\n"
@@ -1419,8 +1460,7 @@ class SipUserAgent:
                 f"Content-Length: 0\r\n\r\n"
             )
             self._send(ack, addr)
-            if call.rtp_protocol is None:
-                await self._setup_rtp(call)
+            await self._setup_rtp(call, start_loop=True)
             call.state = "answered"
             call.answered_at = time.time()
             if self.on_call_state:
@@ -1450,14 +1490,12 @@ class SipUserAgent:
             number = "7" + number[1:]
         if not number:
             raise ValueError("Empty number")
-        rtp_port = self._allocate_rtp_port()
         call_id = f"{random.randint(10**10, 10**13)}@{self.local_ip}"
         local_tag = f"{random.randint(10**6, 10**9)}"
         self._cseq += 1
         request_uri = f"sip:{number}@{self.config.domain}"
         from_header = self._from(tag=local_tag)
         to_header = f"<{request_uri}>"
-        sdp = self._local_sdp(rtp_port)
         call = ActiveCall(
             call_id=call_id,
             direction="outbound",
@@ -1465,7 +1503,7 @@ class SipUserAgent:
             local_tag=local_tag,
             remote_host=self._proxy_ip,
             remote_port=self._proxy_port,
-            local_rtp_port=rtp_port,
+            local_rtp_port=self._allocate_rtp_port(),
             state="dialing",
             cseq=self._cseq,
             from_header=from_header,
@@ -1474,6 +1512,12 @@ class SipUserAgent:
             playback_provider=playback_provider,
         )
         self.calls[call_id] = call
+        try:
+            await self._setup_rtp(call, start_loop=False)
+        except Exception:
+            await self.hangup(call.call_id, cause="rtp_bind_failed", send_bye=False)
+            raise
+        sdp = self._local_sdp(call.local_rtp_port)
         headers = {
             "From": from_header,
             "To": to_header,
@@ -1496,7 +1540,7 @@ class SipUserAgent:
             if call.call_id in self.calls:
                 await self.hangup(call.call_id, cause="invite_failed", send_bye=False)
             raise
-        if call.state != "answered":
+        if not call.invite_final:
             await self._handle_outbound_response(
                 call,
                 status,

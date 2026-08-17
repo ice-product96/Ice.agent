@@ -83,6 +83,22 @@ async def test_invite_401_does_not_fail_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_setup_rtp_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    ua = _ua()
+    call = _call(ua)
+    binds: list[int] = []
+
+    async def fake_bind(target: ActiveCall) -> None:
+        binds.append(target.local_rtp_port)
+        target.rtp_protocol = object()  # type: ignore[assignment]
+
+    monkeypatch.setattr(ua, "_bind_rtp_socket", fake_bind)
+    await ua._setup_rtp(call, start_loop=False)
+    await ua._setup_rtp(call, start_loop=False)
+    assert binds == [10000]
+
+
+@pytest.mark.asyncio
 async def test_invite_403_fails_call() -> None:
     ua = _ua()
     call = _call(ua)
