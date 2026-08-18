@@ -1073,32 +1073,85 @@ async def dismiss_consultation_api(
 
 @router.get("/employees", dependencies=auth)
 async def list_employees(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    profiles = (await db.scalars(select(EmployeeProfile).order_by(EmployeeProfile.agent_id))).all()
-    open_consults = int(
-        await db.scalar(
-            select(func.count()).select_from(Consultation).where(Consultation.status == "open")
+    from .work_items import counts_for_agent
+
+    agents = (await db.scalars(select(Agent).order_by(Agent.id))).all()
+    profiles = {
+        profile.agent_id: profile
+        for profile in (await db.scalars(select(EmployeeProfile))).all()
+    }
+    items: list[dict[str, Any]] = []
+    open_consults = 0
+    paused = 0
+    autonomous = 0
+    failed_work = 0
+    waiting_manager = 0
+    actionable_work = 0
+    for agent in agents:
+        profile = profiles.get(agent.id)
+        counts = await counts_for_agent(db, agent.id)
+        agent_open_consults = int(
+            await db.scalar(
+                select(func.count())
+                .select_from(Consultation)
+                .where(
+                    Consultation.agent_id == agent.id,
+                    Consultation.status == "open",
+                )
+            )
+            or 0
         )
-        or 0
-    )
-    paused = sum(1 for p in profiles if p.paused and p.autonomy_enabled)
-    autonomous = sum(1 for p in profiles if p.autonomy_enabled)
-    failed_work = int(
-        await db.scalar(select(func.count()).select_from(WorkItem).where(WorkItem.status == "failed"))
-        or 0
-    )
-    waiting_manager = int(
-        await db.scalar(
-            select(func.count()).select_from(WorkItem).where(WorkItem.status == "waiting_manager")
-        )
-        or 0
-    )
+        failed_count = int(counts.get("failed") or 0)
+        waiting_count = int(counts.get("waiting_manager") or 0)
+        actionable_count = int(counts.get("actionable") or 0)
+        open_consults += agent_open_consults
+        failed_work += failed_count
+        waiting_manager += waiting_count
+        actionable_work += actionable_count
+        if profile is not None:
+            if profile.paused and profile.autonomy_enabled:
+                paused += 1
+            if profile.autonomy_enabled:
+                autonomous += 1
+        entry: dict[str, Any] = {
+            "agent_id": agent.id,
+            "agent_name": agent.name,
+            "agent_enabled": agent.enabled,
+            "telegram_account_id": agent.telegram_account_id,
+            "has_profile": profile is not None,
+            "open_consultations": agent_open_consults,
+            "work_item_counts": counts,
+            "failed_work_items": failed_count,
+            "waiting_manager": waiting_count,
+            "actionable_work_items": actionable_count,
+        }
+        if profile is not None:
+            entry.update(profile_json(profile))
+        else:
+            entry.update(
+                {
+                    "id": None,
+                    "autonomy_enabled": False,
+                    "paused": False,
+                    "heartbeat_minutes": 15,
+                    "workday_start": "09:00",
+                    "workday_end": "18:00",
+                    "timezone": "UTC",
+                    "budget_ticks_per_day": 48,
+                    "ticks_used_today": 0,
+                    "role_title": "",
+                    "mission": "",
+                }
+            )
+        items.append(entry)
     return {
-        "items": [profile_json(p) for p in profiles],
+        "items": items,
         "open_consultations": open_consults,
         "paused_agents": paused,
         "autonomous_agents": autonomous,
         "failed_work_items": failed_work,
         "waiting_manager": waiting_manager,
+        "actionable_work_items": actionable_work,
     }
 
 
@@ -2044,12 +2097,28 @@ async def cron_jobs(db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
     return [cron_json(item) for item in (await db.scalars(select(CronJob).order_by(CronJob.id))).all()]
 
 
+def scoped_cron_name(name: str, agent_id: int) -> str:
+    from .employee import clip_cron_name, unique_cron_name
+
+    base = clip_cron_name(name) or "job"
+    candidate = f"a{agent_id}-{base}"[:120]
+    if candidate == base:
+        return unique_cron_name(base, agent_id)
+    return candidate
+
+
 @router.post("/cron", dependencies=auth, status_code=201)
 async def create_cron(payload: CronBody, request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    from .employee import unique_cron_name
+
     schedule, job_payload = cron_values(payload)
+    agent_id = as_int(payload.agent_id, "agent_id")
+    job_name = scoped_cron_name(payload.name, agent_id)
+    if await db.scalar(select(CronJob.id).where(CronJob.name == job_name)):
+        job_name = unique_cron_name(payload.name, agent_id)
     job = CronJob(
-        name=payload.name,
-        agent_id=as_int(payload.agent_id, "agent_id"),
+        name=job_name,
+        agent_id=agent_id,
         cron=schedule,
         payload=job_payload,
         enabled=payload.enabled,

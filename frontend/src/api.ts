@@ -1,6 +1,6 @@
 import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
-  Conversation, ConversationDetail, Consultation, EmployeePolicy, EmployeePolicyCatalog, EmployeeProfile, EmployeeState,
+  Conversation, ConversationDetail, Consultation, EmployeePolicy, EmployeePolicyCatalog, EmployeeProfile, EmployeeRosterEntry, EmployeeState,
   LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
   RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts,
 } from './types'
@@ -108,7 +108,7 @@ export const api = {
       ),
   },
   employees: {
-    list: () => request<{ items: EmployeeProfile[]; open_consultations: number; paused_agents: number; autonomous_agents: number; failed_work_items?: number; waiting_manager?: number }>('/employees'),
+    list: () => request<{ items: EmployeeRosterEntry[]; open_consultations: number; paused_agents: number; autonomous_agents: number; failed_work_items?: number; waiting_manager?: number; actionable_work_items?: number }>('/employees'),
     policyCatalog: () => request<EmployeePolicyCatalog>('/employees/policy-catalog'),
   },
   consultations: {

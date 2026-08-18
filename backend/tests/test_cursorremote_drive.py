@@ -250,3 +250,45 @@ def test_searching_status_is_not_treated_as_not_started() -> None:
     assert result["done"] is False
     assert result["status"] != "not_started"
 
+
+def test_send_prompt_includes_customer_image_in_workspace(tmp_path) -> None:
+    from app.cursor_assets import materialize_cursor_images
+
+    png = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+        "x8AAwMCAO+ip1sAAAAASUVORK5CYII="
+    )
+    workspace = tmp_path / "site"
+    workspace.mkdir()
+    prompt, paths = materialize_cursor_images(
+        {"workspacePath": str(workspace)},
+        "Поставь это фото в шапку",
+        [{"kind": "image", "filename": "hero.png", "mime_type": "image/png", "data_b64": png}],
+        work_item_id=12,
+    )
+    assert "from-customer/case-12" in prompt
+    assert paths
+    assert (workspace / paths[0]).is_file()
+
+    session = ScriptSession(
+        {"wait": [{"status": "timeout"} for _ in range(20)]},
+        default={
+            "agentStatus": "idle",
+            "pendingApprovalCount": 0,
+            "workspacePath": str(workspace),
+        },
+    )
+    asyncio.run(
+        send_prompt_and_drive(
+            session,
+            "Поставь это фото в шапку",
+            attachments=[{"kind": "image", "filename": "hero.png", "mime_type": "image/png", "data_b64": png}],
+            work_item_id=12,
+            timeout_ms=80,
+        )
+    )
+    sent = next(args for tool, args in session.calls if tool == "send_prompt")
+    assert "from-customer/case-12" in sent["text"]
+    assert "hero" in sent["text"].lower() or "from-customer" in sent["text"]
+
+

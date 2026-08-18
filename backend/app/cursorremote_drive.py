@@ -428,6 +428,8 @@ async def send_prompt_and_drive(
     text: str,
     *,
     timeout_ms: int = 90_000,
+    attachments: list[dict[str, Any]] | None = None,
+    work_item_id: Any = None,
 ) -> dict[str, Any]:
     try:
         current = await mcp_call(session, "get_status")
@@ -450,9 +452,17 @@ async def send_prompt_and_drive(
                 "Polled the current job instead."
             ),
         }
-    sent = await mcp_call(session, "send_prompt", {"text": text})
+    from .cursor_assets import materialize_cursor_images
+
+    prompt, image_paths = materialize_cursor_images(
+        current, text, attachments, work_item_id=work_item_id
+    )
+    sent = await mcp_call(session, "send_prompt", {"text": prompt})
     driven = await drive_until_done(session, timeout_ms=timeout_ms, require_busy=True)
-    return {"sent": sent, "prompt_sent": True, **driven}
+    result = {"sent": sent, "prompt_sent": True, **driven}
+    if image_paths:
+        result["images"] = image_paths
+    return result
 
 
 async def check_and_drive(

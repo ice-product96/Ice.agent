@@ -309,7 +309,7 @@ export interface EmployeePolicyCatalog {
 }
 
 export interface EmployeeProfile {
-  id: ID
+  id: ID | null
   agent_id: ID
   autonomy_enabled: boolean
   paused: boolean
@@ -325,6 +325,18 @@ export interface EmployeeProfile {
   role_title: string
   mission: string
   policy?: EmployeePolicy
+}
+
+export interface EmployeeRosterEntry extends EmployeeProfile {
+  agent_name: string
+  agent_enabled: boolean
+  telegram_account_id?: ID | null
+  has_profile?: boolean
+  open_consultations?: number
+  work_item_counts?: Record<string, number>
+  failed_work_items?: number
+  waiting_manager?: number
+  actionable_work_items?: number
 }
 
 export interface EmployeePlan {
@@ -400,7 +412,7 @@ export interface WorkItem {
     count?: number
     debounce_minutes?: number
     flush_job_id?: number | null
-    messages?: Array<{ at?: string | null; text?: string }>
+    messages?: Array<{ at?: string | null; text?: string; attachments?: Array<{ kind?: string; filename?: string }> }>
   }
 }
 

@@ -309,6 +309,14 @@ class AgentRuntime:
         self.scheduler: Any = None
         self.conversations = ConversationContextService()
         self.employee = EmployeeService(telegram=telegram, scheduler=None, events=events)
+        self._agent_locks: dict[int, asyncio.Lock] = {}
+
+    def _lock_for(self, agent_id: int) -> asyncio.Lock:
+        lock = self._agent_locks.get(agent_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._agent_locks[agent_id] = lock
+        return lock
 
     def bind_task_bus(self, task_bus: TaskBus) -> None:
         self.task_bus = task_bus
@@ -678,7 +686,7 @@ class AgentRuntime:
             )
             registry.register(sip_hangup, "sip_hangup", "Hang up an active SIP call")
             registry.register(sip_status, "sip_status", "SIP registration and active call status")
-        cursor_state = {"finished": False}
+        cursor_state = {"finished": False, "prompt_sent": False}
         if self.mcp and mcp_server_names:
             await self.mcp.register_tools(registry, mcp_server_names)
             cursor_session = next(
@@ -698,6 +706,7 @@ class AgentRuntime:
                     pin_cursor_followup_message,
                     send_prompt_and_drive,
                 )
+                from .cursor_assets import collect_images_for_cursor
 
                 async def cursorremote_do(prompt: str) -> dict[str, Any]:
                     """Send a task to Cursor IDE, auto-click Allow/Accept/Run, wait until it actually finishes or times out."""
@@ -721,15 +730,18 @@ class AgentRuntime:
                         item.status == "waiting_external"
                         or bool((item.metadata_json or {}).get("cursor_in_flight"))
                     )
-                    if in_flight:
+                    already_sent = bool(cursor_state.get("prompt_sent")) or bool(
+                        (context or {}).get("_duplicate_intake_flush")
+                    )
+                    if in_flight or already_sent:
                         result = await check_and_drive(cursor_session)
                         result = {
                             **result,
                             "skipped_prompt": True,
                             "prompt_sent": False,
                             "reason": (
-                                "This case is already waiting on Cursor. "
-                                "Did not send a new prompt (that would duplicate the job). "
+                                "This case already has a Cursor job. "
+                                "Did not send another prompt (that would duplicate the task). "
                                 "If done=true, report the result. If done=false, wait — "
                                 "search/explore is not a stop."
                             ),
@@ -738,7 +750,17 @@ class AgentRuntime:
                         if result.get("done"):
                             cursor_state["finished"] = True
                         return result
-                    result = await send_prompt_and_drive(cursor_session, prompt)
+                    result = await send_prompt_and_drive(
+                        cursor_session,
+                        prompt,
+                        attachments=collect_images_for_cursor(context, item),
+                        work_item_id=(item.id if item is not None else context.get("work_item_id")),
+                    )
+                    if result.get("prompt_sent"):
+                        cursor_state["prompt_sent"] = True
+                        from .work_items import stamp_cursor_prompt_sent
+
+                        await stamp_cursor_prompt_sent(db, item)
                     if result.get("done"):
                         cursor_state["finished"] = True
                     return result
@@ -755,6 +777,10 @@ class AgentRuntime:
                     "cursorremote_do",
                     (
                         "Give Cursor a NEW coding task only if this case has not already sent one. "
+                        "One case = one Cursor job. Never send a second prompt for the next bullet "
+                        "or because Cursor is searching. "
+                        "If the customer attached photos, the platform copies them into the project "
+                        "and adds their paths to the prompt — still describe how to use them. "
                         "If the case is waiting on Cursor, the platform converts this to a check "
                         "and will not send a duplicate prompt. Clicks Allow/Accept/Run itself. "
                         "done=true only after Cursor finished. If done=false, schedule_self "
@@ -1042,85 +1068,96 @@ class AgentRuntime:
     ) -> dict[str, Any]:
         if not agent.enabled:
             return {"ok": False, "skipped": True, "reason": "agent_disabled"}
-        profile = await get_or_create_profile(db, agent.id)
-        prepared = await self.employee.prepare_tick_context(db, agent, profile, force=force)
-        if prepared.get("skip"):
-            return {"ok": True, "skipped": True, "reason": prepared.get("reason")}
-        extra = extra or {}
-        pending = await watchdog_items(db, agent.id)
-        watchdog_reason = reason in {"heartbeat", "employee_heartbeat"}
-        if not extra.get("work_item_id") and not pending and not force and watchdog_reason:
+        async with self._lock_for(agent.id):
+            profile = await get_or_create_profile(db, agent.id)
+            prepared = await self.employee.prepare_tick_context(db, agent, profile, force=force)
+            if prepared.get("skip"):
+                return {"ok": True, "skipped": True, "reason": prepared.get("reason")}
+            extra = extra or {}
+            pending = await watchdog_items(db, agent.id)
+            watchdog_reason = reason in {"heartbeat", "employee_heartbeat"}
+            if not extra.get("work_item_id") and not pending and not force and watchdog_reason:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "no_open_work",
+                    "watchdog": {"count": 0, "ids": []},
+                }
+            await self.employee.mark_tick(db, profile)
+            origin = collect_origin_from_jobs(
+                await list_agent_jobs(db, agent.id, enabled_only=False)
+            )
+            context = {
+                "source": "employee_tick",
+                "employee_tick": True,
+                "force_tick": force,
+                "tick_reason": reason,
+                "user_id": f"employee:{agent.id}",
+                **{key: value for key, value in origin.items() if value not in (None, "")},
+                **{
+                    key: extra[key]
+                    for key in ("work_item_id", "reply_chat_id", "reply_phone", "chat_id")
+                    if extra.get(key) not in (None, "")
+                },
+            }
+            if extra.get("work_item_id"):
+                context["work_item_id"] = extra["work_item_id"]
+            elif pending:
+                context["work_item_id"] = pending[0].id
+            if pending:
+                message = build_watchdog_instruction(pending)
+            else:
+                message = build_employee_tick_instruction(profile)
+            focus = await get_work_item(db, context.get("work_item_id"))
+            if focus is not None and focus.status == "collecting" and focus.wait_until:
+                from .work_items import _as_aware
+
+                if _as_aware(focus.wait_until) <= utcnow():
+                    context["source"] = "intake_flush"
+                    context["kind"] = "intake_flush"
+                    context.pop("employee_tick", None)
+                    message = compile_intake_brief(focus)
+                    if focus.chat_id:
+                        context.setdefault("reply_chat_id", focus.chat_id)
+                        context.setdefault("chat_id", focus.chat_id)
+                    if focus.reply_phone:
+                        context.setdefault("reply_phone", focus.reply_phone)
+            if extra.get("instruction"):
+                message = f"{extra['instruction']}\n\n{message}"
+            elif extra.get("message") and reason in {"consult_resolved", "manual"}:
+                message = f"{extra['message']}\n\n{message}"
+            result = await self._run_impl(db, agent, message, context)
+            try:
+                await self.employee.maybe_send_daily_digest(db, agent, profile)
+            except Exception:
+                pass
+            await self.events.publish(
+                "employee.tick",
+                {"agent_id": agent.id, "reason": reason, "force": force},
+            )
             return {
                 "ok": True,
-                "skipped": True,
-                "reason": "no_open_work",
-                "watchdog": {"count": 0, "ids": []},
+                "skipped": False,
+                "result": result,
+                "notes": list(context.get("_job_notes") or []),
+                "deliver_origin": bool(context.get("_deliver_origin_reply")),
+                "origin_already_sent": bool(context.get("_origin_already_sent")),
+                "reply_phone": context.get("reply_phone") or context.get("phone"),
+                "reply_chat_id": origin_chat_id(context),
+                "watchdog": {"count": len(pending), "ids": [item.id for item in pending]},
             }
-        await self.employee.mark_tick(db, profile)
-        origin = collect_origin_from_jobs(
-            await list_agent_jobs(db, agent.id, enabled_only=False)
-        )
-        context = {
-            "source": "employee_tick",
-            "employee_tick": True,
-            "force_tick": force,
-            "tick_reason": reason,
-            "user_id": f"employee:{agent.id}",
-            **{key: value for key, value in origin.items() if value not in (None, "")},
-            **{
-                key: extra[key]
-                for key in ("work_item_id", "reply_chat_id", "reply_phone", "chat_id")
-                if extra.get(key) not in (None, "")
-            },
-        }
-        if extra.get("work_item_id"):
-            context["work_item_id"] = extra["work_item_id"]
-        elif pending:
-            context["work_item_id"] = pending[0].id
-        if pending:
-            message = build_watchdog_instruction(pending)
-        else:
-            message = build_employee_tick_instruction(profile)
-        focus = await get_work_item(db, context.get("work_item_id"))
-        if focus is not None and focus.status == "collecting" and focus.wait_until:
-            from .work_items import _as_aware
-
-            if _as_aware(focus.wait_until) <= utcnow():
-                context["source"] = "intake_flush"
-                context["kind"] = "intake_flush"
-                context.pop("employee_tick", None)
-                message = compile_intake_brief(focus)
-                if focus.chat_id:
-                    context.setdefault("reply_chat_id", focus.chat_id)
-                    context.setdefault("chat_id", focus.chat_id)
-                if focus.reply_phone:
-                    context.setdefault("reply_phone", focus.reply_phone)
-        if extra.get("instruction"):
-            message = f"{extra['instruction']}\n\n{message}"
-        elif extra.get("message") and reason in {"consult_resolved", "manual"}:
-            message = f"{extra['message']}\n\n{message}"
-        result = await self.run(db, agent, message, context)
-        try:
-            await self.employee.maybe_send_daily_digest(db, agent, profile)
-        except Exception:
-            pass
-        await self.events.publish(
-            "employee.tick",
-            {"agent_id": agent.id, "reason": reason, "force": force},
-        )
-        return {
-            "ok": True,
-            "skipped": False,
-            "result": result,
-            "notes": list(context.get("_job_notes") or []),
-            "deliver_origin": bool(context.get("_deliver_origin_reply")),
-            "origin_already_sent": bool(context.get("_origin_already_sent")),
-            "reply_phone": context.get("reply_phone") or context.get("phone"),
-            "reply_chat_id": origin_chat_id(context),
-            "watchdog": {"count": len(pending), "ids": [item.id for item in pending]},
-        }
 
     async def run(
+        self,
+        db: AsyncSession,
+        agent: Agent,
+        message: str,
+        context: dict[str, Any] | None = None,
+    ) -> str:
+        async with self._lock_for(agent.id):
+            return await self._run_impl(db, agent, message, context)
+
+    async def _run_impl(
         self,
         db: AsyncSession,
         agent: Agent,
@@ -1271,14 +1308,37 @@ class AgentRuntime:
                 )
             )
             if work_item is not None and is_intake_flush:
+                from .work_items import intake_flush_already_started
+
+                duplicate_flush = intake_flush_already_started(work_item)
                 context["_intake_flush"] = True
                 context["_intake_collecting"] = False
                 compiled = compile_intake_brief(work_item)
                 if compiled:
                     message = compiled
                     context["_user_message"] = message
-                work_item = await mark_intake_executing(db, work_item)
-                context["_cursor_was_in_flight"] = False
+                work_item = await mark_intake_executing(
+                    db, work_item, scheduler=self.employee.scheduler
+                )
+                context["_duplicate_intake_flush"] = duplicate_flush
+                context["_cursor_was_in_flight"] = duplicate_flush or bool(
+                    (work_item.metadata_json or {}).get("cursor_in_flight")
+                )
+                from .cursor_assets import load_customer_images
+
+                stored_images = load_customer_images(work_item)
+                if stored_images:
+                    attachments = list(attachments) + [
+                        image
+                        for image in stored_images
+                        if image.get("digest")
+                        not in {
+                            str(item.get("digest") or "")
+                            for item in attachments
+                            if isinstance(item, dict)
+                        }
+                    ]
+                    context["_attachments"] = attachments
             elif work_item is not None and should_collect_customer_intake(
                 work_item, context, minutes=debounce_minutes
             ):
@@ -1289,12 +1349,23 @@ class AgentRuntime:
                     minutes=debounce_minutes,
                     scheduler=self.employee.scheduler,
                     agent_id=agent.id,
+                    attachments=attachments,
                 )
                 context["_intake_collecting"] = True
                 context["work_item_id"] = work_item.id
                 context["_cursor_was_in_flight"] = False
             else:
                 context["_cursor_was_in_flight"] = was_in_flight
+                if (
+                    work_item is not None
+                    and attachments
+                    and not context.get("is_admin")
+                    and str(context.get("source") or "") == "telegram"
+                ):
+                    from .cursor_assets import persist_customer_images
+
+                    persist_customer_images(work_item, attachments)
+                    await db.commit()
             system_prompt = await assemble_system_prompt(db, agent)
             employee_block = ""
             if employee_profile.autonomy_enabled or context.get("employee_tick"):

@@ -20,7 +20,7 @@ type Icon = typeof LayoutDashboard
 const nav: { id: Page; label: string; icon: Icon; group?: string }[] = [
   { id: 'dashboard', label: 'Обзор', icon: LayoutDashboard, group: 'Рабочая область' },
   { id: 'agents', label: 'Агенты', icon: Bot },
-  { id: 'employee', label: 'Сотрудник', icon: Briefcase },
+  { id: 'employee', label: 'Сотрудники', icon: Briefcase },
   { id: 'connections', label: 'Подключения', icon: KeyRound },
   { id: 'telegram', label: 'Telegram', icon: MessageCircle },
   { id: 'sip', label: 'SIP', icon: Phone },
@@ -38,7 +38,7 @@ const nav: { id: Page; label: string; icon: Icon; group?: string }[] = [
 const title: Record<Page, [string, string]> = {
   dashboard: ['Центр управления', 'Статус рабочей области Ice.agent в реальном времени'],
   agents: ['Агенты', 'Настройка интеллекта, подключений и возможностей'],
-  employee: ['Сотрудник', 'Очередь кейсов, контроль действий и консультации'],
+  employee: ['Сотрудники', 'Несколько автономных агентов — каждый со своим inbox и политикой'],
   connections: ['Подключения и провайдеры', 'Управление учётными данными LLM и эндпоинтами моделей'],
   telegram: ['Аккаунты Telegram', 'Управление подключёнными пользовательскими и бот-сессиями'],
   sip: ['SIP-аккаунты', 'Регистрация в АТС и привязка к агентам для голосовых звонков'],
@@ -992,8 +992,8 @@ function ConversationsScreen() {
 }
 
 function EmployeeScreen() {
-  const agents = useLoad(api.agents.list, [])
   const overview = useLoad(api.employees.list, [])
+  const roster = overview.data?.items || []
   const [agentId, setAgentId] = useState('')
   const consults = useLoad(
     () => (agentId ? api.consultations.list(agentId, 'open') : Promise.resolve({ items: [], total: 0 })),
@@ -1050,8 +1050,10 @@ function EmployeeScreen() {
   }
 
   useEffect(() => {
-    if (!agentId && agents.data?.length) setAgentId(String(agents.data[0].id))
-  }, [agents.data, agentId])
+    if (agentId || !roster.length) return
+    const preferred = roster.find(item => item.autonomy_enabled) || roster[0]
+    if (preferred) setAgentId(String(preferred.agent_id))
+  }, [roster, agentId])
 
   async function load(id: string) {
     if (!id) return
@@ -1185,30 +1187,54 @@ function EmployeeScreen() {
     } finally { setBusy('') }
   }
 
+  const selectedRoster = roster.find(item => String(item.agent_id) === agentId)
+
   return <>
     <SectionHead
-      title="Автономный сотрудник"
-      text={`Автономных: ${overview.data?.autonomous_agents ?? 0} · ошибок: ${overview.data?.failed_work_items ?? counts.failed ?? 0} · ждут вас: ${overview.data?.waiting_manager ?? counts.waiting_manager ?? 0}`}
+      title="Автономные сотрудники"
+      text={`Агентов: ${roster.length} · автономных: ${overview.data?.autonomous_agents ?? 0} · ошибок: ${overview.data?.failed_work_items ?? counts.failed ?? 0} · ждут вас: ${overview.data?.waiting_manager ?? counts.waiting_manager ?? 0}`}
       action={<div className="head-actions">
-        <select value={agentId} onChange={e => setAgentId(e.target.value)} aria-label="Агент">
-          <option value="">Выберите агента</option>
-          {(agents.data || []).map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
-        </select>
         <button className="secondary" disabled={!agentId || loading} onClick={() => void load(agentId)}><RefreshCw size={15}/>Обновить</button>
       </div>}
     />
-    {(error || notice || agents.error || overview.error || consults.error) && (
+    {roster.length > 0 && <section className="panel employee-roster">
+      <SectionHead title="Команда" text="Каждый агент работает отдельно: свой inbox, heartbeat и политика."/>
+      <div className="employee-roster-grid">
+        {roster.map(item => {
+          const badge = (item.failed_work_items || 0) + (item.waiting_manager || 0) + (item.open_consultations || 0)
+          const selected = String(item.agent_id) === agentId
+          return <button
+            type="button"
+            key={item.agent_id}
+            className={`employee-roster-card ${selected ? 'selected' : ''} ${!item.agent_enabled ? 'disabled' : ''}`}
+            onClick={() => setAgentId(String(item.agent_id))}
+          >
+            <div className="employee-roster-head">
+              <strong>{item.agent_name}</strong>
+              {badge > 0 && <span className="nav-badge">{badge}</span>}
+            </div>
+            <small>{item.role_title || 'Роль не задана'}{item.autonomy_enabled ? ' · автономия' : ''}{item.paused ? ' · пауза' : ''}</small>
+            <div className="employee-roster-stats">
+              <span>кейсов: {item.actionable_work_items || 0}</span>
+              <span>ошибок: {item.failed_work_items || 0}</span>
+              <span>ждут: {item.waiting_manager || 0}</span>
+            </div>
+          </button>
+        })}
+      </div>
+    </section>}
+    {(error || notice || overview.error || consults.error) && (
       <>
         {error && <Alert message={error}/>}
         {notice && !error && <p className="notice-banner">{notice}</p>}
-        {(agents.error || overview.error || consults.error) && !error && (
-          <Alert message={agents.error || overview.error || consults.error}/>
+        {(overview.error || consults.error) && !error && (
+          <Alert message={overview.error || consults.error}/>
         )}
       </>
     )}
-    {loading && !state ? <Loading/> : !agentId ? <Empty icon={Briefcase} title="Выберите агента" text="Включите автономию — входящие задачи станут кейсами, heartbeat будет их сторожить."/> : state && <>
+    {loading && !state ? <Loading/> : !agentId ? <Empty icon={Briefcase} title="Выберите сотрудника" text="Настройте нескольких агентов — каждый будет работать со своими кейсами и клиентами."/> : state && <>
       <section className="panel work-inbox">
-        <SectionHead title="Inbox кейсов" text="Единица работы — кейс, не строка cron. Сторож смотрит открытые, а не пишет журнал тика."
+        <SectionHead title={`Inbox · ${selectedRoster?.agent_name || state.agent_name || ''}`} text="Единица работы — кейс, не строка cron. Сторож смотрит открытые, а не пишет журнал тика."
           action={<div className="head-actions">
             <button className="secondary" disabled={!!busy} onClick={async () => {
               setBusy('pause')
@@ -1274,6 +1300,9 @@ function EmployeeScreen() {
                 <div className="intake-message" key={`${entry.at || index}`}>
                   <small>{entry.at ? new Date(entry.at).toLocaleString('ru-RU') : ''}</small>
                   <p>{entry.text}</p>
+                  {(entry.attachments || []).length > 0 && (
+                    <small>{(entry.attachments || []).map(file => file.filename || file.kind || 'файл').join(', ')}</small>
+                  )}
                 </div>
               ))}
             </div>

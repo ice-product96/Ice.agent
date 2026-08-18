@@ -6,11 +6,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .conversation import as_utc
-from .db import Agent, MessageLog, RuntimeSettings, TelegramAccount
+from .db import Agent, Consultation, ConversationState, MessageLog, RuntimeSettings, TelegramAccount
 from .employee import CONSULT_CMD_RE
 from .events import EventHub
 from .runtime import AgentRuntime, NO_TELEGRAM_REPLY
 from .telegram import TelegramGateway, attachment_label, public_attachment
+from .work_items import find_open_for_chat
 
 ADMIN_ACK_TEXT = "Принято, обрабатываю…"
 logger = logging.getLogger(__name__)
@@ -46,24 +47,101 @@ class TelegramEventRouter:
         self._recent_set.add(key)
         return False
 
+    async def _account_and_agents(
+        self,
+        db: AsyncSession,
+        phone: str,
+    ) -> tuple[TelegramAccount | None, list[Agent]]:
+        rows = (
+            await db.execute(
+                select(TelegramAccount, Agent)
+                .join(Agent, Agent.telegram_account_id == TelegramAccount.id)
+                .where(
+                    TelegramAccount.phone == phone,
+                    TelegramAccount.enabled.is_(True),
+                    Agent.enabled.is_(True),
+                )
+                .order_by(Agent.id)
+            )
+        ).all()
+        if not rows:
+            return None, []
+        account = rows[0][0]
+        return account, [row[1] for row in rows]
+
+    async def _pick_agent(
+        self,
+        db: AsyncSession,
+        account: TelegramAccount,
+        agents: list[Agent],
+        *,
+        chat_id: str | None = None,
+        consult_id: int | None = None,
+    ) -> Agent | None:
+        if not agents:
+            return None
+        if len(agents) == 1:
+            return agents[0]
+        if consult_id is not None:
+            consult = await db.get(Consultation, consult_id)
+            if consult is not None:
+                picked = next((agent for agent in agents if agent.id == consult.agent_id), None)
+                if picked is not None:
+                    return picked
+        if chat_id:
+            for agent in agents:
+                if await find_open_for_chat(db, agent.id, chat_id):
+                    return agent
+            agent_ids = [agent.id for agent in agents]
+            recent_agent = await db.scalar(
+                select(MessageLog.agent_id)
+                .where(
+                    MessageLog.account_id == account.id,
+                    MessageLog.chat_id == str(chat_id),
+                    MessageLog.agent_id.in_(agent_ids),
+                )
+                .order_by(MessageLog.id.desc())
+                .limit(1)
+            )
+            if recent_agent is not None:
+                picked = next((agent for agent in agents if agent.id == recent_agent), None)
+                if picked is not None:
+                    return picked
+            conv_agent = await db.scalar(
+                select(ConversationState.agent_id)
+                .where(
+                    ConversationState.account_id == account.id,
+                    ConversationState.chat_id == str(chat_id),
+                    ConversationState.agent_id.in_(agent_ids),
+                )
+                .order_by(ConversationState.updated_at.desc())
+                .limit(1)
+            )
+            if conv_agent is not None:
+                picked = next((agent for agent in agents if agent.id == conv_agent), None)
+                if picked is not None:
+                    return picked
+        return agents[0]
+
     async def _target(
         self,
         db: AsyncSession,
         phone: str,
+        *,
+        chat_id: str | None = None,
+        consult_id: int | None = None,
     ) -> tuple[TelegramAccount | None, Agent | None]:
-        result = await db.execute(
-            select(TelegramAccount, Agent)
-            .join(Agent, Agent.telegram_account_id == TelegramAccount.id)
-            .where(
-                TelegramAccount.phone == phone,
-                TelegramAccount.enabled.is_(True),
-                Agent.enabled.is_(True),
-            )
-            .order_by(Agent.id)
-            .limit(1)
+        account, agents = await self._account_and_agents(db, phone)
+        if account is None:
+            return None, None
+        agent = await self._pick_agent(
+            db,
+            account,
+            agents,
+            chat_id=chat_id,
+            consult_id=consult_id,
         )
-        found = result.first()
-        return found if found else (None, None)
+        return account, agent
 
     async def new_message(self, payload: dict[str, Any]) -> None:
         text = str(payload.get("text") or "").strip()
@@ -90,8 +168,19 @@ class TelegramEventRouter:
             )
             return
         phone = str(payload.get("phone") or "")
+        chat_id = str(payload.get("chat_id") or payload.get("sender_id") or "")
+        consult_id: int | None = None
+        if text:
+            consult_match = CONSULT_CMD_RE.match(text)
+            if consult_match:
+                consult_id = int(consult_match.group(2))
         async with self.sessions() as db:
-            account, agent = await self._target(db, phone)
+            account, agent = await self._target(
+                db,
+                phone,
+                chat_id=chat_id or None,
+                consult_id=consult_id,
+            )
             if account is None or agent is None:
                 logger.warning(
                     "telegram.unrouted phone=%s message_id=%s (no enabled agent/account)",

@@ -111,6 +111,8 @@ def customer_result_only_instruction() -> str:
         "Do NOT call telegram_send_message or telegram_send_file to the customer chat "
         "until cursorremote_do/check returns done=true for THIS assignment. "
         "A leftover idle summary from a previous Cursor job is not this result. "
+        "If the customer sent images, include how Cursor should use them; the platform "
+        "copies those files into the project automatically. "
         "If done=false, schedule_self to check again and write nothing to the customer."
     )
 
@@ -118,9 +120,12 @@ def customer_result_only_instruction() -> str:
 def customer_intake_flush_instruction() -> str:
     return (
         "The quiet period ended. The user message is the accumulated customer assignment. "
-        "Execute it now. You MAY call cursorremote_do if it is a coding/workspace task. "
+        "Execute it now with a SINGLE cursorremote_do that covers the whole brief. "
+        "Do not send a separate Cursor job for each bullet, message, or image. "
         "If it is only small talk or already answered, do not start Cursor — finish without a new job. "
         "Do NOT mention that you waited, buffered messages, or that a timer fired. "
+        "If the customer sent images, they are attached here and the platform will copy them "
+        "into the Cursor project when you call cursorremote_do — describe how to use them. "
         + customer_result_only_instruction()
     )
 

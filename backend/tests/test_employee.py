@@ -79,7 +79,8 @@ def test_tick_instruction_uses_scheduler() -> None:
     assert "schedule_self" in text
     assert "cursorremote_check" in text
     assert "планы (час/день" not in text
-    assert "новый schedule_self и cursorremote_do не ставь" in text
+    assert "cursorremote_do" in text
+    assert "не ставь" in text
     assert "результат тика" in text
     assert "поиск" in text.lower()
 

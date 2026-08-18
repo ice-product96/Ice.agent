@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .action_reports import audit_tool_result, cursor_result_ready_for_customer
-from .db import Agent, Consultation, WorkItem, WorkItemEvent, utcnow
+from .db import Agent, Consultation, CronJob, WorkItem, WorkItemEvent, utcnow
 from .job_result import origin_chat_id, origin_phone, send_origin_reply
 
 logger = logging.getLogger(__name__)
@@ -146,6 +146,15 @@ def intake_json(item: WorkItem) -> dict[str, Any]:
             {
                 "at": entry.get("at"),
                 "text": _clip(str(entry.get("text") or ""), 400),
+                "attachments": [
+                    {
+                        "kind": file.get("kind"),
+                        "filename": file.get("filename"),
+                    }
+                    for file in list(entry.get("attachments") or [])
+                    if isinstance(file, dict)
+                ]
+                or None,
             }
         )
     return {
@@ -167,10 +176,19 @@ def compile_intake_brief(item: WorkItem) -> str:
         if not isinstance(entry, dict):
             continue
         text = str(entry.get("text") or "").strip()
-        if not text:
+        files = [
+            str(file.get("filename") or file.get("kind") or "файл")
+            for file in list(entry.get("attachments") or [])
+            if isinstance(file, dict)
+        ]
+        if not text and not files:
             continue
         when = str(entry.get("at") or "")
-        lines.append(f"{index}. {text}" + (f" ({when})" if when else ""))
+        extra = ""
+        if files:
+            extra = " [вложение: " + ", ".join(files) + "]"
+        body = text or "изображение"
+        lines.append(f"{index}. {body}{extra}" + (f" ({when})" if when else ""))
     return "\n".join(lines)[:8000]
 
 
@@ -206,15 +224,22 @@ async def begin_customer_intake(
     minutes: int,
     scheduler: Any | None,
     agent_id: int,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> WorkItem:
     """Append a customer message and (re)arm the quiet-period flush timer."""
     minutes = max(1, min(180, int(minutes)))
+    from .cursor_assets import persist_customer_images
+
+    stored = persist_customer_images(item, attachments)
     meta = dict(item.metadata_json or {})
     blob = dict(meta.get("intake") or {}) if isinstance(meta.get("intake"), dict) else {}
     messages = list(blob.get("messages") or [])
     text = (message or "").strip()
-    if text:
-        messages.append({"at": utcnow().isoformat(), "text": text[:4000]})
+    if text or stored:
+        entry: dict[str, Any] = {"at": utcnow().isoformat(), "text": text[:4000]}
+        if stored:
+            entry["attachments"] = stored
+        messages.append(entry)
     wait_until = utcnow() + timedelta(minutes=minutes)
     blob.update(
         {
@@ -290,13 +315,57 @@ async def extend_customer_intake(
     )
 
 
-async def mark_intake_executing(db: AsyncSession, item: WorkItem) -> WorkItem:
+def intake_flush_already_started(item: WorkItem | None) -> bool:
+    if item is None:
+        return False
+    blob = intake_blob(item)
+    if blob.get("flushing"):
+        return True
+    return item.status not in {"collecting"}
+
+
+async def disarm_intake_flush_job(
+    db: AsyncSession,
+    item: WorkItem,
+    scheduler: Any | None,
+) -> None:
+    blob = intake_blob(item)
+    job_id = _as_int(blob.get("flush_job_id")) or _as_int(item.cron_job_id)
+    if job_id is None:
+        return
+    job = await db.get(CronJob, job_id)
+    if job is None or not job.enabled:
+        return
+    job.enabled = False
+    await db.commit()
+    if scheduler is not None:
+        try:
+            scheduler.remove(job.id)
+        except Exception:
+            logger.info("intake flush job %s already removed", job.id)
+
+
+async def mark_intake_executing(
+    db: AsyncSession,
+    item: WorkItem,
+    *,
+    scheduler: Any | None = None,
+) -> WorkItem:
     meta = dict(item.metadata_json or {})
     blob = dict(meta.get("intake") or {}) if isinstance(meta.get("intake"), dict) else {}
+    duplicate = bool(blob.get("flushing")) or item.status != "collecting"
     blob["armed"] = False
+    blob["flushing"] = True
+    blob.setdefault("flushed_at", utcnow().isoformat())
     meta["intake"] = blob
-    meta["cursor_in_flight"] = False
+    if not duplicate:
+        meta["cursor_in_flight"] = False
     item.metadata_json = meta
+    await disarm_intake_flush_job(db, item, scheduler)
+    if duplicate:
+        await db.commit()
+        await db.refresh(item)
+        return item
     item.goal = compile_intake_brief(item) or item.goal
     return await set_status(
         db,
@@ -307,6 +376,16 @@ async def mark_intake_executing(db: AsyncSession, item: WorkItem) -> WorkItem:
         event_title="Тишина закончилась — выполняю",
         event_detail=compile_intake_brief(item)[:1500],
     )
+
+
+async def stamp_cursor_prompt_sent(db: AsyncSession, item: WorkItem | None) -> None:
+    if item is None:
+        return
+    meta = dict(item.metadata_json or {})
+    meta["cursor_in_flight"] = True
+    item.metadata_json = meta
+    await db.commit()
+    await db.refresh(item)
 
 
 async def add_event(
@@ -851,8 +930,14 @@ async def watchdog_items(db: AsyncSession, agent_id: int) -> list[WorkItem]:
             due = item.wait_until
             if due is None:
                 continue
-            if _as_aware(due) <= now:
-                actionable.append(item)
+            if _as_aware(due) > now:
+                continue
+            blob = intake_blob(item)
+            if blob.get("flushing"):
+                continue
+            if blob.get("flush_job_id") or item.cron_job_id:
+                continue
+            actionable.append(item)
             continue
         if item.status == "failed":
             actionable.append(item)
