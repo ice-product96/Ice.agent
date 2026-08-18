@@ -19,7 +19,34 @@ APPROVE_LABELS = (
     "allowlist",
 )
 
-BUSY_STATUSES = frozenset({"thinking", "generating", "running_tool", "waiting_approval"})
+# Anything not clearly idle is treated as in-flight. Search/explore used to look
+# "stopped" because it was missing from this set — the agent then sent a duplicate prompt.
+BUSY_STATUSES = frozenset({
+    "thinking",
+    "generating",
+    "running_tool",
+    "waiting_approval",
+    "searching",
+    "exploring",
+    "planning",
+    "reading",
+    "applying",
+    "editing",
+    "compiling",
+    "indexing",
+    "streaming",
+    "working",
+    "running",
+})
+IDLE_STATUSES = frozenset({"idle", "ready", "done", "complete", "completed"})
+STOPPED_STATUSES = frozenset({"error", "failed", "cancelled", "canceled", "stopped"})
+
+CURSOR_CHECK_ONLY_MESSAGE = (
+    "Только cursorremote_check. Не вызывай cursorremote_do и не давай Cursor новую задачу "
+    "(даже если в сводке «поиск» или кажется, что он остановился). "
+    "Пока done=false — он ещё работает: снова schedule_self через ~2 минуты. "
+    "Если done=true — итог заказчику, новый промпт не отправляй."
+)
 
 FOLLOW_UP_HINT = (
     "Cursor is not finished. Call schedule_self in about 2 minutes with a message to run "
@@ -92,7 +119,56 @@ def cursor_is_busy(status: Any) -> bool:
     if data.get("agentActivityLive"):
         return True
     name = str(data.get("agentStatus") or data.get("status") or "").strip().lower()
-    return name in BUSY_STATUSES
+    if name in STOPPED_STATUSES:
+        return False
+    if name in IDLE_STATUSES or name in {"", "unknown"}:
+        return False
+    if name in BUSY_STATUSES:
+        return True
+    return True
+
+
+def cursor_has_active_work(state: Any) -> bool:
+    """True if the chat already shows search/tools/plan — not a blank idle editor."""
+    data = parse_mcp_payload(state)
+    if not isinstance(data, dict):
+        return False
+    if data.get("pendingApprovals"):
+        return True
+    for item in list(data.get("messages") or []):
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "").lower()
+        if kind in {"assistant", "plan", "tool", "tool_call", "thinking", "search"}:
+            return True
+        if kind == "human":
+            continue
+        if str(item.get("text") or "").strip():
+            return True
+    return False
+
+
+def should_pin_cursor_followup(message: str) -> bool:
+    text = (message or "").lower()
+    if not text:
+        return True
+    markers = (
+        "cursor",
+        "cursorremote",
+        "остановил",
+        "stopped",
+        "searching",
+        "поиск",
+        "explore",
+        "ide",
+    )
+    return any(token in text for token in markers)
+
+
+def pin_cursor_followup_message(message: str) -> str:
+    if should_pin_cursor_followup(message):
+        return CURSOR_CHECK_ONLY_MESSAGE
+    return message
 
 
 def summarize_cursor_state(state: Any) -> str:
@@ -269,6 +345,14 @@ async def drive_until_done(
             continue
 
         if require_busy and not seen_busy:
+            try:
+                peek_state = await mcp_call(session, "get_state", {"messageLimit": 8})
+            except Exception:
+                peek_state = None
+            if cursor_has_active_work(peek_state):
+                seen_busy = True
+                await asyncio.sleep(2)
+                continue
             if (time.monotonic() - start) * 1000 < start_grace_ms:
                 await asyncio.sleep(2)
                 continue
@@ -345,6 +429,27 @@ async def send_prompt_and_drive(
     *,
     timeout_ms: int = 90_000,
 ) -> dict[str, Any]:
+    try:
+        current = await mcp_call(session, "get_status")
+    except Exception:
+        current = None
+    if cursor_is_busy(current):
+        driven = await drive_until_done(
+            session,
+            timeout_ms=timeout_ms,
+            require_busy=False,
+            start_grace_ms=0,
+        )
+        return {
+            **driven,
+            "sent": False,
+            "prompt_sent": False,
+            "skipped_prompt": True,
+            "reason": (
+                "Cursor already working — did not send a duplicate task. "
+                "Polled the current job instead."
+            ),
+        }
     sent = await mcp_call(session, "send_prompt", {"text": text})
     driven = await drive_until_done(session, timeout_ms=timeout_ms, require_busy=True)
     return {"sent": sent, "prompt_sent": True, **driven}

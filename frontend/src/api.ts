@@ -96,6 +96,16 @@ export const api = {
       request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/close`, { method: 'POST', ...body({ note }) }),
     instructWorkItem: (id: string, workItemId: string, note: string) =>
       request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/instruct`, { method: 'POST', ...body({ note }) }),
+    flushWorkItemIntake: (id: string, workItemId: string, note = '') =>
+      request<{ ok: boolean; item: WorkItem; result?: string }>(
+        `/agents/${id}/work-items/${workItemId}/flush-intake`,
+        { method: 'POST', ...body({ note }) },
+      ),
+    waitWorkItemIntake: (id: string, workItemId: string, minutes = 15, note = '') =>
+      request<{ ok: boolean; item: WorkItem }>(
+        `/agents/${id}/work-items/${workItemId}/intake-wait`,
+        { method: 'POST', ...body({ minutes, note }) },
+      ),
   },
   employees: {
     list: () => request<{ items: EmployeeProfile[]; open_consultations: number; paused_agents: number; autonomous_agents: number; failed_work_items?: number; waiting_manager?: number }>('/employees'),

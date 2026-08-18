@@ -168,6 +168,11 @@ def describe_value(value: Any) -> str:
             summary = str(value.get("summary") or "").strip()
             if value.get("done"):
                 return _clip("Cursor закончил работу." + (f" {summary}" if summary else ""))
+            if value.get("skipped_prompt"):
+                return _clip(
+                    "Новую задачу в Cursor не отправили — предыдущая ещё шла. "
+                    + (f"{summary}" if summary else "Проверили текущую работу.")
+                )
             status = str(value.get("status") or "").strip()
             extra = f" ({status})" if status else ""
             return _clip(f"Cursor ещё работает{extra}.")
@@ -203,6 +208,8 @@ def notes_from_audit(audit: list[dict[str, Any]] | None) -> list[str]:
             if payload.get("done"):
                 summary = str(payload.get("summary") or "").strip()
                 notes.append("Cursor закончил работу" + (f": {summary[:240]}" if summary else "."))
+            elif payload.get("skipped_prompt"):
+                notes.append("Новую задачу в Cursor не ставили: предыдущая ещё выполняется.")
             else:
                 status = str(payload.get("status") or "").strip()
                 notes.append(

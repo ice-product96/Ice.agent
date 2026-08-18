@@ -639,6 +639,11 @@ class WorkItemNoteBody(BaseModel):
     note: str = ""
 
 
+class WorkItemWaitBody(BaseModel):
+    minutes: int = Field(default=15, ge=1, le=180)
+    note: str = ""
+
+
 @router.get("/agents/{agent_id}/employee", dependencies=auth)
 async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     agent = await one(db, Agent, agent_id)
@@ -890,6 +895,65 @@ async def instruct_agent_work_item(
             db, scheduler, agent.id, reason="consult_resolved", work_item_id=item.id
         )
     return {"ok": True, "item": work_item_json(item), "tick": tick}
+
+
+@router.post("/agents/{agent_id}/work-items/{work_item_id}/flush-intake", dependencies=auth)
+async def flush_agent_work_item_intake(
+    agent_id: str,
+    work_item_id: int,
+    payload: WorkItemNoteBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .work_items import compile_intake_brief, work_item_json
+
+    agent, item = await _agent_work_item(db, agent_id, work_item_id)
+    runtime = getattr(request.app.state, "runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="Runtime unavailable")
+    brief = compile_intake_brief(item)
+    note = (payload.note or "").strip()
+    message = brief
+    if note:
+        message = f"Указание руководителя: {note}\n\n{brief}"
+    result = await runtime.run(
+        db,
+        agent,
+        message or item.goal or item.title,
+        {
+            "kind": "intake_flush",
+            "source": "intake_flush",
+            "work_item_id": item.id,
+            "reply_chat_id": item.chat_id,
+            "chat_id": item.chat_id,
+            "reply_phone": item.reply_phone,
+            "phone": item.reply_phone,
+        },
+    )
+    return {"ok": True, "item": work_item_json(item), "result": result}
+
+
+@router.post("/agents/{agent_id}/work-items/{work_item_id}/intake-wait", dependencies=auth)
+async def extend_agent_work_item_intake(
+    agent_id: str,
+    work_item_id: int,
+    payload: WorkItemWaitBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .work_items import begin_customer_intake, work_item_json
+
+    agent, item = await _agent_work_item(db, agent_id, work_item_id)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    item = await begin_customer_intake(
+        db,
+        item,
+        payload.note,
+        minutes=payload.minutes,
+        scheduler=scheduler,
+        agent_id=agent.id,
+    )
+    return {"ok": True, "item": work_item_json(item)}
 
 
 @router.get("/agents/{agent_id}/employee/plans", dependencies=auth)
@@ -1899,8 +1963,8 @@ def cron_job_kind(job: CronJob) -> str:
     if (
         payload.get("work_item_id")
         or name.startswith("employee-tick-once-")
-        or source in {"scheduled", "consult_resolved"}
-        or str(payload.get("kind") or "") == "employee_tick"
+        or source in {"scheduled", "consult_resolved", "intake_flush"}
+        or str(payload.get("kind") or "") in {"employee_tick", "intake_flush"}
     ):
         return "followup"
     return "cron"

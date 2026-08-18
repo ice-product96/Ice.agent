@@ -23,6 +23,8 @@ DEFAULT_EMPLOYEE_POLICY: dict[str, Any] = {
     "customer_requests_without_approval": True,
     "consult_manager_on_idle_tick": False,
     "tick_instruction_extra": "",
+    # Quiet window after a customer Telegram message before Cursor/execution.
+    "intake_debounce_minutes": 15,
 }
 
 
@@ -49,6 +51,12 @@ def employee_policy(profile: Any) -> dict[str, Any]:
         merged["approval_required_tools"] = [str(item) for item in tools]
     else:
         merged["approval_required_tools"] = list(DEFAULT_EMPLOYEE_POLICY["approval_required_tools"])
+    try:
+        merged["intake_debounce_minutes"] = max(
+            0, min(180, int(merged.get("intake_debounce_minutes", 15)))
+        )
+    except (TypeError, ValueError):
+        merged["intake_debounce_minutes"] = 15
     return merged
 
 
@@ -79,6 +87,31 @@ def action_matches_tool(action_name: str | None, tool_name: str) -> bool:
     return normalized.lower() == tool_name.lower()
 
 
+def intake_debounce_minutes(profile: Any) -> int:
+    return int(employee_policy(profile).get("intake_debounce_minutes") or 0)
+
+
+def customer_intake_instruction() -> str:
+    return (
+        "The customer may send several Telegram messages to complete one assignment. "
+        "Reply NOW: acknowledge, answer questions, ask a short clarification if needed. "
+        "Do NOT mention a delay, timer, queue, waiting period, or that work starts later. "
+        "Do NOT call cursorremote_do, cursorremote_check, or give Cursor a job yet. "
+        "Do NOT claim that Cursor already started or finished. "
+        "Be natural and helpful. The platform will start execution after a quiet period."
+    )
+
+
+def customer_intake_flush_instruction() -> str:
+    return (
+        "The quiet period ended. The user message is the accumulated customer assignment. "
+        "Execute it now. You MAY call cursorremote_do if it is a coding/workspace task. "
+        "If it is only small talk or already answered, do not start Cursor — finish without a new job. "
+        "Do NOT mention that you waited, buffered messages, or that a timer fired. "
+        "Write the customer only a normal progress/result message when there is something real to say."
+    )
+
+
 def approval_required_for_tool(
     profile: Any,
     tool_name: str,
@@ -107,9 +140,10 @@ def build_employee_tick_instruction(profile: Any) -> str:
         "Ты автономный сотрудник. Это сторожевой тик, не сообщение клиента и не журнал для руководителя.",
         "Работай только по открытым кейсам из блока состояния. Не создавай новый кейс, если номер уже есть.",
         "Следующие шаги ставь через schedule_self как таймер кейса — не используй hour/day/week/month планы.",
-        "Если ждёшь Cursor: cursorremote_check. Пока done=false — снова schedule_self через ~2 минуты, "
+        "Если ждёшь Cursor: только cursorremote_check. Поиск/explore — это не остановка и не повод "
+        "давать новую задачу. Пока done=false — снова schedule_self через ~2 минуты, "
         "заказчику не пиши что готово. Если done=true — финальный текст это сообщение заказчику "
-        "(платформа отправит его в исходный чат), новый schedule_self не ставь.",
+        "(платформа отправит его в исходный чат), новый schedule_self и cursorremote_do не ставь.",
         "Не пиши руководителю и клиенту «результат тика». Сообщения людям — только вопрос, готово или застревание.",
         "Сделай один полезный шаг по кейсу и при необходимости сохрани заметки через self_configure.",
     ]
@@ -149,7 +183,8 @@ def customer_telegram_instruction() -> str:
         "A successful send_prompt or done=false is NOT completion. Wait until cursorremote_do/"
         "cursorremote_check returns done=true, then message the customer with the result. "
         "If done=true, do not schedule_self again — even if summary is empty, report that the work is complete. "
-        "If Cursor is still running (done=false), schedule_self in ~2 minutes to check again. "
+        "If Cursor is still running (done=false), including search/explore, schedule_self in ~2 minutes to check again. "
+        "Never send a second cursorremote_do for the same task because it 'looks stuck on search'."
         "If they say 'call me' without a number, ask once naturally for their phone number. "
                     "When they send a phone number, call immediately — do not wait for manager confirmation. "
                     "When you call sip_dial, always fill purpose (why you call, what to achieve) and opening. "

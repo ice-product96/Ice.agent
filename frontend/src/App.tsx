@@ -71,6 +71,7 @@ Cursor IDE (cursorremote_do / cursorremote_check):
 - Никогда не проси человека нажать Allow в IDE.
 - done=true — Cursor закончил. Напиши заказчику результат и НЕ ставь новый schedule_self.
 - done=false или один send_prompt — это НЕ готовность. schedule_self через ~2 минуты: cursorremote_check и снова ждать.
+- Поиск/explore в Cursor — это не остановка. Не давай вторую задачу «продолжи, ты остановился».
 - Не используй hour/day/week/month планы. Следующие шаги — только schedule_self.
 `
 
@@ -1004,7 +1005,7 @@ function EmployeeScreen() {
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState('')
   const [answerDrafts, setAnswerDrafts] = useState<Record<string, string>>({})
-  const [inboxFilter, setInboxFilter] = useState<'actionable' | 'in_progress' | 'waiting_external' | 'waiting_customer' | 'waiting_manager' | 'failed' | 'all'>('actionable')
+  const [inboxFilter, setInboxFilter] = useState<'actionable' | 'in_progress' | 'collecting' | 'waiting_external' | 'waiting_customer' | 'waiting_manager' | 'failed' | 'all'>('actionable')
   const [selectedId, setSelectedId] = useState('')
   const [instructNote, setInstructNote] = useState('')
   const [selected, setSelected] = useState<WorkItem | null>(null)
@@ -1023,6 +1024,7 @@ function EmployeeScreen() {
     customer_requests_without_approval: true,
     consult_manager_on_idle_tick: false,
     tick_instruction_extra: '',
+    intake_debounce_minutes: 15,
   })
   const policyCatalog = useLoad(api.employees.policyCatalog, [])
 
@@ -1034,6 +1036,7 @@ function EmployeeScreen() {
       customer_requests_without_approval: raw?.customer_requests_without_approval ?? defaults?.customer_requests_without_approval ?? true,
       consult_manager_on_idle_tick: raw?.consult_manager_on_idle_tick ?? defaults?.consult_manager_on_idle_tick ?? false,
       tick_instruction_extra: raw?.tick_instruction_extra ?? defaults?.tick_instruction_extra ?? '',
+      intake_debounce_minutes: raw?.intake_debounce_minutes ?? defaults?.intake_debounce_minutes ?? 15,
     })
   }
 
@@ -1117,14 +1120,14 @@ function EmployeeScreen() {
   const counts = state?.work_item_counts || {}
   const inboxItems = workItems.filter(item => {
     if (inboxFilter === 'all') return true
-    if (inboxFilter === 'actionable') return ['failed', 'waiting_manager', 'open', 'in_progress'].includes(item.status)
+    if (inboxFilter === 'actionable') return ['failed', 'waiting_manager', 'open', 'in_progress', 'collecting'].includes(item.status)
     if (inboxFilter === 'in_progress') return ['open', 'in_progress'].includes(item.status)
     return item.status === inboxFilter
   })
   const staffJobs = (state?.jobs || []).filter(job => (job.kind || 'cron') === 'cron')
   const heartbeatJob = (state?.jobs || []).find(job => job.kind === 'heartbeat')
 
-  async function runWorkAction(action: 'resume' | 'pause' | 'close' | 'instruct') {
+  async function runWorkAction(action: 'resume' | 'pause' | 'close' | 'instruct' | 'flush' | 'wait') {
     if (!agentId || !selectedId) return
     setBusy(action); setError(''); setNotice('')
     try {
@@ -1132,6 +1135,15 @@ function EmployeeScreen() {
       if (action === 'pause') await api.agents.pauseWorkItem(agentId, selectedId, instructNote)
       if (action === 'close') await api.agents.closeWorkItem(agentId, selectedId, instructNote)
       if (action === 'instruct') await api.agents.instructWorkItem(agentId, selectedId, instructNote)
+      if (action === 'flush') {
+        await api.agents.flushWorkItemIntake(agentId, selectedId, instructNote)
+        setNotice('Накопленное задание запущено.')
+      }
+      if (action === 'wait') {
+        const minutes = policy.intake_debounce_minutes || 15
+        await api.agents.waitWorkItemIntake(agentId, selectedId, minutes, instructNote)
+        setNotice(`Пауза перед выполнением продлена на ${minutes} мин.`)
+      }
       setInstructNote('')
       await load(agentId)
       await overview.refresh()
@@ -1219,6 +1231,7 @@ function EmployeeScreen() {
           {([
             ['actionable', 'Нужно действие', counts.actionable],
             ['in_progress', 'В работе', (counts.in_progress || 0) + (counts.open || 0)],
+            ['collecting', 'Коплю задание', counts.collecting],
             ['waiting_external', 'Жду Cursor', counts.waiting_external],
             ['waiting_customer', 'Жду клиента', counts.waiting_customer],
             ['waiting_manager', 'Жду меня', counts.waiting_manager],
@@ -1247,6 +1260,29 @@ function EmployeeScreen() {
         <p className="work-goal">{selected.goal || selected.title}</p>
         <small>Клиент {selected.chat_id || '—'}{selected.sender_username ? ` · @${selected.sender_username}` : ''}{selected.reply_phone ? ` · ${selected.reply_phone}` : ''}</small>
         {selected.last_error && <Alert message={selected.last_error}/>}
+        {selected.status === 'collecting' && (
+          <div className="intake-box">
+            <strong>Накопленное задание</strong>
+            <small>
+              {selected.intake?.count || 0} сообщ.
+              {selected.wait_until ? ` · запуск ${new Date(selected.wait_until).toLocaleString('ru-RU')}` : ''}
+              {selected.intake?.debounce_minutes ? ` · окно ${selected.intake.debounce_minutes} мин` : ''}
+            </small>
+            <p>Заказчику отвечаем сразу. В Cursor уйдёт после паузы, если не нажать «Запустить сейчас».</p>
+            <div className="intake-messages">
+              {(selected.intake?.messages || []).map((entry, index) => (
+                <div className="intake-message" key={`${entry.at || index}`}>
+                  <small>{entry.at ? new Date(entry.at).toLocaleString('ru-RU') : ''}</small>
+                  <p>{entry.text}</p>
+                </div>
+              ))}
+            </div>
+            <div className="head-actions" style={{ marginTop: 8 }}>
+              <button className="primary compact" disabled={!!busy} onClick={() => void runWorkAction('flush')}>Запустить сейчас</button>
+              <button className="secondary compact" disabled={!!busy} onClick={() => void runWorkAction('wait')}>Подождать ещё</button>
+            </div>
+          </div>
+        )}
         <textarea rows={2} style={{ marginTop: 12, width: '100%' }} placeholder="Указание: продолжи / напиши клиенту / закрой…" value={instructNote} onChange={e => setInstructNote(e.target.value)}/>
         <div className="head-actions" style={{ marginTop: 8 }}>
           <button className="primary compact" disabled={!!busy} onClick={() => void runWorkAction('resume')}>Продолжи</button>
@@ -1284,6 +1320,9 @@ function EmployeeScreen() {
           <div className="toggle-box"><Toggle label="Поручения руководителя без approve" checked={policy.manager_orders_without_approval} onChange={value => setPolicy(p => ({ ...p, manager_orders_without_approval: value }))}/></div>
           <div className="toggle-box"><Toggle label="Запросы заказчика (звонок/SIP) без approve" checked={policy.customer_requests_without_approval} onChange={value => setPolicy(p => ({ ...p, customer_requests_without_approval: value }))}/></div>
           <div className="toggle-box"><Toggle label="Спрашивать руководителя на heartbeat если нечего делать" checked={policy.consult_manager_on_idle_tick} onChange={value => setPolicy(p => ({ ...p, consult_manager_on_idle_tick: value }))}/></div>
+          <Field label="Пауза перед выполнением (мин)" hint="После сообщения заказчика: ответить сразу, копить текст, в Cursor отдать только после тишины. 0 — выполнять сразу. Заказчику про ожидание не писать.">
+            <input type="number" min={0} max={180} value={policy.intake_debounce_minutes} onChange={e => setPolicy(p => ({ ...p, intake_debounce_minutes: Number(e.target.value) || 0 }))}/>
+          </Field>
           <Field label="Доп. инструкция для heartbeat" wide hint="Добавляется к системному тексту тика">
             <textarea rows={2} value={policy.tick_instruction_extra} onChange={e => setPolicy(p => ({ ...p, tick_instruction_extra: e.target.value }))}/>
           </Field>

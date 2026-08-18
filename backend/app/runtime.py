@@ -35,9 +35,14 @@ from .job_result import (
 )
 from .work_items import (
     after_agent_run,
+    begin_customer_intake,
     bind_work_item,
     build_watchdog_instruction,
+    compile_intake_brief,
+    get_work_item,
     list_open_work_items,
+    mark_intake_executing,
+    should_collect_customer_intake,
     watchdog_items,
 )
 from .employee import (
@@ -66,7 +71,10 @@ from .integrations import (
 from .employee_policy import (
     approval_required_for_tool,
     build_employee_tick_instruction,
+    customer_intake_flush_instruction,
+    customer_intake_instruction,
     customer_telegram_instruction,
+    intake_debounce_minutes,
     manager_telegram_instruction,
     normalize_action_name,
 )
@@ -578,10 +586,52 @@ class AgentRuntime:
                 None,
             )
             if cursor_session is not None:
-                from .cursorremote_drive import check_and_drive, send_prompt_and_drive
+                from .cursorremote_drive import (
+                    CURSOR_CHECK_ONLY_MESSAGE,
+                    check_and_drive,
+                    pin_cursor_followup_message,
+                    send_prompt_and_drive,
+                )
 
                 async def cursorremote_do(prompt: str) -> dict[str, Any]:
                     """Send a task to Cursor IDE, auto-click Allow/Accept/Run, wait until it actually finishes or times out."""
+                    from .work_items import get_work_item
+
+                    item = await get_work_item(db, (context or {}).get("work_item_id"))
+                    if (context or {}).get("_intake_collecting") or (
+                        item is not None and item.status == "collecting"
+                    ):
+                        return {
+                            "ok": False,
+                            "done": False,
+                            "skipped_prompt": True,
+                            "prompt_sent": False,
+                            "reason": (
+                                "Still collecting the customer's assignment. "
+                                "Do not start Cursor. Reply naturally and do not mention a wait."
+                            ),
+                        }
+                    in_flight = item is not None and (
+                        item.status == "waiting_external"
+                        or bool((item.metadata_json or {}).get("cursor_in_flight"))
+                    )
+                    if in_flight:
+                        result = await check_and_drive(cursor_session)
+                        result = {
+                            **result,
+                            "skipped_prompt": True,
+                            "prompt_sent": False,
+                            "reason": (
+                                "This case is already waiting on Cursor. "
+                                "Did not send a new prompt (that would duplicate the job). "
+                                "If done=true, report the result. If done=false, wait — "
+                                "search/explore is not a stop."
+                            ),
+                            "next": result.get("next") or CURSOR_CHECK_ONLY_MESSAGE,
+                        }
+                        if result.get("done"):
+                            cursor_state["finished"] = True
+                        return result
                     result = await send_prompt_and_drive(cursor_session, prompt)
                     if result.get("done"):
                         cursor_state["finished"] = True
@@ -598,11 +648,11 @@ class AgentRuntime:
                     cursorremote_do,
                     "cursorremote_do",
                     (
-                        "Give Cursor a coding task in the attached workspace. "
-                        "Clicks Allow/Accept/Run itself. Returns done=true only after Cursor "
-                        "finished (not when it merely started). If done=false, schedule_self "
-                        "in ~2 minutes to cursorremote_check. If done=true, message the requester "
-                        "and do not schedule another check."
+                        "Give Cursor a NEW coding task only if this case has not already sent one. "
+                        "If the case is waiting on Cursor, the platform converts this to a check "
+                        "and will not send a duplicate prompt. Clicks Allow/Accept/Run itself. "
+                        "done=true only after Cursor finished. If done=false, schedule_self "
+                        "in ~2 minutes to cursorremote_check. Search/explore is not a stop."
                     ),
                 )
                 registry.register(
@@ -611,7 +661,8 @@ class AgentRuntime:
                     (
                         "Check an already running Cursor job. Clicks Allow/Accept. "
                         "done=true means finished — write to the original Telegram chat, "
-                        "do not schedule_self. done=false means still working — schedule_self again."
+                        "do not schedule_self. done=false means still working (including search) "
+                        "— schedule_self again. Never start a second job for the same case."
                     ),
                 )
         if self.task_bus:
@@ -657,6 +708,9 @@ class AgentRuntime:
                     context=context,
                     account_phone=phone,
                 )
+                from .cursorremote_drive import pin_cursor_followup_message
+
+                payload["message"] = pin_cursor_followup_message(str(payload.get("message") or message))
                 job = await save_once_job(
                     db,
                     self.scheduler,
@@ -921,6 +975,20 @@ class AgentRuntime:
             message = build_watchdog_instruction(pending)
         else:
             message = build_employee_tick_instruction(profile)
+        focus = await get_work_item(db, context.get("work_item_id"))
+        if focus is not None and focus.status == "collecting" and focus.wait_until:
+            from .work_items import _as_aware
+
+            if _as_aware(focus.wait_until) <= utcnow():
+                context["source"] = "intake_flush"
+                context["kind"] = "intake_flush"
+                context.pop("employee_tick", None)
+                message = compile_intake_brief(focus)
+                if focus.chat_id:
+                    context.setdefault("reply_chat_id", focus.chat_id)
+                    context.setdefault("chat_id", focus.chat_id)
+                if focus.reply_phone:
+                    context.setdefault("reply_phone", focus.reply_phone)
         if extra.get("instruction"):
             message = f"{extra['instruction']}\n\n{message}"
         elif extra.get("message") and reason in {"consult_resolved", "manual"}:
@@ -1084,6 +1152,32 @@ class AgentRuntime:
             memory_context = format_memory_hits(memories)
             scope_line = memory_scope_prompt(memory_scope) if memory_scope else ""
             employee_profile = await get_or_create_profile(db, agent.id)
+            work_item = await get_work_item(db, context.get("work_item_id"))
+            debounce_minutes = intake_debounce_minutes(employee_profile)
+            is_intake_flush = str(context.get("source") or "") == "intake_flush" or str(
+                context.get("kind") or ""
+            ) == "intake_flush"
+            if work_item is not None and is_intake_flush:
+                context["_intake_flush"] = True
+                context["_intake_collecting"] = False
+                compiled = compile_intake_brief(work_item)
+                if compiled:
+                    message = compiled
+                    context["_user_message"] = message
+                work_item = await mark_intake_executing(db, work_item)
+            elif work_item is not None and should_collect_customer_intake(
+                work_item, context, minutes=debounce_minutes
+            ):
+                work_item = await begin_customer_intake(
+                    db,
+                    work_item,
+                    message,
+                    minutes=debounce_minutes,
+                    scheduler=self.employee.scheduler,
+                    agent_id=agent.id,
+                )
+                context["_intake_collecting"] = True
+                context["work_item_id"] = work_item.id
             system_prompt = await assemble_system_prompt(db, agent)
             employee_block = ""
             if employee_profile.autonomy_enabled or context.get("employee_tick"):
@@ -1101,6 +1195,7 @@ class AgentRuntime:
                 or context.get("source") in {"employee_tick", "employee_heartbeat"}
             )
             origin_followup = context.get("source") == "scheduled" and origin_chat_id(context) is not None
+            is_intake_flush = bool(context.get("_intake_flush"))
             phone_hint = ""
             if is_telegram and not context.get("is_admin"):
                 lower = message.lower()
@@ -1136,6 +1231,12 @@ class AgentRuntime:
                     "If done=false, do not tell the customer it is ready. "
                     + customer_telegram_instruction()
                 )
+            elif is_intake_flush:
+                role_instruction = (
+                    customer_intake_flush_instruction()
+                    + "\n"
+                    + customer_telegram_instruction()
+                )
             elif is_employee_tick:
                 role_instruction = build_employee_tick_instruction(employee_profile)
             elif is_telegram:
@@ -1162,6 +1263,7 @@ class AgentRuntime:
                         if context.get("is_admin")
                         else customer_telegram_instruction()
                     )
+                    + (customer_intake_instruction() if context.get("_intake_collecting") else "")
                     + (f"\n{phone_hint}" if phone_hint else "")
                 )
             else:

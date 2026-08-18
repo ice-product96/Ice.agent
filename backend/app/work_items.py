@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 OPEN_STATUSES = (
     "open",
     "in_progress",
+    "collecting",
     "waiting_external",
     "waiting_customer",
     "waiting_manager",
@@ -31,6 +32,7 @@ WAIT_MANAGER_SLA = timedelta(minutes=60)
 STATUS_LABELS = {
     "open": "Новый",
     "in_progress": "В работе",
+    "collecting": "Коплю задание",
     "waiting_external": "Жду Cursor",
     "waiting_customer": "Жду клиента",
     "waiting_manager": "Жду руководителя",
@@ -43,6 +45,7 @@ STATUS_LABELS = {
 NOTIFY_CHANNELS: dict[str, set[str]] = {
     "created": {"ui"},
     "progress": {"ui"},
+    "collecting": {"ui"},
     "waiting_external": {"ui"},
     "waiting_customer": {"ui"},
     "waiting_manager": {"manager", "ui"},
@@ -85,6 +88,7 @@ def work_item_json(item: WorkItem, *, events: list[WorkItemEvent] | None = None)
         "cron_job_id": item.cron_job_id,
         "created_at": item.created_at.isoformat() if item.created_at else None,
         "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+        "intake": intake_json(item),
     }
     if events is not None:
         data["events"] = [work_event_json(event) for event in events]
@@ -116,6 +120,192 @@ def _as_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_aware(value: datetime | None) -> datetime:
+    if value is None:
+        return utcnow()
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def intake_blob(item: WorkItem) -> dict[str, Any]:
+    raw = dict(item.metadata_json or {})
+    blob = raw.get("intake")
+    return dict(blob) if isinstance(blob, dict) else {}
+
+
+def intake_json(item: WorkItem) -> dict[str, Any]:
+    blob = intake_blob(item)
+    messages = []
+    for entry in list(blob.get("messages") or [])[-20:]:
+        if not isinstance(entry, dict):
+            continue
+        messages.append(
+            {
+                "at": entry.get("at"),
+                "text": _clip(str(entry.get("text") or ""), 400),
+            }
+        )
+    return {
+        "armed": bool(blob.get("armed")),
+        "count": len(list(blob.get("messages") or [])),
+        "debounce_minutes": blob.get("debounce_minutes"),
+        "flush_job_id": blob.get("flush_job_id"),
+        "messages": messages,
+    }
+
+
+def compile_intake_brief(item: WorkItem) -> str:
+    blob = intake_blob(item)
+    parts = list(blob.get("messages") or [])
+    if not parts:
+        return (item.goal or item.title or "").strip()
+    lines = [f"Сводка задания заказчика ({len(parts)} сообщ.):"]
+    for index, entry in enumerate(parts[-20:], start=1):
+        if not isinstance(entry, dict):
+            continue
+        text = str(entry.get("text") or "").strip()
+        if not text:
+            continue
+        when = str(entry.get("at") or "")
+        lines.append(f"{index}. {text}" + (f" ({when})" if when else ""))
+    return "\n".join(lines)[:8000]
+
+
+def should_collect_customer_intake(
+    item: WorkItem | None,
+    context: dict[str, Any],
+    *,
+    minutes: int,
+) -> bool:
+    if item is None or minutes <= 0:
+        return False
+    if context.get("is_admin"):
+        return False
+    source = str(context.get("source") or "")
+    if source in {"intake_flush", "scheduled", "employee_tick", "employee_heartbeat", "consult_resolved"}:
+        return False
+    if context.get("employee_tick") or context.get("_intake_flush"):
+        return False
+    if source != "telegram":
+        return False
+    if item.status in {"waiting_external", "waiting_manager", "paused"}:
+        return False
+    if (item.metadata_json or {}).get("cursor_in_flight"):
+        return False
+    return True
+
+
+async def begin_customer_intake(
+    db: AsyncSession,
+    item: WorkItem,
+    message: str,
+    *,
+    minutes: int,
+    scheduler: Any | None,
+    agent_id: int,
+) -> WorkItem:
+    """Append a customer message and (re)arm the quiet-period flush timer."""
+    minutes = max(1, min(180, int(minutes)))
+    meta = dict(item.metadata_json or {})
+    blob = dict(meta.get("intake") or {}) if isinstance(meta.get("intake"), dict) else {}
+    messages = list(blob.get("messages") or [])
+    text = (message or "").strip()
+    if text:
+        messages.append({"at": utcnow().isoformat(), "text": text[:4000]})
+    wait_until = utcnow() + timedelta(minutes=minutes)
+    blob.update(
+        {
+            "armed": True,
+            "messages": messages[-40:],
+            "debounce_minutes": minutes,
+        }
+    )
+    meta["intake"] = blob
+    item.metadata_json = meta
+    if not item.title or item.title == "Задача":
+        item.title = _clip(text or item.title, 120) or item.title
+    item.goal = compile_intake_brief(item)
+    await set_status(
+        db,
+        item,
+        "collecting",
+        next_action="Коплю сообщения заказчика, затем выполню",
+        wait_owner="customer",
+        wait_until=wait_until,
+        event_title="Сообщение накоплено",
+        event_detail=_clip(text, 400),
+        commit=False,
+    )
+    from .employee import save_once_job
+
+    job = await save_once_job(
+        db,
+        scheduler,
+        agent_id=agent_id,
+        name=f"intake-flush-{item.id}",
+        payload={
+            "kind": "intake_flush",
+            "source": "intake_flush",
+            "work_item_id": item.id,
+            "message": compile_intake_brief(item),
+            "run_once_at": wait_until.isoformat(),
+            "timezone": "UTC",
+            "reply_chat_id": item.chat_id,
+            "reply_phone": item.reply_phone,
+            "chat_id": item.chat_id,
+            "phone": item.reply_phone,
+        },
+        current_job_id=item.cron_job_id,
+    )
+    blob = dict(intake_blob(item))
+    blob["flush_job_id"] = job.id
+    meta = dict(item.metadata_json or {})
+    meta["intake"] = blob
+    item.metadata_json = meta
+    item.cron_job_id = job.id
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+async def extend_customer_intake(
+    db: AsyncSession,
+    item: WorkItem,
+    *,
+    minutes: int,
+    scheduler: Any | None,
+    agent_id: int,
+    note: str = "",
+) -> WorkItem:
+    return await begin_customer_intake(
+        db,
+        item,
+        note or "",
+        minutes=minutes,
+        scheduler=scheduler,
+        agent_id=agent_id,
+    )
+
+
+async def mark_intake_executing(db: AsyncSession, item: WorkItem) -> WorkItem:
+    meta = dict(item.metadata_json or {})
+    blob = dict(meta.get("intake") or {}) if isinstance(meta.get("intake"), dict) else {}
+    blob["armed"] = False
+    meta["intake"] = blob
+    item.metadata_json = meta
+    item.goal = compile_intake_brief(item) or item.goal
+    return await set_status(
+        db,
+        item,
+        "in_progress",
+        next_action="Выполняю накопленное задание",
+        wait_owner="self",
+        event_title="Тишина закончилась — выполняю",
+        event_detail=compile_intake_brief(item)[:1500],
+    )
 
 
 async def add_event(
@@ -190,6 +380,7 @@ async def counts_for_agent(db: AsyncSession, agent_id: int) -> dict[str, int]:
         "waiting_external": 0,
         "waiting_customer": 0,
         "waiting_manager": 0,
+        "collecting": 0,
         "failed": 0,
         "paused": 0,
         "done": 0,
@@ -198,6 +389,10 @@ async def counts_for_agent(db: AsyncSession, agent_id: int) -> dict[str, int]:
     for item in items:
         if item.status in counts:
             counts[item.status] += 1
+        if item.status == "collecting":
+            if item.wait_until and _as_aware(item.wait_until) <= utcnow():
+                counts["actionable"] += 1
+            continue
         if item.status in {"failed", "waiting_manager"} or (
             item.status in OPEN_STATUSES and not item.paused
         ):
@@ -434,6 +629,9 @@ async def after_agent_run(
             detail = str(payload.get("summary") or payload.get("reason") or payload.get("error") or "")[:800]
             if tool in {"cursorremote_check", "cursorremote_do"}:
                 cursor_busy = not bool(payload.get("done"))
+                meta = dict(item.metadata_json or {})
+                meta["cursor_in_flight"] = not bool(payload.get("done"))
+                item.metadata_json = meta
             if tool == "schedule_self" and payload.get("run_at"):
                 try:
                     scheduled_at = datetime.fromisoformat(str(payload["run_at"]).replace("Z", "+00:00"))
@@ -494,6 +692,9 @@ async def after_agent_run(
         return item
 
     if cursor_done:
+        meta = dict(item.metadata_json or {})
+        meta["cursor_in_flight"] = False
+        item.metadata_json = meta
         await set_status(
             db,
             item,
@@ -518,6 +719,8 @@ async def after_agent_run(
         return item
 
     if result.strip() and str(context.get("source")) == "telegram":
+        if item.status == "collecting" or context.get("_intake_collecting"):
+            return item
         await set_status(
             db,
             item,
@@ -632,6 +835,13 @@ async def watchdog_items(db: AsyncSession, agent_id: int) -> list[WorkItem]:
     now = utcnow()
     actionable: list[WorkItem] = []
     for item in await list_open_work_items(db, agent_id, include_paused=False):
+        if item.status == "collecting":
+            due = item.wait_until
+            if due is None:
+                continue
+            if _as_aware(due) <= now:
+                actionable.append(item)
+            continue
         if item.status == "failed":
             actionable.append(item)
             continue
@@ -659,6 +869,11 @@ def build_watchdog_instruction(items: list[WorkItem]) -> str:
         "Это сторожевой тик. Работай только по открытым кейсам ниже.",
         "Не пиши руководителю и клиенту «результат тика». Сообщения — только если кейс требует человека или готово.",
         "Не создавай новый кейс, если уже есть номер.",
+        "Если кейс «Жду Cursor»: только cursorremote_check. Не вызывай cursorremote_do "
+        "с текстом вроде «Cursor остановился на поиске» — это дублирует задачу. Поиск не остановка.",
+        "Если кейс «Коплю задание» и wait ещё не вышел — не выполняй и не зови Cursor.",
+        "Если кейс «Коплю задание» уже просрочен — выполни сводку сообщений заказчика. "
+        "Не пиши ему про таймер или что ждали.",
     ]
     for item in items[:12]:
         wait = f" до {item.wait_until.isoformat()}" if item.wait_until else ""

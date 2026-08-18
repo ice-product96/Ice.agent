@@ -300,6 +300,7 @@ export interface EmployeePolicy {
   customer_requests_without_approval: boolean
   consult_manager_on_idle_tick: boolean
   tick_instruction_extra: string
+  intake_debounce_minutes: number
 }
 
 export interface EmployeePolicyCatalog {
@@ -394,6 +395,13 @@ export interface WorkItem {
   created_at?: string | null
   updated_at?: string | null
   events?: WorkItemEvent[]
+  intake?: {
+    armed?: boolean
+    count?: number
+    debounce_minutes?: number
+    flush_job_id?: number | null
+    messages?: Array<{ at?: string | null; text?: string }>
+  }
 }
 
 export interface WorkItemCounts {
@@ -402,6 +410,7 @@ export interface WorkItemCounts {
   waiting_external?: number
   waiting_customer?: number
   waiting_manager?: number
+  collecting?: number
   failed?: number
   paused?: number
   done?: number

@@ -4,9 +4,12 @@ import json
 from app.cursorremote_drive import (
     _approval_actions,
     check_and_drive,
+    cursor_has_active_work,
     cursor_is_busy,
     drive_until_done,
     parse_mcp_payload,
+    pin_cursor_followup_message,
+    send_prompt_and_drive,
     summarize_cursor_state,
 )
 
@@ -88,6 +91,8 @@ def test_approval_actions_skip_reject() -> None:
 
 def test_cursor_is_busy_statuses() -> None:
     assert cursor_is_busy({"agentStatus": "thinking"})
+    assert cursor_is_busy({"agentStatus": "searching"})
+    assert cursor_is_busy({"agentStatus": "exploring"})
     assert cursor_is_busy({"agentStatus": "idle", "agentActivityLive": True})
     assert cursor_is_busy({"agentStatus": "idle", "pendingApprovalCount": 2})
     assert cursor_is_busy(
@@ -98,6 +103,21 @@ def test_cursor_is_busy_statuses() -> None:
         }
     )
     assert not cursor_is_busy({"agentStatus": "idle", "pendingApprovalCount": 0})
+
+
+def test_search_messages_count_as_active_work() -> None:
+    assert cursor_has_active_work(
+        {"messages": [{"type": "assistant", "text": "Searching the codebase…"}]}
+    )
+    assert cursor_has_active_work({"messages": [{"type": "plan", "label": "search"}]})
+    assert not cursor_has_active_work({"messages": [{"type": "human", "text": "do LAVVE"}]})
+
+
+def test_pin_followup_blocks_restart_wording() -> None:
+    pinned = pin_cursor_followup_message("Cursor остановился на поиске, дай задачу заново")
+    assert "cursorremote_check" in pinned
+    assert "cursorremote_do" in pinned
+    assert "не давай" in pinned.lower() or "Не вызывай" in pinned
 
 
 def test_summarize_cursor_state_uses_assistant_text() -> None:
@@ -194,3 +214,39 @@ def test_check_does_not_finish_on_waiting_approval() -> None:
     )
     result = asyncio.run(check_and_drive(session, timeout_ms=80, idle_debounce_ms=0))
     assert result["done"] is False
+
+
+def test_send_prompt_skipped_when_cursor_already_working() -> None:
+    busy = {"agentStatus": "searching", "pendingApprovalCount": 0, "agentActivityLive": True}
+    session = ScriptSession(
+        {
+            "get_status": [
+                busy,
+                busy,
+                {"agentStatus": "idle", "pendingApprovalCount": 0},
+                {"agentStatus": "idle", "pendingApprovalCount": 0},
+                {"agentStatus": "idle", "pendingApprovalCount": 0},
+            ],
+            "wait": [{"status": "needs_input", "pendingApprovalCount": 0}],
+            "get_state": [
+                {"messages": [{"type": "assistant", "text": "Search finished, patch applied."}]}
+            ],
+        },
+        default={"agentStatus": "idle", "pendingApprovalCount": 0},
+    )
+    result = asyncio.run(send_prompt_and_drive(session, "ты остановился на поиске, сделай ещё раз"))
+    assert result["skipped_prompt"] is True
+    assert result["prompt_sent"] is False
+    assert not any(tool == "send_prompt" for tool, _ in session.calls)
+    assert result["done"] is True
+
+
+def test_searching_status_is_not_treated_as_not_started() -> None:
+    searching = {"agentStatus": "searching", "pendingApprovalCount": 0, "agentActivityLive": False}
+    session = ScriptSession({"wait": [{"status": "timeout"} for _ in range(20)]}, default=searching)
+    result = asyncio.run(
+        drive_until_done(session, timeout_ms=80, start_grace_ms=0, idle_debounce_ms=0, require_busy=True)
+    )
+    assert result["done"] is False
+    assert result["status"] != "not_started"
+
