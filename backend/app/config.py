@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     admin_telegram_ids: str = ""
     session_dir: Path = Path("./data/sessions")
     backup_dir: Path = Path("./data/backups")
+    # Public URL of this ice.agent API as seen from the Cursor PC (for customer file downloads).
+    public_base_url: str = ""
     # SIP UA (pjsua2) — local bind + RTP pool for parallel calls
     sip_bind_port: int = 5060
     sip_rtp_port_min: int = 10000

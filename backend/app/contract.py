@@ -1,9 +1,11 @@
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -813,21 +815,26 @@ async def resume_agent_work_item(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    from .work_items import resume_work_item, work_item_json
+    from .work_items import resume_work_item, work_item_aborted, work_item_json
 
     agent, item = await _agent_work_item(db, agent_id, work_item_id)
+    if work_item_aborted(item):
+        raise HTTPException(status_code=409, detail="work item aborted")
     await resume_work_item(db, item, note=payload.note)
-    runtime = getattr(request.app.state, "runtime", None)
-    tick = None
-    if runtime is not None:
-        tick = await runtime.tick(
-            db,
-            agent,
-            force=True,
-            reason="manual",
-            extra={"work_item_id": item.id, "instruction": payload.note},
-        )
-    return {"ok": True, "item": work_item_json(item), "tick": tick}
+    scheduler = getattr(request.app.state, "scheduler", None)
+    await schedule_immediate_tick(
+        db,
+        scheduler,
+        agent.id,
+        reason="manual",
+        work_item_id=item.id,
+        manager_answer=(payload.note or "").strip(),
+    )
+    return {
+        "ok": True,
+        "item": work_item_json(item),
+        "message": "Тик запланирован — кейс продолжится в фоне.",
+    }
 
 
 @router.post("/agents/{agent_id}/work-items/{work_item_id}/pause", dependencies=auth)
@@ -849,13 +856,56 @@ async def close_agent_work_item(
     agent_id: str,
     work_item_id: int,
     payload: WorkItemNoteBody,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     from .work_items import close_work_item, work_item_json
 
     _, item = await _agent_work_item(db, agent_id, work_item_id)
-    await close_work_item(db, item, note=payload.note)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    await close_work_item(db, item, note=payload.note, scheduler=scheduler)
     return {"ok": True, "item": work_item_json(item)}
+
+
+@router.post("/agents/{agent_id}/work-items/{work_item_id}/abort", dependencies=auth)
+async def abort_agent_work_item(
+    agent_id: str,
+    work_item_id: int,
+    payload: WorkItemNoteBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .work_items import abort_work_item, work_item_aborted, work_item_json
+
+    _, item = await _agent_work_item(db, agent_id, work_item_id)
+    if work_item_aborted(item):
+        return {
+            "ok": True,
+            "item": work_item_json(item),
+            "message": "Кейс уже отменён.",
+        }
+    scheduler = getattr(request.app.state, "scheduler", None)
+    await abort_work_item(db, item, note=payload.note, scheduler=scheduler)
+    return {
+        "ok": True,
+        "item": work_item_json(item),
+        "message": "Кейс отменён: расписания сняты, агент больше не продолжит это задание.",
+    }
+
+
+@router.delete("/agents/{agent_id}/work-items/{work_item_id}", dependencies=auth)
+async def delete_agent_work_item(
+    agent_id: str,
+    work_item_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .work_items import delete_work_item
+
+    _, item = await _agent_work_item(db, agent_id, work_item_id)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    await delete_work_item(db, item, scheduler=scheduler)
+    return {"ok": True, "deleted_id": work_item_id}
 
 
 @router.post("/agents/{agent_id}/work-items/{work_item_id}/instruct", dependencies=auth)
@@ -866,35 +916,29 @@ async def instruct_agent_work_item(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    from .work_items import resume_work_item, work_item_json
+    from .work_items import resume_work_item, work_item_aborted, work_item_json
 
     agent, item = await _agent_work_item(db, agent_id, work_item_id)
+    if work_item_aborted(item):
+        raise HTTPException(status_code=409, detail="work item aborted")
     note = (payload.note or "").strip()
     if not note:
         raise HTTPException(status_code=422, detail="note is required")
     await resume_work_item(db, item, note=note)
-    runtime = getattr(request.app.state, "runtime", None)
-    tick = None
-    if runtime is not None:
-        tick = await runtime.tick(
-            db,
-            agent,
-            force=True,
-            reason="manual",
-            extra={
-                "work_item_id": item.id,
-                "instruction": (
-                    f"Указание руководителя по кейсу #{item.id}: {note}. "
-                    "Не создавай новый кейс. Выполни это указание."
-                ),
-            },
-        )
-    else:
-        scheduler = getattr(request.app.state, "scheduler", None)
-        await schedule_immediate_tick(
-            db, scheduler, agent.id, reason="consult_resolved", work_item_id=item.id
-        )
-    return {"ok": True, "item": work_item_json(item), "tick": tick}
+    scheduler = getattr(request.app.state, "scheduler", None)
+    await schedule_immediate_tick(
+        db,
+        scheduler,
+        agent.id,
+        reason="manual",
+        work_item_id=item.id,
+        manager_answer=note,
+    )
+    return {
+        "ok": True,
+        "item": work_item_json(item),
+        "message": "Указание принято — тик запланирован в фоне.",
+    }
 
 
 @router.post("/agents/{agent_id}/work-items/{work_item_id}/reset-cursor", dependencies=auth)
@@ -905,29 +949,18 @@ async def reset_agent_work_item_cursor(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    from .work_items import reset_cursor_assignment, work_item_json
+    from .work_items import reset_cursor_assignment, work_item_aborted, work_item_json
 
-    agent, item = await _agent_work_item(db, agent_id, work_item_id)
+    _, item = await _agent_work_item(db, agent_id, work_item_id)
+    if work_item_aborted(item):
+        raise HTTPException(status_code=409, detail="work item aborted")
     note = (payload.note or "").strip() or "Сброс привязки case→Cursor по указанию руководителя."
     await reset_cursor_assignment(db, item, note=note)
-    runtime = getattr(request.app.state, "runtime", None)
-    tick = None
-    if runtime is not None:
-        tick = await runtime.tick(
-            db,
-            agent,
-            force=True,
-            reason="consult_resolved",
-            extra={
-                "work_item_id": item.id,
-                "instruction": (
-                    f"Привязка к старому Cursor job сброшена. {note} "
-                    "Вызови cursorremote_do ОДИН раз с полным брифом по текущему goal кейса. "
-                    "Не сообщай заказчику о готовности, пока done=true для этой задачи."
-                ),
-            },
-        )
-    return {"ok": True, "item": work_item_json(item), "tick": tick}
+    return {
+        "ok": True,
+        "item": work_item_json(item),
+        "message": "Привязка к Cursor сброшена. Запустите кейс вручную (Продолжи / Force tick), если нужно.",
+    }
 
 
 @router.post("/agents/{agent_id}/work-items/{work_item_id}/flush-intake", dependencies=auth)
@@ -938,32 +971,52 @@ async def flush_agent_work_item_intake(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    from .work_items import compile_intake_brief, work_item_json
+    from datetime import timedelta
+
+    from .db import utcnow
+    from .employee import save_once_job
+    from .work_items import (
+        compile_intake_brief,
+        mark_intake_executing,
+        work_item_aborted,
+        work_item_json,
+    )
 
     agent, item = await _agent_work_item(db, agent_id, work_item_id)
-    runtime = getattr(request.app.state, "runtime", None)
-    if runtime is None:
-        raise HTTPException(status_code=503, detail="Runtime unavailable")
+    if work_item_aborted(item):
+        raise HTTPException(status_code=409, detail="work item aborted")
+    scheduler = getattr(request.app.state, "scheduler", None)
     brief = compile_intake_brief(item)
     note = (payload.note or "").strip()
     message = brief
     if note:
         message = f"Указание руководителя: {note}\n\n{brief}"
-    result = await runtime.run(
+    item = await mark_intake_executing(db, item, scheduler=scheduler)
+    run_at = utcnow() + timedelta(seconds=3)
+    await save_once_job(
         db,
-        agent,
-        message or item.goal or item.title,
-        {
+        scheduler,
+        agent_id=agent.id,
+        name=f"intake-flush-{item.id}",
+        payload={
             "kind": "intake_flush",
             "source": "intake_flush",
             "work_item_id": item.id,
+            "message": message or item.goal or item.title,
+            "run_once_at": run_at.isoformat(),
+            "timezone": "UTC",
             "reply_chat_id": item.chat_id,
-            "chat_id": item.chat_id,
             "reply_phone": item.reply_phone,
+            "chat_id": item.chat_id,
             "phone": item.reply_phone,
         },
+        current_job_id=item.cron_job_id,
     )
-    return {"ok": True, "item": work_item_json(item), "result": result}
+    return {
+        "ok": True,
+        "item": work_item_json(item),
+        "message": "Накопленное задание запланировано — выполнится в фоне через несколько секунд.",
+    }
 
 
 @router.post("/agents/{agent_id}/work-items/{work_item_id}/intake-wait", dependencies=auth)
@@ -1102,6 +1155,38 @@ async def dismiss_consultation_api(
         "consultation": consultation_json(item),
         "message": "Консультация снята с очереди без запуска агента.",
     }
+
+
+@router.get("/work-assets/{work_item_id}/{digest}/{filename}")
+async def download_work_asset(
+    work_item_id: int,
+    digest: str,
+    filename: str,
+    token: str = Query(..., min_length=8),
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> FileResponse:
+    from .cursor_assets import assets_root, verify_asset_access_token
+
+    secret = settings.secret_key.get_secret_value()
+    if not verify_asset_access_token(work_item_id, digest, token, secret):
+        raise HTTPException(status_code=403, detail="Invalid or expired asset token")
+    item = await db.get(WorkItem, work_item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Work item not found")
+    for entry in list((item.metadata_json or {}).get("customer_images") or []):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("digest") or "") != digest:
+            continue
+        path = Path(str(entry.get("path") or ""))
+        if not path.is_file():
+            fallback = assets_root() / str(work_item_id) / path.name
+            if fallback.is_file():
+                path = fallback
+        if path.is_file():
+            return FileResponse(path, filename=filename or path.name)
+    raise HTTPException(status_code=404, detail="Asset not found")
 
 
 @router.get("/employees", dependencies=auth)

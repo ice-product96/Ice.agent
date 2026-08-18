@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 
 from app.cursorremote_drive import (
     _approval_actions,
@@ -36,7 +37,14 @@ class _Resp:
 
 
 class ScriptSession:
-    def __init__(self, queues: dict[str, list], default: dict | None = None) -> None:
+    def __init__(
+        self,
+        queues: dict[str, list],
+        default: dict | None = None,
+        *,
+        tool_names: list[str] | None = None,
+        workspace: Path | None = None,
+    ) -> None:
         self.queues = {key: list(values) for key, values in queues.items()}
         self.calls: list[tuple[str, dict]] = []
         self.default = default or {
@@ -44,9 +52,30 @@ class ScriptSession:
             "pendingApprovalCount": 0,
             "agentActivityLive": False,
         }
+        self.tool_names = list(tool_names or [])
+        self.workspace = workspace
+
+    async def list_tools(self):
+        class _Tool:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class _Result:
+            tools = [_Tool(name) for name in self.tool_names]
+
+        return _Result()
 
     async def call_tool(self, tool: str, arguments: dict | None = None):
         self.calls.append((tool, dict(arguments or {})))
+        if tool == "write_workspace_file" and self.workspace is not None:
+            rel = str((arguments or {}).get("relativePath") or (arguments or {}).get("path") or "")
+            raw_b64 = (arguments or {}).get("content_base64") or ""
+            target = self.workspace / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            import base64
+
+            target.write_bytes(base64.b64decode(raw_b64))
+            return _Resp({"ok": True, "path": rel})
         queue = self.queues.setdefault(tool, [])
         if not queue:
             return _Resp(self.default)
@@ -251,25 +280,13 @@ def test_searching_status_is_not_treated_as_not_started() -> None:
     assert result["status"] != "not_started"
 
 
-def test_send_prompt_includes_customer_image_in_workspace(tmp_path) -> None:
-    from app.cursor_assets import materialize_cursor_images
-
+def test_send_prompt_uploads_customer_image_via_mcp_write(tmp_path) -> None:
     png = (
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
         "x8AAwMCAO+ip1sAAAAASUVORK5CYII="
     )
     workspace = tmp_path / "site"
     workspace.mkdir()
-    prompt, paths = materialize_cursor_images(
-        {"workspacePath": str(workspace)},
-        "Поставь это фото в шапку",
-        [{"kind": "image", "filename": "hero.png", "mime_type": "image/png", "data_b64": png}],
-        work_item_id=12,
-    )
-    assert "from-customer/case-12" in prompt
-    assert paths
-    assert (workspace / paths[0]).is_file()
-
     session = ScriptSession(
         {"wait": [{"status": "timeout"} for _ in range(20)]},
         default={
@@ -277,6 +294,8 @@ def test_send_prompt_includes_customer_image_in_workspace(tmp_path) -> None:
             "pendingApprovalCount": 0,
             "workspacePath": str(workspace),
         },
+        tool_names=["write_workspace_file"],
+        workspace=workspace,
     )
     asyncio.run(
         send_prompt_and_drive(
@@ -289,6 +308,9 @@ def test_send_prompt_includes_customer_image_in_workspace(tmp_path) -> None:
     )
     sent = next(args for tool, args in session.calls if tool == "send_prompt")
     assert "from-customer/case-12" in sent["text"]
-    assert "hero" in sent["text"].lower() or "from-customer" in sent["text"]
+    write_calls = [args for tool, args in session.calls if tool == "write_workspace_file"]
+    assert write_calls
+    rel = write_calls[0]["relativePath"]
+    assert (workspace / rel).is_file()
 
 

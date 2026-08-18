@@ -63,13 +63,18 @@ def notify_channels(event: str) -> set[str]:
 
 
 def work_item_json(item: WorkItem, *, events: list[WorkItemEvent] | None = None) -> dict[str, Any]:
+    meta = item.metadata_json or {}
+    status_label = STATUS_LABELS.get(item.status, item.status)
+    if meta.get("aborted") and item.status == "done":
+        status_label = "Отменён"
     data = {
         "id": item.id,
         "agent_id": item.agent_id,
         "title": item.title,
         "goal": item.goal,
         "status": item.status,
-        "status_label": STATUS_LABELS.get(item.status, item.status),
+        "status_label": status_label,
+        "aborted": bool(meta.get("aborted")),
         "next_action": item.next_action,
         "wait_owner": item.wait_owner,
         "wait_until": item.wait_until.isoformat() if item.wait_until else None,
@@ -1033,15 +1038,94 @@ async def pause_work_item(db: AsyncSession, item: WorkItem, *, note: str = "") -
     )
 
 
+async def cancel_work_item_schedules(
+    db: AsyncSession,
+    item: WorkItem,
+    scheduler: Any | None,
+    *,
+    mark_aborted: bool = True,
+) -> list[int]:
+    """Stop all pending cron/intake timers for this case."""
+    await disarm_intake_flush_job(db, item, scheduler)
+    cancelled: list[int] = []
+    jobs = list(
+        await db.scalars(
+            select(CronJob).where(
+                CronJob.agent_id == item.agent_id,
+                CronJob.enabled.is_(True),
+            )
+        )
+    )
+    for job in jobs:
+        payload = dict(job.payload or {})
+        linked = payload.get("work_item_id")
+        try:
+            linked_id = int(linked) if linked is not None else None
+        except (TypeError, ValueError):
+            linked_id = None
+        if linked_id == item.id or job.name == f"intake-flush-{item.id}":
+            job.enabled = False
+            cancelled.append(job.id)
+            if scheduler is not None:
+                try:
+                    scheduler.remove(job.id)
+                except Exception:
+                    logger.info("cron job %s already removed from scheduler", job.id)
+    meta = dict(item.metadata_json or {})
+    blob = dict(meta.get("intake") or {}) if isinstance(meta.get("intake"), dict) else {}
+    blob["armed"] = False
+    blob["flushing"] = False
+    meta["intake"] = blob
+    meta["cursor_in_flight"] = False
+    if mark_aborted:
+        meta["aborted"] = True
+        meta["aborted_at"] = utcnow().isoformat()
+        item.paused = True
+    item.metadata_json = meta
+    item.cron_job_id = None
+    item.wait_until = None
+    await db.commit()
+    await db.refresh(item)
+    return cancelled
+
+
+async def abort_work_item(
+    db: AsyncSession,
+    item: WorkItem,
+    *,
+    note: str = "",
+    scheduler: Any | None = None,
+) -> WorkItem:
+    await cancel_work_item_schedules(db, item, scheduler)
+    return await set_status(
+        db,
+        item,
+        "done",
+        next_action="",
+        wait_owner="none",
+        event_title="Кейс отменён",
+        event_detail=note or "Выполнение остановлено. Новые тики и cron по этому кейсу не запускаются.",
+    )
+
+
 async def close_work_item(
     db: AsyncSession,
     item: WorkItem,
     *,
     note: str = "",
     status: str = "done",
+    scheduler: Any | None = None,
 ) -> WorkItem:
     if status not in {"done", "failed"}:
         status = "done"
+    await cancel_work_item_schedules(db, item, scheduler, mark_aborted=False)
+    meta = dict(item.metadata_json or {})
+    meta.pop("aborted", None)
+    meta.pop("aborted_at", None)
+    item.metadata_json = meta
+    item.paused = False
+    await db.commit()
+    await db.refresh(item)
     return await set_status(
         db,
         item,
@@ -1051,6 +1135,26 @@ async def close_work_item(
         event_title="Кейс закрыт руководителем",
         event_detail=note,
     )
+
+
+async def delete_work_item(
+    db: AsyncSession,
+    item: WorkItem,
+    *,
+    scheduler: Any | None = None,
+) -> None:
+    from sqlalchemy import delete
+
+    await cancel_work_item_schedules(db, item, scheduler, mark_aborted=True)
+    await db.execute(delete(WorkItemEvent).where(WorkItemEvent.work_item_id == item.id))
+    await db.delete(item)
+    await db.commit()
+
+
+def work_item_aborted(item: WorkItem | None) -> bool:
+    if item is None:
+        return False
+    return bool((item.metadata_json or {}).get("aborted"))
 
 
 def work_items_context_lines(items: list[WorkItem]) -> list[str]:

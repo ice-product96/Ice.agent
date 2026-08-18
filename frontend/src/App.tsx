@@ -1009,6 +1009,7 @@ function EmployeeScreen() {
   const [selectedId, setSelectedId] = useState('')
   const [instructNote, setInstructNote] = useState('')
   const [selected, setSelected] = useState<WorkItem | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState(false)
   const [sections, setSections] = useState<Record<string, string>>({})
   const [mission, setMission] = useState('')
   const [roleTitle, setRoleTitle] = useState('')
@@ -1078,7 +1079,7 @@ function EmployeeScreen() {
     }
   }
 
-  useEffect(() => { if (agentId) void load(agentId) }, [agentId])
+  useEffect(() => { setConfirmDelete(false) }, [selectedId])
 
   useEffect(() => {
     if (!agentId || !selectedId) {
@@ -1129,17 +1130,34 @@ function EmployeeScreen() {
   const staffJobs = (state?.jobs || []).filter(job => (job.kind || 'cron') === 'cron')
   const heartbeatJob = (state?.jobs || []).find(job => job.kind === 'heartbeat')
 
-  async function runWorkAction(action: 'resume' | 'pause' | 'close' | 'instruct' | 'flush' | 'wait' | 'reset-cursor') {
+  async function runWorkAction(action: 'resume' | 'pause' | 'close' | 'abort' | 'delete' | 'instruct' | 'flush' | 'wait' | 'reset-cursor') {
     if (!agentId || !selectedId) return
+    if (action === 'delete' && !confirmDelete) {
+      setConfirmDelete(true)
+      return
+    }
     setBusy(action); setError(''); setNotice('')
     try {
       if (action === 'resume') await api.agents.resumeWorkItem(agentId, selectedId, instructNote)
       if (action === 'pause') await api.agents.pauseWorkItem(agentId, selectedId, instructNote)
       if (action === 'close') await api.agents.closeWorkItem(agentId, selectedId, instructNote)
+      if (action === 'abort') {
+        const result = await api.agents.abortWorkItem(agentId, selectedId, instructNote)
+        setNotice(result.message || 'Кейс отменён — выполнение остановлено.')
+        setSelectedId('')
+        setSelected(null)
+      }
+      if (action === 'delete') {
+        await api.agents.deleteWorkItem(agentId, selectedId)
+        setNotice('Кейс удалён.')
+        setSelectedId('')
+        setSelected(null)
+        setConfirmDelete(false)
+      }
       if (action === 'instruct') await api.agents.instructWorkItem(agentId, selectedId, instructNote)
       if (action === 'flush') {
-        await api.agents.flushWorkItemIntake(agentId, selectedId, instructNote)
-        setNotice('Накопленное задание запущено.')
+        const result = await api.agents.flushWorkItemIntake(agentId, selectedId, instructNote)
+        setNotice(result.message || 'Накопленное задание запущено.')
       }
       if (action === 'wait') {
         const minutes = policy.intake_debounce_minutes || 15
@@ -1147,14 +1165,15 @@ function EmployeeScreen() {
         setNotice(`Пауза перед выполнением продлена на ${minutes} мин.`)
       }
       if (action === 'reset-cursor') {
-        await api.agents.resetWorkItemCursor(agentId, selectedId, instructNote)
-        setNotice('Привязка к Cursor сброшена — агент отправит задачу заново.')
+        const result = await api.agents.resetWorkItemCursor(agentId, selectedId, instructNote)
+        setNotice(result.message || 'Привязка к Cursor сброшена.')
       }
-      setInstructNote('')
+      if (action !== 'delete' && action !== 'abort') setInstructNote('')
       await load(agentId)
       await overview.refresh()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Действие не удалось')
+      setConfirmDelete(false)
     } finally { setBusy('') }
   }
 
@@ -1322,7 +1341,11 @@ function EmployeeScreen() {
           <button className="secondary compact" disabled={!!busy || !instructNote.trim()} onClick={() => void runWorkAction('instruct')}>Указать</button>
           <button className="secondary compact" disabled={!!busy} onClick={() => void runWorkAction('pause')}>Пауза кейса</button>
           <button className="secondary compact" disabled={!!busy} onClick={() => void runWorkAction('reset-cursor')}>Сбросить Cursor</button>
-          <button className="danger compact" disabled={!!busy} onClick={() => void runWorkAction('close')}>Закрыть</button>
+          <button className="secondary compact" disabled={!!busy} onClick={() => void runWorkAction('abort')}>Отменить кейс</button>
+          <button className="danger compact" disabled={!!busy} onClick={() => void runWorkAction('delete')}>
+            {confirmDelete ? 'Подтвердить удаление' : 'Удалить кейс'}
+          </button>
+          {confirmDelete && <button type="button" className="secondary compact" disabled={!!busy} onClick={() => setConfirmDelete(false)}>Не удалять</button>}
         </div>
         <h3 className="work-timeline-title">Лента действий</h3>
         <div className="work-timeline">

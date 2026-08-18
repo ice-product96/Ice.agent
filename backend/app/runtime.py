@@ -760,6 +760,8 @@ class AgentRuntime:
                         prompt,
                         attachments=collect_images_for_cursor(context, item),
                         work_item_id=(item.id if item is not None else context.get("work_item_id")),
+                        public_base_url=self.settings.public_base_url,
+                        secret_key=self.settings.secret_key.get_secret_value(),
                     )
                     if result.get("prompt_sent"):
                         cursor_state["prompt_sent"] = True
@@ -784,8 +786,9 @@ class AgentRuntime:
                         "Give Cursor a NEW coding task only if this case has not already sent one. "
                         "One case = one Cursor job. Never send a second prompt for the next bullet "
                         "or because Cursor is searching. "
-                        "If the customer attached photos, the platform copies them into the project "
-                        "and adds their paths to the prompt — still describe how to use them. "
+                        "If the customer attached photos or files, the platform uploads them into "
+                        "the Cursor workspace via MCP (or provides signed download URLs for the Cursor PC). "
+                        "Still describe how to use them in the task. "
                         "If the case is waiting on Cursor, the platform converts this to a check "
                         "and will not send a duplicate prompt. Clicks Allow/Accept/Run itself. "
                         "done=true only after Cursor finished. If done=false, schedule_self "
@@ -1109,6 +1112,11 @@ class AgentRuntime:
                 context["work_item_id"] = extra["work_item_id"]
             elif pending:
                 context["work_item_id"] = pending[0].id
+            from .work_items import get_work_item, work_item_aborted
+
+            tick_item = await get_work_item(db, context.get("work_item_id"))
+            if work_item_aborted(tick_item):
+                return {"ok": True, "skipped": True, "reason": "work_item_aborted"}
             if pending:
                 message = build_watchdog_instruction(pending)
             else:
@@ -1189,6 +1197,13 @@ class AgentRuntime:
         context = context or {}
         context["_user_message"] = message
         await bind_work_item(db, agent, context, message)
+        from .work_items import get_work_item, work_item_aborted
+
+        bound_item = await get_work_item(db, context.get("work_item_id"))
+        if work_item_aborted(bound_item):
+            context["_suppress_telegram_reply"] = True
+            context["_suppress_telegram_reason"] = "work_item_aborted"
+            return NO_TELEGRAM_REPLY
         await self.events.publish("agent.started", {"agent_id": agent.id})
         user_id = str(context.get("user_id") or context.get("sender_id") or context.get("chat_id") or "global")
         memories: list[dict[str, Any]] = []

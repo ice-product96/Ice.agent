@@ -430,6 +430,8 @@ async def send_prompt_and_drive(
     timeout_ms: int = 90_000,
     attachments: list[dict[str, Any]] | None = None,
     work_item_id: Any = None,
+    public_base_url: str = "",
+    secret_key: str = "",
 ) -> dict[str, Any]:
     try:
         current = await mcp_call(session, "get_status")
@@ -452,16 +454,38 @@ async def send_prompt_and_drive(
                 "Polled the current job instead."
             ),
         }
-    from .cursor_assets import materialize_cursor_images
+    from .cursor_file_transfer import build_customer_files_prompt, deliver_customer_files_to_cursor
 
-    prompt, image_paths = materialize_cursor_images(
-        current, text, attachments, work_item_id=work_item_id
+    delivery = await deliver_customer_files_to_cursor(
+        session,
+        attachments,
+        work_item_id=work_item_id,
+        public_base_url=public_base_url,
+        secret_key=secret_key,
     )
-    sent = await mcp_call(session, "send_prompt", {"text": prompt})
+    prompt = build_customer_files_prompt(
+        text,
+        workspace_paths=delivery.get("paths") or [],
+        download_steps=delivery.get("download_steps") or [],
+        inline_note=str(delivery.get("inline_note") or ""),
+    )
+    send_payload: dict[str, Any] = {"text": prompt}
+    inline_attachments = delivery.get("send_prompt_attachments") or []
+    if inline_attachments:
+        send_payload["attachments"] = inline_attachments
+    sent = await mcp_call(session, "send_prompt", send_payload)
     driven = await drive_until_done(session, timeout_ms=timeout_ms, require_busy=True)
-    result = {"sent": sent, "prompt_sent": True, **driven}
-    if image_paths:
-        result["images"] = image_paths
+    result = {
+        "sent": sent,
+        "prompt_sent": True,
+        **driven,
+        "file_delivery": {
+            "method": delivery.get("method"),
+            "paths": delivery.get("paths") or [],
+        },
+    }
+    if delivery.get("paths"):
+        result["images"] = delivery["paths"]
     return result
 
 

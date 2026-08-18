@@ -180,7 +180,7 @@ async def collect_telegram_attachments(event: Any, messages: Iterable[Any]) -> l
             continue
         item = dict(meta)
         kind = str(item.get("kind") or "")
-        download = kind in {"image", "voice", "audio"}
+        download = kind in {"image", "voice", "audio", "file", "document"}
         size = int(item.get("size") or 0)
         if download and size > MAX_TELEGRAM_ATTACHMENT_BYTES:
             item["skipped"] = "too_large"

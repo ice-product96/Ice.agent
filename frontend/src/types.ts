@@ -391,6 +391,7 @@ export interface WorkItem {
   goal?: string
   status: string
   status_label?: string
+  aborted?: boolean
   next_action?: string
   wait_owner?: string
   wait_until?: string | null

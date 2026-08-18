@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import logging
 import re
 from pathlib import Path
@@ -15,6 +16,7 @@ from .config import get_settings
 logger = logging.getLogger(__name__)
 
 IMAGE_KINDS = {"image"}
+CUSTOMER_FILE_KINDS = frozenset({"image", "file", "document"})
 _MIME_EXT = {
     "image/jpeg": ".jpg",
     "image/jpg": ".jpg",
@@ -22,6 +24,9 @@ _MIME_EXT = {
     "image/gif": ".gif",
     "image/webp": ".webp",
     "image/bmp": ".bmp",
+    "application/pdf": ".pdf",
+    "application/zip": ".zip",
+    "image/svg+xml": ".svg",
 }
 _WORKSPACE_KEYS = (
     "workspacePath",
@@ -37,6 +42,60 @@ _WORKSPACE_KEYS = (
     "path",
 )
 MAX_IMAGES = 8
+MAX_CUSTOMER_FILES = 8
+
+
+def customer_file_relative_path(
+    work_item_id: Any,
+    attachment: dict[str, Any],
+    *,
+    index: int,
+    digest: str,
+) -> str:
+    case = str(work_item_id or "inbox").strip() or "inbox"
+    filename = (
+        f"{index:02d}_{digest[:8]}_{_safe_stem(str(attachment.get('filename') or 'file'))}"
+        f"{_ext_for(attachment)}"
+    )
+    return f"from-customer/case-{case}/{filename}"
+
+
+def asset_access_token(work_item_id: Any, digest: str, secret: str) -> str:
+    payload = f"{work_item_id}:{digest}".encode()
+    key = (secret or "change-me").encode()
+    return hmac.new(key, payload, hashlib.sha256).hexdigest()[:40]
+
+
+def verify_asset_access_token(
+    work_item_id: Any,
+    digest: str,
+    token: str,
+    secret: str,
+) -> bool:
+    if not token:
+        return False
+    expected = asset_access_token(work_item_id, digest, secret)
+    return hmac.compare_digest(expected, token)
+
+
+def asset_download_url(
+    work_item_id: Any,
+    digest: str,
+    attachment: dict[str, Any],
+    *,
+    public_base_url: str,
+    secret_key: str,
+) -> str | None:
+    base = (public_base_url or "").strip().rstrip("/")
+    if not base or not digest:
+        return None
+    token = asset_access_token(work_item_id, digest, secret_key)
+    filename = Path(str(attachment.get("filename") or "file")).name or "file"
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", filename).strip("-._") or "file"
+    return (
+        f"{base}/api/v1/work-assets/{work_item_id}/{digest}/{safe_name}"
+        f"?token={token}"
+    )
 
 
 def assets_root() -> Path:
@@ -46,18 +105,20 @@ def assets_root() -> Path:
 def _ext_for(attachment: dict[str, Any]) -> str:
     name = str(attachment.get("filename") or "")
     suffix = Path(name).suffix.lower()
-    if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+    if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".pdf", ".zip"}:
         return ".jpg" if suffix == ".jpeg" else suffix
     mime = str(attachment.get("mime_type") or "").strip().lower()
     if mime == "image/jpg":
         mime = "image/jpeg"
-    return _MIME_EXT.get(mime, ".jpg")
+    if suffix:
+        return suffix
+    return _MIME_EXT.get(mime, Path(name).suffix or ".bin")
 
 
 def _safe_stem(name: str) -> str:
     stem = Path(name).stem
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", stem).strip("-._")
-    return (cleaned or "image")[:40]
+    return (cleaned or "file")[:40]
 
 
 def _decode(attachment: dict[str, Any]) -> bytes | None:
@@ -101,7 +162,7 @@ def persist_customer_images(
     incoming = [
         item_att
         for item_att in (attachments or [])
-        if isinstance(item_att, dict) and str(item_att.get("kind") or "") in IMAGE_KINDS
+        if isinstance(item_att, dict) and str(item_att.get("kind") or "") in CUSTOMER_FILE_KINDS
     ]
     if not incoming:
         return []
@@ -116,7 +177,7 @@ def persist_customer_images(
     known = {str(entry.get("digest") or "") for entry in stored}
     added: list[dict[str, Any]] = []
     for attachment in incoming:
-        if len(stored) >= MAX_IMAGES:
+        if len(stored) >= MAX_CUSTOMER_FILES:
             break
         raw = _decode(attachment)
         if not raw:
@@ -139,7 +200,7 @@ def persist_customer_images(
         known.add(digest)
         added.append(record)
     if added:
-        meta["customer_images"] = stored[-MAX_IMAGES:]
+        meta["customer_images"] = stored[-MAX_CUSTOMER_FILES:]
         item.metadata_json = meta
     return [_public_ref(entry) for entry in added]
 
@@ -168,21 +229,22 @@ def load_customer_images(item: Any | None) -> list[dict[str, Any]]:
                 "data_b64": base64.b64encode(raw).decode("ascii"),
             }
         )
-    return loaded[:MAX_IMAGES]
+    return loaded[:MAX_CUSTOMER_FILES]
 
 
-def collect_images_for_cursor(
+def collect_files_for_cursor(
     context: dict[str, Any] | None,
     item: Any | None,
 ) -> list[dict[str, Any]]:
+    """Collect customer files (images and documents) with bytes for Cursor transfer."""
     seen: set[str] = set()
-    images: list[dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
     sources = list((context or {}).get("_attachments") or [])
     sources.extend(load_customer_images(item))
     for attachment in sources:
         if not isinstance(attachment, dict):
             continue
-        if str(attachment.get("kind") or "") not in IMAGE_KINDS:
+        if str(attachment.get("kind") or "") not in CUSTOMER_FILE_KINDS:
             continue
         raw = _decode(attachment)
         if not raw:
@@ -195,10 +257,21 @@ def collect_images_for_cursor(
         payload["digest"] = digest
         if not payload.get("data_b64"):
             payload["data_b64"] = base64.b64encode(raw).decode("ascii")
-        images.append(payload)
-        if len(images) >= MAX_IMAGES:
+        files.append(payload)
+        if len(files) >= MAX_CUSTOMER_FILES:
             break
-    return images
+    return files
+
+
+def collect_images_for_cursor(
+    context: dict[str, Any] | None,
+    item: Any | None,
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in collect_files_for_cursor(context, item)
+        if str(item.get("kind") or "") in IMAGE_KINDS
+    ]
 
 
 def _coerce_path(value: Any) -> Path | None:

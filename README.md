@@ -118,6 +118,8 @@ Playwright MCP поднимается вместе со стеком. Если �
 | URL | с хоста: `http://127.0.0.1:3000/mcp`; из Docker API: `http://host.docker.internal:3000/mcp` |
 | Заголовки | `Authorization=Bearer <MCP_TOKEN>` |
 
+**Файлы от заказчика (Telegram → Cursor):** ice.agent хранит вложения у себя, но при `cursorremote_do` передаёт их **на ПК с Cursor** через MCP `write_workspace_file` (если CursorRemote его поддерживает). Если инструмента нет — в промпт добавляются signed URL (`ICE_PUBLIC_BASE_URL`) для скачивания на машину Cursor, плюс inline-вложения для картинок. Задайте `ICE_PUBLIC_BASE_URL` так, чтобы **Cursor PC** мог достучаться до API (например `http://192.168.10.39:8000`).
+
 У агента:
 
 1. Включите инструмент **MCP**.

@@ -94,12 +94,16 @@ export const api = {
       request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/pause`, { method: 'POST', ...body({ note }) }),
     closeWorkItem: (id: string, workItemId: string, note = '') =>
       request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/close`, { method: 'POST', ...body({ note }) }),
+    abortWorkItem: (id: string, workItemId: string, note = '') =>
+      request<{ ok: boolean; item: WorkItem; message?: string }>(`/agents/${id}/work-items/${workItemId}/abort`, { method: 'POST', ...body({ note }) }),
+    deleteWorkItem: (id: string, workItemId: string) =>
+      request<{ ok: boolean; deleted_id: number }>(`/agents/${id}/work-items/${workItemId}`, { method: 'DELETE' }),
     instructWorkItem: (id: string, workItemId: string, note: string) =>
       request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/instruct`, { method: 'POST', ...body({ note }) }),
     resetWorkItemCursor: (id: string, workItemId: string, note = '') =>
-      request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/reset-cursor`, { method: 'POST', ...body({ note }) }),
+      request<{ ok: boolean; item: WorkItem; message?: string }>(`/agents/${id}/work-items/${workItemId}/reset-cursor`, { method: 'POST', ...body({ note }) }),
     flushWorkItemIntake: (id: string, workItemId: string, note = '') =>
-      request<{ ok: boolean; item: WorkItem; result?: string }>(
+      request<{ ok: boolean; item: WorkItem; result?: string; message?: string }>(
         `/agents/${id}/work-items/${workItemId}/flush-intake`,
         { method: 'POST', ...body({ note }) },
       ),
