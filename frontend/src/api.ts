@@ -104,8 +104,16 @@ export const api = {
   consultations: {
     list: (agentId?: string, status = 'open') =>
       request<{ items: Consultation[]; total: number }>(`/consultations${qs({ agent_id: agentId, status, limit: 100 })}`),
-    resolve: (id: string, data: { status: string; answer_text?: string }) =>
-      request<{ ok: boolean; consultation: Consultation }>(`/consultations/${id}/resolve`, { method: 'POST', ...body(data) }),
+    resolve: (id: string, data: { status: string; answer_text?: string; schedule_tick?: boolean }) =>
+      request<{ ok: boolean; consultation: Consultation; tick?: Record<string, unknown>; message?: string }>(
+        `/consultations/${id}/resolve`,
+        { method: 'POST', ...body(data) },
+      ),
+    dismiss: (id: string, reason = 'Не актуально') =>
+      request<{ ok: boolean; consultation: Consultation; message?: string }>(
+        `/consultations/${id}/dismiss`,
+        { method: 'POST', ...body({ reason }) },
+      ),
   },
   llmProfiles: {
     list: () => request<LlmProfile[]>('/llm-profiles'),

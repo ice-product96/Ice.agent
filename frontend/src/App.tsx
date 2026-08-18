@@ -993,11 +993,15 @@ function ConversationsScreen() {
 function EmployeeScreen() {
   const agents = useLoad(api.agents.list, [])
   const overview = useLoad(api.employees.list, [])
-  const consults = useLoad(() => api.consultations.list(undefined, 'open'), [])
   const [agentId, setAgentId] = useState('')
+  const consults = useLoad(
+    () => (agentId ? api.consultations.list(agentId, 'open') : Promise.resolve({ items: [], total: 0 })),
+    [agentId],
+  )
   const [state, setState] = useState<EmployeeState | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState('')
   const [answerDrafts, setAnswerDrafts] = useState<Record<string, string>>({})
   const [inboxFilter, setInboxFilter] = useState<'actionable' | 'in_progress' | 'waiting_external' | 'waiting_customer' | 'waiting_manager' | 'failed' | 'all'>('actionable')
@@ -1122,7 +1126,7 @@ function EmployeeScreen() {
 
   async function runWorkAction(action: 'resume' | 'pause' | 'close' | 'instruct') {
     if (!agentId || !selectedId) return
-    setBusy(action); setError('')
+    setBusy(action); setError(''); setNotice('')
     try {
       if (action === 'resume') await api.agents.resumeWorkItem(agentId, selectedId, instructNote)
       if (action === 'pause') await api.agents.pauseWorkItem(agentId, selectedId, instructNote)
@@ -1133,6 +1137,39 @@ function EmployeeScreen() {
       await overview.refresh()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Действие не удалось')
+    } finally { setBusy('') }
+  }
+
+  async function resolveConsult(item: Consultation, status: 'answered' | 'approved' | 'rejected') {
+    setBusy(`consult-${item.id}`); setError(''); setNotice('')
+    try {
+      const answer = (answerDrafts[item.id] || '').trim()
+      if (status === 'answered' && !answer) {
+        setError('Напишите ответ или нажмите «Снять с очереди», если вопрос не актуален.')
+        return
+      }
+      const result = await api.consultations.resolve(item.id, { status, answer_text: answer })
+      setAnswerDrafts(d => { const next = { ...d }; delete next[item.id]; return next })
+      setNotice(result.message || 'Консультация закрыта, агент продолжит работу.')
+      await consults.refresh()
+      await load(agentId)
+      await overview.refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось ответить')
+    } finally { setBusy('') }
+  }
+
+  async function dismissConsult(item: Consultation) {
+    setBusy(`dismiss-${item.id}`); setError(''); setNotice('')
+    try {
+      const result = await api.consultations.dismiss(item.id, answerDrafts[item.id]?.trim() || 'Не актуально')
+      setAnswerDrafts(d => { const next = { ...d }; delete next[item.id]; return next })
+      setNotice(result.message || 'Консультация снята с очереди.')
+      await consults.refresh()
+      await load(agentId)
+      await overview.refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось снять с очереди')
     } finally { setBusy('') }
   }
 
@@ -1148,7 +1185,15 @@ function EmployeeScreen() {
         <button className="secondary" disabled={!agentId || loading} onClick={() => void load(agentId)}><RefreshCw size={15}/>Обновить</button>
       </div>}
     />
-    {(error || agents.error || overview.error || consults.error) && <Alert message={error || agents.error || overview.error || consults.error}/>}
+    {(error || notice || agents.error || overview.error || consults.error) && (
+      <>
+        {error && <Alert message={error}/>}
+        {notice && !error && <p className="notice-banner">{notice}</p>}
+        {(agents.error || overview.error || consults.error) && !error && (
+          <Alert message={agents.error || overview.error || consults.error}/>
+        )}
+      </>
+    )}
     {loading && !state ? <Loading/> : !agentId ? <Empty icon={Briefcase} title="Выберите агента" text="Включите автономию — входящие задачи станут кейсами, heartbeat будет их сторожить."/> : state && <>
       <section className="panel work-inbox">
         <SectionHead title="Inbox кейсов" text="Единица работы — кейс, не строка cron. Сторож смотрит открытые, а не пишет журнал тика."
@@ -1304,7 +1349,10 @@ function EmployeeScreen() {
       </section>
 
       <section className="panel">
-        <SectionHead title={`Консультации (${openConsults.length} открытых)`} text="Ответы также в Telegram: /answer id · /approve id · /reject id"/>
+        <SectionHead
+          title={`Консультации (${openConsults.length} открытых)`}
+          text="Ответ закрывает вопрос и сразу запускает агента (force tick). «Снять с очереди» — для устаревших без запуска. Telegram: /answer id · /approve id · /reject id"
+        />
         {openConsults.length === 0 ? <Empty icon={MessageCircle} title="Очередь пуста" text="Когда сотруднику что-то нужно — запрос появится здесь и у админов в Telegram."/> :
           <div className="list-panel">{openConsults.map((item: Consultation) => <div className="server-row" key={item.id} style={{ alignItems: 'flex-start', paddingTop: 12, paddingBottom: 12 }}>
             <span className="chip">{item.requires_approval ? 'approval' : 'consult'}</span>
@@ -1312,12 +1360,14 @@ function EmployeeScreen() {
               <strong>#{item.id}{item.work_item_id ? ` · кейс #${item.work_item_id}` : ''} · агент {item.agent_id}</strong>
               <small>{item.question}</small>
               {item.context && <small>{item.context.slice(0, 240)}</small>}
+              {!item.work_item_id && <small className="consult-hint">Старая консультация без кейса — можно снять с очереди, если не актуальна.</small>}
               <textarea rows={2} style={{ marginTop: 8, width: '100%' }} placeholder="Ответ руководителя…" value={answerDrafts[item.id] || ''} onChange={e => setAnswerDrafts(d => ({ ...d, [item.id]: e.target.value }))}/>
               <div className="head-actions" style={{ marginTop: 8 }}>
-                <button className="secondary compact" onClick={async () => { await api.consultations.resolve(item.id, { status: 'answered', answer_text: answerDrafts[item.id] || '' }); await consults.refresh(); await load(agentId) }}>Ответить</button>
+                <button className="secondary compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'answered')}>Ответить</button>
+                <button className="secondary compact" disabled={!!busy} onClick={() => void dismissConsult(item)}>Снять с очереди</button>
                 {item.requires_approval && <>
-                  <button className="primary compact" onClick={async () => { await api.consultations.resolve(item.id, { status: 'approved', answer_text: answerDrafts[item.id] || 'approved' }); await consults.refresh(); await load(agentId) }}>Одобрить</button>
-                  <button className="danger compact" onClick={async () => { await api.consultations.resolve(item.id, { status: 'rejected', answer_text: answerDrafts[item.id] || 'rejected' }); await consults.refresh(); await load(agentId) }}>Отклонить</button>
+                  <button className="primary compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'approved')}>Одобрить</button>
+                  <button className="danger compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'rejected')}>Отклонить</button>
                 </>}
               </div>
             </div>

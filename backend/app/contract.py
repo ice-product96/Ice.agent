@@ -628,6 +628,11 @@ async def employee_policy_catalog() -> dict[str, Any]:
 class ConsultationResolveBody(BaseModel):
     status: str = "answered"  # answered|approved|rejected
     answer_text: str = ""
+    schedule_tick: bool = True
+
+
+class ConsultationDismissBody(BaseModel):
+    reason: str = "Не актуально"
 
 
 class WorkItemNoteBody(BaseModel):
@@ -659,7 +664,7 @@ async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depen
     consults = (
         await db.scalars(
             select(Consultation)
-            .where(Consultation.agent_id == agent.id)
+            .where(Consultation.agent_id == agent.id, Consultation.status == "open")
             .order_by(Consultation.id.desc())
             .limit(40)
         )
@@ -942,11 +947,64 @@ async def resolve_consultation_api(
             status=status,
             answer_text=payload.answer_text,
             answered_by="web",
-            schedule_tick=True,
+            schedule_tick=False,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Consultation not found") from exc
-    return {"ok": True, "consultation": consultation_json(item)}
+    tick_result = None
+    if payload.schedule_tick:
+        agent = await db.get(Agent, item.agent_id)
+        if agent is not None:
+            answer = (item.answer_text or payload.answer_text or status).strip()
+            tick_result = await runtime.tick(
+                db,
+                agent,
+                force=True,
+                reason="consult_resolved",
+                extra={
+                    "work_item_id": item.work_item_id,
+                    "instruction": (
+                        f"Ответ руководителя на консультацию #{item.id}: {answer}. "
+                        "Выполни указание. Не создавай новую consult_manager по этому же вопросу."
+                    ),
+                },
+            )
+    return {
+        "ok": True,
+        "consultation": consultation_json(item),
+        "tick": tick_result,
+        "message": (
+            "Агент продолжит работу по ответу."
+            if tick_result and not tick_result.get("skipped")
+            else "Консультация закрыта."
+        ),
+    }
+
+
+@router.post("/consultations/{consultation_id}/dismiss", dependencies=auth)
+async def dismiss_consultation_api(
+    consultation_id: int,
+    payload: ConsultationDismissBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    runtime = getattr(request.app.state, "runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="Runtime unavailable")
+    try:
+        item = await runtime.employee.dismiss_consultation(
+            db,
+            consultation_id,
+            reason=payload.reason,
+            answered_by="web",
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Consultation not found") from exc
+    return {
+        "ok": True,
+        "consultation": consultation_json(item),
+        "message": "Консультация снята с очереди без запуска агента.",
+    }
 
 
 @router.get("/employees", dependencies=auth)

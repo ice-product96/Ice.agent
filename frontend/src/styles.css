@@ -57,6 +57,8 @@ h1, h2, h3, .brand { font-family: 'Manrope', sans-serif; }
 .work-event small { color: #6f778a; }
 .work-event p { margin-top: 6px; color: #b8bfcd; font-size: 12px; line-height: 1.4; }
 .work-event.kind-failed { border-color: #ff6f8333; }
+.notice-banner { margin: 0 0 12px; padding: 10px 14px; border-radius: 8px; border: 1px solid #4ad6a033; background: #4ad6a012; color: #9fe8c8; font-size: 13px; }
+.consult-hint { display: block; margin-top: 6px; color: #858da0; font-style: italic; }
 .sidebar-foot { margin-top: auto; }
 .system-mini { margin: 10px 5px 14px; padding: 12px; display: flex; gap: 10px; align-items: flex-start; background: #111720; border: 1px solid #202938; border-radius: 10px; }
 .system-mini strong, .system-mini small { display: block; }

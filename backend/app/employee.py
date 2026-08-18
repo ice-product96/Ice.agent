@@ -487,6 +487,9 @@ async def schedule_immediate_tick(
     *,
     reason: str = "consult_resolved",
     work_item_id: int | None = None,
+    manager_answer: str = "",
+    consultation_id: int | None = None,
+    force: bool = True,
 ) -> CronJob:
     profile = await get_or_create_profile(db, agent_id)
     run_at = utcnow() + timedelta(seconds=3)
@@ -496,13 +499,19 @@ async def schedule_immediate_tick(
         "source": reason,
         "run_once_at": run_at.isoformat(),
         "timezone": "UTC",
+        "force": force,
     }
+    prefix_parts: list[str] = []
+    if consultation_id is not None:
+        prefix_parts.append(f"Консультация #{consultation_id} закрыта руководителем.")
+    answer = (manager_answer or "").strip()
+    if answer:
+        prefix_parts.append(f"Ответ руководителя: {answer}")
     if work_item_id:
         payload["work_item_id"] = work_item_id
-        payload["message"] = (
-            f"Продолжи кейс #{work_item_id} по ответу руководителя. Не создавай новый кейс. "
-            + payload["message"]
-        )
+        prefix_parts.insert(0, f"Продолжи кейс #{work_item_id}. Не создавай новый кейс.")
+    if prefix_parts:
+        payload["message"] = " ".join(prefix_parts) + "\n\n" + payload["message"]
     job = CronJob(
         name=f"employee-tick-once-{agent_id}-{uuid.uuid4().hex[:10]}",
         agent_id=agent_id,
@@ -569,6 +578,23 @@ class EmployeeService:
         need_kind: str = "decision",
         work_item_id: int | None = None,
     ) -> dict[str, Any]:
+        cleaned_question = question.strip()
+        existing = await db.scalar(
+            select(Consultation).where(
+                Consultation.agent_id == agent.id,
+                Consultation.status == "open",
+                Consultation.question == cleaned_question,
+            )
+        )
+        if existing is not None:
+            need = await db.scalar(
+                select(EmployeeNeed).where(EmployeeNeed.consultation_id == existing.id)
+            )
+            return {
+                "consultation": consultation_json(existing),
+                "need": need_json(need) if need is not None else None,
+                "duplicate": True,
+            }
         item = Consultation(
             agent_id=agent.id,
             work_item_id=work_item_id,
@@ -678,15 +704,16 @@ class EmployeeService:
                 note = item.answer_text or status
                 await resume_work_item(db, work, note=f"Руководитель ({status}): {note}")
         if schedule_tick and self.scheduler is not None:
-            profile = await get_or_create_profile(db, item.agent_id)
-            if profile.autonomy_enabled and not profile.paused:
-                await schedule_immediate_tick(
-                    db,
-                    self.scheduler,
-                    item.agent_id,
-                    reason="consult_resolved",
-                    work_item_id=item.work_item_id,
-                )
+            await schedule_immediate_tick(
+                db,
+                self.scheduler,
+                item.agent_id,
+                reason="consult_resolved",
+                work_item_id=item.work_item_id,
+                manager_answer=item.answer_text or "",
+                consultation_id=item.id,
+                force=True,
+            )
         if self.events:
             await self.events.publish(
                 "employee.consultation.resolved",
@@ -694,6 +721,59 @@ class EmployeeService:
                     "agent_id": item.agent_id,
                     "consultation_id": item.id,
                     "status": status,
+                },
+            )
+        return item
+
+    async def dismiss_consultation(
+        self,
+        db: AsyncSession,
+        consultation_id: int,
+        *,
+        reason: str = "",
+        answered_by: str = "",
+    ) -> Consultation:
+        """Close a stale consultation without resuming the agent."""
+        item = await db.get(Consultation, consultation_id)
+        if item is None:
+            raise KeyError(consultation_id)
+        if item.status != "open":
+            return item
+        note = (reason or "Снято с очереди руководителем").strip()
+        item.status = "dismissed"
+        item.answer_text = note
+        item.answered_by = (answered_by or "").strip() or None
+        item.answered_at = utcnow()
+        needs = (
+            await db.scalars(
+                select(EmployeeNeed).where(EmployeeNeed.consultation_id == item.id)
+            )
+        ).all()
+        for need in needs:
+            need.status = "dropped"
+            need.detail = (need.detail or "") + f"\nDismissed: {note}"
+        if item.work_item_id:
+            from .work_items import get_work_item, set_status
+
+            work = await get_work_item(db, item.work_item_id)
+            if work is not None and work.status == "waiting_manager":
+                await set_status(
+                    db,
+                    work,
+                    "in_progress",
+                    next_action="Консультация снята — продолжай без ожидания",
+                    wait_owner="self",
+                    event_title="Консультация снята",
+                    event_detail=note,
+                )
+        await db.commit()
+        await db.refresh(item)
+        if self.events:
+            await self.events.publish(
+                "employee.consultation.dismissed",
+                {
+                    "agent_id": item.agent_id,
+                    "consultation_id": item.id,
                 },
             )
         return item
