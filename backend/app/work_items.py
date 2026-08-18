@@ -316,12 +316,11 @@ async def extend_customer_intake(
 
 
 def intake_flush_already_started(item: WorkItem | None) -> bool:
+    """True when intake flush side-effects already ran (timer disarmed, cursor reset)."""
     if item is None:
         return False
     blob = intake_blob(item)
-    if blob.get("flushing"):
-        return True
-    return item.status not in {"collecting"}
+    return bool(blob.get("flushing"))
 
 
 async def disarm_intake_flush_job(
@@ -353,28 +352,48 @@ async def mark_intake_executing(
 ) -> WorkItem:
     meta = dict(item.metadata_json or {})
     blob = dict(meta.get("intake") or {}) if isinstance(meta.get("intake"), dict) else {}
-    duplicate = bool(blob.get("flushing")) or item.status != "collecting"
+    reflush = bool(blob.get("flushing")) or item.status != "collecting"
     blob["armed"] = False
     blob["flushing"] = True
-    blob.setdefault("flushed_at", utcnow().isoformat())
+    blob["flushed_at"] = utcnow().isoformat()
     meta["intake"] = blob
-    if not duplicate:
-        meta["cursor_in_flight"] = False
+    meta["cursor_in_flight"] = False
+    meta["cursor_assignment_seq"] = int(meta.get("cursor_assignment_seq") or 0) + 1
     item.metadata_json = meta
-    await disarm_intake_flush_job(db, item, scheduler)
-    if duplicate:
-        await db.commit()
-        await db.refresh(item)
-        return item
     item.goal = compile_intake_brief(item) or item.goal
+    await disarm_intake_flush_job(db, item, scheduler)
     return await set_status(
         db,
         item,
         "in_progress",
         next_action="Выполняю накопленное задание",
         wait_owner="self",
-        event_title="Тишина закончилась — выполняю",
+        event_title="Новое задание — выполняю" if reflush else "Тишина закончилась — выполняю",
         event_detail=compile_intake_brief(item)[:1500],
+    )
+
+
+async def reset_cursor_assignment(
+    db: AsyncSession,
+    item: WorkItem,
+    *,
+    note: str = "",
+) -> WorkItem:
+    """Clear stale case→Cursor binding so a new prompt can be sent."""
+    meta = dict(item.metadata_json or {})
+    meta["cursor_in_flight"] = False
+    meta["cursor_assignment_seq"] = int(meta.get("cursor_assignment_seq") or 0) + 1
+    item.metadata_json = meta
+    item.paused = False
+    item.last_error = None
+    return await set_status(
+        db,
+        item,
+        "in_progress",
+        next_action="Отправить задачу в Cursor заново",
+        wait_owner="self",
+        event_title="Сброшена привязка к Cursor",
+        event_detail=note or "Можно снова вызвать cursorremote_do с полным брифом.",
     )
 
 

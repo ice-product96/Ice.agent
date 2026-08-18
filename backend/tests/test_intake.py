@@ -201,6 +201,32 @@ async def test_watchdog_skips_collecting_when_flush_job_exists(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_reset_cursor_assignment_clears_in_flight(tmp_path: Path) -> None:
+    from app.work_items import reset_cursor_assignment
+
+    engine, sessions = await sessions_for(tmp_path / "reset-cursor.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.commit()
+        await db.refresh(agent)
+        item = WorkItem(
+            agent_id=agent.id,
+            title="LAVVE image",
+            status="waiting_external",
+            metadata_json={"cursor_in_flight": True, "cursor_assignment_seq": 3},
+        )
+        db.add(item)
+        await db.commit()
+        await db.refresh(item)
+        reset = await reset_cursor_assignment(db, item, note="manual reset")
+        assert reset.status == "in_progress"
+        assert not (reset.metadata_json or {}).get("cursor_in_flight")
+        assert int((reset.metadata_json or {}).get("cursor_assignment_seq") or 0) == 4
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_mark_intake_executing_clears_stale_cursor_flag(tmp_path: Path) -> None:
     engine, sessions = await sessions_for(tmp_path / "flush.db")
     async with sessions() as db:
@@ -223,6 +249,7 @@ async def test_mark_intake_executing_clears_stale_cursor_flag(tmp_path: Path) ->
         assert (flushed.metadata_json or {}).get("intake", {}).get("armed") is False
         flushed.metadata_json = {**(flushed.metadata_json or {}), "cursor_in_flight": True}
         again = await mark_intake_executing(db, flushed)
-        assert (again.metadata_json or {}).get("cursor_in_flight") is True
+        assert not (again.metadata_json or {}).get("cursor_in_flight")
         assert again.status == "in_progress"
+        assert int((again.metadata_json or {}).get("cursor_assignment_seq") or 0) >= 2
     await engine.dispose()

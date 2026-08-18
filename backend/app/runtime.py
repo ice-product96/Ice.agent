@@ -726,13 +726,18 @@ class AgentRuntime:
                                 "Do not start Cursor. Reply naturally and do not mention a wait."
                             ),
                         }
-                    in_flight = item is not None and (
-                        item.status == "waiting_external"
-                        or bool((item.metadata_json or {}).get("cursor_in_flight"))
+                    is_fresh_assignment = bool((context or {}).get("_intake_flush")) or str(
+                        (context or {}).get("source") or ""
+                    ) in {"intake_flush", "consult_resolved"}
+                    in_flight = (
+                        not is_fresh_assignment
+                        and item is not None
+                        and (
+                            item.status == "waiting_external"
+                            or bool((item.metadata_json or {}).get("cursor_in_flight"))
+                        )
                     )
-                    already_sent = bool(cursor_state.get("prompt_sent")) or bool(
-                        (context or {}).get("_duplicate_intake_flush")
-                    )
+                    already_sent = bool(cursor_state.get("prompt_sent"))
                     if in_flight or already_sent:
                         result = await check_and_drive(cursor_session)
                         result = {
@@ -1321,9 +1326,7 @@ class AgentRuntime:
                     db, work_item, scheduler=self.employee.scheduler
                 )
                 context["_duplicate_intake_flush"] = duplicate_flush
-                context["_cursor_was_in_flight"] = duplicate_flush or bool(
-                    (work_item.metadata_json or {}).get("cursor_in_flight")
-                )
+                context["_cursor_was_in_flight"] = False
                 from .cursor_assets import load_customer_images
 
                 stored_images = load_customer_images(work_item)

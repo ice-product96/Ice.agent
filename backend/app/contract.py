@@ -897,6 +897,39 @@ async def instruct_agent_work_item(
     return {"ok": True, "item": work_item_json(item), "tick": tick}
 
 
+@router.post("/agents/{agent_id}/work-items/{work_item_id}/reset-cursor", dependencies=auth)
+async def reset_agent_work_item_cursor(
+    agent_id: str,
+    work_item_id: int,
+    payload: WorkItemNoteBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .work_items import reset_cursor_assignment, work_item_json
+
+    agent, item = await _agent_work_item(db, agent_id, work_item_id)
+    note = (payload.note or "").strip() or "Сброс привязки case→Cursor по указанию руководителя."
+    await reset_cursor_assignment(db, item, note=note)
+    runtime = getattr(request.app.state, "runtime", None)
+    tick = None
+    if runtime is not None:
+        tick = await runtime.tick(
+            db,
+            agent,
+            force=True,
+            reason="consult_resolved",
+            extra={
+                "work_item_id": item.id,
+                "instruction": (
+                    f"Привязка к старому Cursor job сброшена. {note} "
+                    "Вызови cursorremote_do ОДИН раз с полным брифом по текущему goal кейса. "
+                    "Не сообщай заказчику о готовности, пока done=true для этой задачи."
+                ),
+            },
+        )
+    return {"ok": True, "item": work_item_json(item), "tick": tick}
+
+
 @router.post("/agents/{agent_id}/work-items/{work_item_id}/flush-intake", dependencies=auth)
 async def flush_agent_work_item_intake(
     agent_id: str,

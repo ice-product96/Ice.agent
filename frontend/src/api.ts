@@ -96,6 +96,8 @@ export const api = {
       request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/close`, { method: 'POST', ...body({ note }) }),
     instructWorkItem: (id: string, workItemId: string, note: string) =>
       request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/instruct`, { method: 'POST', ...body({ note }) }),
+    resetWorkItemCursor: (id: string, workItemId: string, note = '') =>
+      request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/reset-cursor`, { method: 'POST', ...body({ note }) }),
     flushWorkItemIntake: (id: string, workItemId: string, note = '') =>
       request<{ ok: boolean; item: WorkItem; result?: string }>(
         `/agents/${id}/work-items/${workItemId}/flush-intake`,

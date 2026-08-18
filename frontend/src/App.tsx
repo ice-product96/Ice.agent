@@ -1129,7 +1129,7 @@ function EmployeeScreen() {
   const staffJobs = (state?.jobs || []).filter(job => (job.kind || 'cron') === 'cron')
   const heartbeatJob = (state?.jobs || []).find(job => job.kind === 'heartbeat')
 
-  async function runWorkAction(action: 'resume' | 'pause' | 'close' | 'instruct' | 'flush' | 'wait') {
+  async function runWorkAction(action: 'resume' | 'pause' | 'close' | 'instruct' | 'flush' | 'wait' | 'reset-cursor') {
     if (!agentId || !selectedId) return
     setBusy(action); setError(''); setNotice('')
     try {
@@ -1145,6 +1145,10 @@ function EmployeeScreen() {
         const minutes = policy.intake_debounce_minutes || 15
         await api.agents.waitWorkItemIntake(agentId, selectedId, minutes, instructNote)
         setNotice(`Пауза перед выполнением продлена на ${minutes} мин.`)
+      }
+      if (action === 'reset-cursor') {
+        await api.agents.resetWorkItemCursor(agentId, selectedId, instructNote)
+        setNotice('Привязка к Cursor сброшена — агент отправит задачу заново.')
       }
       setInstructNote('')
       await load(agentId)
@@ -1317,6 +1321,7 @@ function EmployeeScreen() {
           <button className="primary compact" disabled={!!busy} onClick={() => void runWorkAction('resume')}>Продолжи</button>
           <button className="secondary compact" disabled={!!busy || !instructNote.trim()} onClick={() => void runWorkAction('instruct')}>Указать</button>
           <button className="secondary compact" disabled={!!busy} onClick={() => void runWorkAction('pause')}>Пауза кейса</button>
+          <button className="secondary compact" disabled={!!busy} onClick={() => void runWorkAction('reset-cursor')}>Сбросить Cursor</button>
           <button className="danger compact" disabled={!!busy} onClick={() => void runWorkAction('close')}>Закрыть</button>
         </div>
         <h3 className="work-timeline-title">Лента действий</h3>
