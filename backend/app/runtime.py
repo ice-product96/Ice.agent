@@ -33,6 +33,13 @@ from .job_result import (
     origin_chat_id,
     telegram_already_sent,
 )
+from .work_items import (
+    after_agent_run,
+    bind_work_item,
+    build_watchdog_instruction,
+    list_open_work_items,
+    watchdog_items,
+)
 from .employee import (
     AGENT_EDITABLE_SECTIONS,
     NEED_KINDS,
@@ -45,6 +52,7 @@ from .employee import (
     list_open_consultations,
     list_open_needs,
     need_json,
+    save_once_job,
 )
 from .events import EventHub
 from .integrations import (
@@ -649,20 +657,18 @@ class AgentRuntime:
                     context=context,
                     account_phone=phone,
                 )
-                job = CronJob(
-                    name=name.strip() or f"once-{agent.id}-{uuid4().hex[:12]}",
+                job = await save_once_job(
+                    db,
+                    self.scheduler,
                     agent_id=agent.id,
-                    cron="@once",
+                    name=name,
                     payload=payload,
-                    enabled=True,
+                    current_job_id=(context or {}).get("_cron_job_id"),
                 )
-                db.add(job)
-                await db.commit()
-                await db.refresh(job)
-                self.scheduler.upsert(job)
                 return {
                     "ok": True,
                     "job_id": job.id,
+                    "name": job.name,
                     "run_at": target.isoformat(),
                     "message": message,
                 }
@@ -721,7 +727,7 @@ class AgentRuntime:
             profile = await get_or_create_profile(db, agent.id)
             tools_set = set((agent.config or {}).get("tools") or [])
             if profile.autonomy_enabled or "employee" in tools_set or "autonomy" in tools_set:
-                await self._register_employee_tools(registry, db, agent, profile)
+                await self._register_employee_tools(registry, db, agent, profile, context)
 
         attach_tool_plane(registry)
         return registry
@@ -732,6 +738,7 @@ class AgentRuntime:
         db: AsyncSession,
         agent: Agent,
         profile: Any,
+        context: dict[str, Any] | None = None,
     ) -> None:
         async def need_upsert(
             title: str,
@@ -778,28 +785,29 @@ class AgentRuntime:
             await db.refresh(need)
             return {"need": need_json(need)}
 
-        async def consult_manager(question: str, context: str = "", kind: str = "decision") -> dict[str, Any]:
+        async def consult_manager(question: str, context_text: str = "", kind: str = "decision") -> dict[str, Any]:
             """Ask the manager a question via Telegram; wait for /answer on next ticks."""
             return await self.employee.create_consultation(
                 db,
                 agent,
                 question=question,
-                context=context,
+                context=context_text,
                 requires_approval=False,
                 need_kind=kind if kind in NEED_KINDS else "decision",
+                work_item_id=(context or {}).get("work_item_id"),
             )
 
-        async def request_approval(action_name: str, reason: str, context: str = "") -> dict[str, Any]:
+        async def request_approval(action_name: str, reason: str, context_text: str = "") -> dict[str, Any]:
             """Request manager approval before a dangerous action. action_name must be a tool id (e.g. sip_dial)."""
             tool_name = normalize_action_name(action_name)
             return await self.employee.create_consultation(
                 db,
                 agent,
                 question=f"Approve action `{tool_name}`: {reason}",
-                context=context,
+                context=context_text,
                 requires_approval=True,
                 action_name=tool_name,
-                need_kind="decision",
+                work_item_id=(context or {}).get("work_item_id"),
             )
 
         async def self_configure(section_key: str, content: str) -> dict[str, Any]:
@@ -870,6 +878,7 @@ class AgentRuntime:
         *,
         force: bool = False,
         reason: str = "heartbeat",
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not agent.enabled:
             return {"ok": False, "skipped": True, "reason": "agent_disabled"}
@@ -877,6 +886,16 @@ class AgentRuntime:
         prepared = await self.employee.prepare_tick_context(db, agent, profile, force=force)
         if prepared.get("skip"):
             return {"ok": True, "skipped": True, "reason": prepared.get("reason")}
+        extra = extra or {}
+        pending = await watchdog_items(db, agent.id)
+        watchdog_reason = reason in {"heartbeat", "employee_heartbeat"}
+        if not extra.get("work_item_id") and not pending and not force and watchdog_reason:
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "no_open_work",
+                "watchdog": {"count": 0, "ids": []},
+            }
         await self.employee.mark_tick(db, profile)
         origin = collect_origin_from_jobs(
             await list_agent_jobs(db, agent.id, enabled_only=False)
@@ -888,8 +907,24 @@ class AgentRuntime:
             "tick_reason": reason,
             "user_id": f"employee:{agent.id}",
             **{key: value for key, value in origin.items() if value not in (None, "")},
+            **{
+                key: extra[key]
+                for key in ("work_item_id", "reply_chat_id", "reply_phone", "chat_id")
+                if extra.get(key) not in (None, "")
+            },
         }
-        message = build_employee_tick_instruction(profile)
+        if extra.get("work_item_id"):
+            context["work_item_id"] = extra["work_item_id"]
+        elif pending:
+            context["work_item_id"] = pending[0].id
+        if pending:
+            message = build_watchdog_instruction(pending)
+        else:
+            message = build_employee_tick_instruction(profile)
+        if extra.get("instruction"):
+            message = f"{extra['instruction']}\n\n{message}"
+        elif extra.get("message") and reason in {"consult_resolved", "manual"}:
+            message = f"{extra['message']}\n\n{message}"
         result = await self.run(db, agent, message, context)
         try:
             await self.employee.maybe_send_daily_digest(db, agent, profile)
@@ -908,6 +943,7 @@ class AgentRuntime:
             "origin_already_sent": bool(context.get("_origin_already_sent")),
             "reply_phone": context.get("reply_phone") or context.get("phone"),
             "reply_chat_id": origin_chat_id(context),
+            "watchdog": {"count": len(pending), "ids": [item.id for item in pending]},
         }
 
     async def run(
@@ -936,6 +972,7 @@ class AgentRuntime:
             raise RuntimeError("Assigned LLM profile has no API key")
         context = context or {}
         context["_user_message"] = message
+        await bind_work_item(db, agent, context, message)
         await self.events.publish("agent.started", {"agent_id": agent.id})
         user_id = str(context.get("user_id") or context.get("sender_id") or context.get("chat_id") or "global")
         memories: list[dict[str, Any]] = []
@@ -1057,6 +1094,7 @@ class AgentRuntime:
                     await list_agent_jobs(db, agent.id),
                     await list_open_needs(db, agent.id),
                     await list_open_consultations(db, agent.id),
+                    await list_open_work_items(db, agent.id),
                 )
             is_employee_tick = bool(
                 context.get("employee_tick")
@@ -1202,6 +1240,7 @@ class AgentRuntime:
                         message_at=as_utc(None),
                         text=f"{call['tool']}: {call['status']}",
                         metadata_json=safe_call,
+                        work_item_id=context.get("work_item_id"),
                     )
                 )
                 await self.events.publish(
@@ -1255,6 +1294,7 @@ class AgentRuntime:
                                     "recipients": len(sent_reports),
                                     "excluded_sender": bool(exclude),
                                 },
+                                work_item_id=context.get("work_item_id"),
                             )
                         )
                         await db.commit()
@@ -1322,6 +1362,7 @@ class AgentRuntime:
                         message_at=outbound_at,
                         text=str(context.get("_suppress_telegram_reason") or ""),
                         metadata_json={"source": "telegram", "suppressed": True},
+                        work_item_id=context.get("work_item_id"),
                     )
                 )
                 await db.commit()
@@ -1337,6 +1378,7 @@ class AgentRuntime:
                         message_at=outbound_at,
                         text=result,
                         metadata_json={"source": context.get("source", "runtime")},
+                        work_item_id=context.get("work_item_id"),
                     )
                 )
                 await db.commit()
@@ -1345,6 +1387,9 @@ class AgentRuntime:
             context["_origin_already_sent"] = telegram_already_sent(registry.audit)
             if cursor_finished_in_audit(registry.audit) and not suppressed:
                 context["_deliver_origin_reply"] = True
+            await after_agent_run(
+                db, agent, context, result, registry.audit, employee=self.employee
+            )
             return result
         finally:
             close = getattr(client, "aclose", None)

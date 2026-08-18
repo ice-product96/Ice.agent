@@ -67,8 +67,10 @@ class CronManager:
     ) -> None:
         outcome: dict[str, Any]
         try:
-            raw = await self.callback(agent_id, payload)
-            outcome = humanize_job_outcome(raw, payload=payload)
+            run_payload = dict(payload or {})
+            run_payload["_cron_job_id"] = job_id
+            raw = await self.callback(agent_id, run_payload)
+            outcome = humanize_job_outcome(raw, payload=run_payload)
         except Exception as exc:
             logger.exception("Scheduled job id=%s failed", job_id)
             outcome = humanize_job_outcome(None, payload=payload, error=exc)

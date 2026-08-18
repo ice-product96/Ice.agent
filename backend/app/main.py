@@ -194,44 +194,55 @@ async def lifespan(app: FastAPI):
                 return await send_origin_reply(telegram, phone, chat_id, body)
 
             kind = str(payload.get("kind") or "")
-            if kind == "employee_tick" or payload.get("source") in {
-                "employee_heartbeat",
-                "consult_resolved",
-                "employee_tick",
-            }:
-                tick_result = await runtime.tick(
-                    db,
-                    agent,
-                    force=bool(payload.get("force")),
-                    reason=str(payload.get("source") or kind or "heartbeat"),
-                )
-                if tick_result.get("deliver_origin"):
-                    delivery = await deliver_result(
-                        tick_result.get("result"),
-                        already_sent=bool(tick_result.get("origin_already_sent")),
-                        extra={
-                            "reply_phone": tick_result.get("reply_phone"),
-                            "reply_chat_id": tick_result.get("reply_chat_id"),
-                        },
+            try:
+                if kind == "employee_tick" or payload.get("source") in {
+                    "employee_heartbeat",
+                    "consult_resolved",
+                    "employee_tick",
+                }:
+                    tick_result = await runtime.tick(
+                        db,
+                        agent,
+                        force=bool(payload.get("force")),
+                        reason=str(payload.get("source") or kind or "heartbeat"),
+                        extra=payload,
                     )
-                    tick_result["delivery"] = delivery
-                    tick_result["notified"] = bool(delivery.get("sent"))
-                return tick_result
-            result = await runtime.run(db, agent, str(payload.get("message", "")), payload)
-            outcome = {
-                "ok": True,
-                "result": result,
-                "notified": False,
-                "notes": list(payload.get("_job_notes") or []),
-            }
-            if payload.get("_deliver_origin_reply"):
-                delivery = await deliver_result(
-                    result,
-                    already_sent=bool(payload.get("_origin_already_sent")),
-                )
-                outcome["delivery"] = delivery
-                outcome["notified"] = bool(delivery.get("sent"))
-            return outcome
+                    if tick_result.get("deliver_origin"):
+                        delivery = await deliver_result(
+                            tick_result.get("result"),
+                            already_sent=bool(tick_result.get("origin_already_sent")),
+                            extra={
+                                "reply_phone": tick_result.get("reply_phone"),
+                                "reply_chat_id": tick_result.get("reply_chat_id"),
+                            },
+                        )
+                        tick_result["delivery"] = delivery
+                        tick_result["notified"] = bool(delivery.get("sent"))
+                    return tick_result
+                result = await runtime.run(db, agent, str(payload.get("message", "")), payload)
+                outcome = {
+                    "ok": True,
+                    "result": result,
+                    "notified": False,
+                    "notes": list(payload.get("_job_notes") or []),
+                }
+                if payload.get("_deliver_origin_reply"):
+                    delivery = await deliver_result(
+                        result,
+                        already_sent=bool(payload.get("_origin_already_sent")),
+                    )
+                    outcome["delivery"] = delivery
+                    outcome["notified"] = bool(delivery.get("sent"))
+                return outcome
+            except Exception as exc:
+                try:
+                    await db.rollback()
+                except Exception:
+                    logger.exception("rollback after scheduled run failed")
+                from .work_items import handle_run_failure
+
+                await handle_run_failure(db, agent, payload, exc, runtime.employee)
+                raise
 
     scheduler = CronManager(SessionLocal, run_scheduled)
     runtime.bind_scheduler(scheduler)

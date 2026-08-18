@@ -20,6 +20,7 @@ SKIP_REASONS = {
     "budget_exhausted": "Исчерпан дневной лимит рабочих тиков.",
     "off_hours": "Вне рабочих часов — тик пропущен.",
     "ok": "Рабочий тик выполнен.",
+    "no_open_work": "Открытых кейсов нет — сторож завершился без эскалации.",
 }
 
 PUBLIC_RESULT_KEYS = ("ok", "status", "title", "summary", "details", "ran_at")
@@ -69,6 +70,7 @@ def build_followup_payload(
         "sender_username": source.get("sender_username"),
         "is_admin": bool(source.get("is_admin")),
         "message_id": source.get("message_id"),
+        "work_item_id": source.get("work_item_id"),
     }
 
 
@@ -239,6 +241,16 @@ def public_job_result(value: Any) -> dict[str, Any] | None:
     return result
 
 
+def _friendly_job_error(error: BaseException) -> str:
+    text = exception_text(error)
+    lower = text.lower()
+    if "pendingrollback" in lower:
+        return "Сбой записи в базу во время запуска. Повторная задача будет с другим именем."
+    if "uniqueviolation" in lower or "duplicate key" in lower or "cron_jobs_name_key" in lower:
+        return "Имя задачи в расписании уже занято. Повтор будет поставлен под новым именем."
+    return _clip(text, 400)
+
+
 def humanize_job_outcome(
     raw: Any,
     *,
@@ -252,7 +264,7 @@ def humanize_job_outcome(
             "ok": False,
             "status": "error",
             "title": "Ошибка",
-            "summary": _clip(exception_text(error), 400),
+            "summary": _friendly_job_error(error),
             "details": [],
             "ran_at": ran_at,
         }
@@ -267,6 +279,25 @@ def humanize_job_outcome(
             "title": "Пропущено",
             "summary": SKIP_REASONS.get(reason, _clip(f"Пропущено: {reason}")),
             "details": details[:8],
+            "ran_at": ran_at,
+        }
+
+    if str(payload.get("source") or "") == "employee_heartbeat" and not (
+        isinstance(raw, dict) and raw.get("deliver_origin")
+    ):
+        watchdog = raw.get("watchdog") if isinstance(raw, dict) else None
+        count = watchdog.get("count") if isinstance(watchdog, dict) else None
+        summary = (
+            f"Проверено открытых кейсов: {count}."
+            if count is not None
+            else "Сторожевой тик без эскалации руководителю."
+        )
+        return {
+            "ok": True,
+            "status": "completed",
+            "title": "Сторож",
+            "summary": summary,
+            "details": [],
             "ran_at": ran_at,
         }
 

@@ -415,6 +415,7 @@ class ConversationContextService:
             message_at=as_utc(at),
             text=text,
             metadata_json={"source": context.get("source", "runtime"), "delivery": "generated"},
+            work_item_id=context.get("work_item_id"),
         )
         db.add(log)
         await db.flush()

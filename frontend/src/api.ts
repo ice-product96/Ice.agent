@@ -2,7 +2,7 @@ import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
   Conversation, ConversationDetail, Consultation, EmployeePolicy, EmployeePolicyCatalog, EmployeeProfile, EmployeeState,
   LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
-  RuntimeSettings, SipAccount, SipCall, TelegramAccount,
+  RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api/v1'
@@ -85,9 +85,20 @@ export const api = {
     pauseEmployee: (id: string, paused = true) =>
       request<{ ok: boolean; paused: boolean }>(`/agents/${id}/employee/pause?paused=${paused ? 'true' : 'false'}`, { method: 'POST' }),
     tickEmployee: (id: string) => request<{ ok: boolean; skipped?: boolean; reason?: string; result?: string }>(`/agents/${id}/employee/tick`, { method: 'POST' }),
+    workItems: (id: string, status = 'open') =>
+      request<{ items: WorkItem[]; counts: WorkItemCounts }>(`/agents/${id}/work-items${qs({ status, limit: 80 })}`),
+    workItem: (id: string, workItemId: string) => request<WorkItem>(`/agents/${id}/work-items/${workItemId}`),
+    resumeWorkItem: (id: string, workItemId: string, note = '') =>
+      request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/resume`, { method: 'POST', ...body({ note }) }),
+    pauseWorkItem: (id: string, workItemId: string, note = '') =>
+      request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/pause`, { method: 'POST', ...body({ note }) }),
+    closeWorkItem: (id: string, workItemId: string, note = '') =>
+      request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/close`, { method: 'POST', ...body({ note }) }),
+    instructWorkItem: (id: string, workItemId: string, note: string) =>
+      request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/instruct`, { method: 'POST', ...body({ note }) }),
   },
   employees: {
-    list: () => request<{ items: EmployeeProfile[]; open_consultations: number; paused_agents: number; autonomous_agents: number }>('/employees'),
+    list: () => request<{ items: EmployeeProfile[]; open_consultations: number; paused_agents: number; autonomous_agents: number; failed_work_items?: number; waiting_manager?: number }>('/employees'),
     policyCatalog: () => request<EmployeePolicyCatalog>('/employees/policy-catalog'),
   },
   consultations: {

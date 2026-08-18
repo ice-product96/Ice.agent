@@ -146,6 +146,8 @@ export interface CronJob {
   next_run_at?: string
   status?: Status
   last_result?: CronJobResult | null
+  kind?: 'cron' | 'heartbeat' | 'followup' | string
+  work_item_id?: ID | number | null
 }
 
 export interface LogEntry {
@@ -255,6 +257,8 @@ export interface Dashboard {
     mcp_servers?: number
     open_consultations?: number
     autonomous_agents?: number
+    failed_work_items?: number
+    waiting_manager?: number
     [key: string]: number | undefined
   }
 }
@@ -352,9 +356,56 @@ export interface Consultation {
   status: string
   requires_approval: boolean
   action_name?: string | null
+  work_item_id?: ID | number | null
   answer_text?: string | null
   answered_by?: string | null
   answered_at?: string | null
+}
+
+export interface WorkItemEvent {
+  id: ID
+  created_at?: string | null
+  kind: string
+  title: string
+  detail?: string
+  payload?: Record<string, unknown>
+}
+
+export interface WorkItem {
+  id: ID
+  agent_id: ID
+  title: string
+  goal?: string
+  status: string
+  status_label?: string
+  next_action?: string
+  wait_owner?: string
+  wait_until?: string | null
+  source?: string
+  chat_id?: string | null
+  reply_phone?: string | null
+  sender_id?: string | null
+  sender_username?: string | null
+  paused?: boolean
+  retry_count?: number
+  last_error?: string | null
+  consultation_id?: ID | number | null
+  cron_job_id?: ID | number | null
+  created_at?: string | null
+  updated_at?: string | null
+  events?: WorkItemEvent[]
+}
+
+export interface WorkItemCounts {
+  open?: number
+  in_progress?: number
+  waiting_external?: number
+  waiting_customer?: number
+  waiting_manager?: number
+  failed?: number
+  paused?: number
+  done?: number
+  actionable?: number
 }
 
 export interface EmployeeState {
@@ -366,6 +417,8 @@ export interface EmployeeState {
   jobs?: CronJob[]
   needs: EmployeeNeed[]
   consultations: Consultation[]
+  work_items?: WorkItem[]
+  work_item_counts?: WorkItemCounts
 }
 
 export interface Paginated<T> {

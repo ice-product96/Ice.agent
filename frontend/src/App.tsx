@@ -3,7 +3,7 @@ import {
   Activity, Bot, BrainCircuit, Briefcase, CalendarClock, CheckCircle2, ChevronRight, CircleAlert,
   Clock3, Database, FileText, Globe2, KeyRound, LayoutDashboard, Link2, LoaderCircle, LogOut, Menu,
   MessageCircle, MessagesSquare, Moon, Phone, PhoneCall, PhoneOff, Play, Plus, RefreshCw, Search, ServerCog, Settings, ShieldCheck,
-  Sparkles, Trash2, Users, Wifi, WifiOff, X, Zap,
+  Sparkles, Trash2, Users, Wifi, WifiOff, X, Zap, Inbox,
 } from 'lucide-react'
 import { api, openLiveSocket } from './api'
 import { agentModelPresets, profileModelPresets } from './llmModels'
@@ -11,7 +11,7 @@ import type {
   AdminSettings, Agent, AgentTask, Consultation, CronJob, Dashboard, EmployeeState, LogEntry, McpServer,
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, RuntimeSettings,
   EmployeePolicy, EmployeePolicyCatalog,
-  SipAccount, SipCall, Status, TelegramAccount,
+  SipAccount, SipCall, Status, TelegramAccount, WorkItem,
 } from './types'
 
 type Page = 'dashboard' | 'agents' | 'connections' | 'runtime' | 'telegram' | 'sip' | 'calls' | 'conversations' | 'employee' | 'memory' | 'mcp' | 'cron' | 'settings' | 'logs' | 'tasks'
@@ -38,7 +38,7 @@ const nav: { id: Page; label: string; icon: Icon; group?: string }[] = [
 const title: Record<Page, [string, string]> = {
   dashboard: ['Центр управления', 'Статус рабочей области Ice.agent в реальном времени'],
   agents: ['Агенты', 'Настройка интеллекта, подключений и возможностей'],
-  employee: ['Сотрудник', 'Автономия, планы, потребности и консультации с руководителем'],
+  employee: ['Сотрудник', 'Очередь кейсов, контроль действий и консультации'],
   connections: ['Подключения и провайдеры', 'Управление учётными данными LLM и эндпоинтами моделей'],
   telegram: ['Аккаунты Telegram', 'Управление подключёнными пользовательскими и бот-сессиями'],
   sip: ['SIP-аккаунты', 'Регистрация в АТС и привязка к агентам для голосовых звонков'],
@@ -117,6 +117,8 @@ function Shell({ page, setPage, logout, children }: {
   page: Page; setPage: (page: Page) => void; logout: () => void; children: ReactNode
 }) {
   const [open, setOpen] = useState(false)
+  const overview = useLoad(api.employees.list, [])
+  const badge = (overview.data?.failed_work_items || 0) + (overview.data?.waiting_manager || 0)
   return <div className="app-shell">
     <aside className={`sidebar ${open ? 'open' : ''}`}>
       <div className="brand"><span className="brand-mark"><Sparkles size={19}/></span><span>Ice<span>.agent</span></span></div>
@@ -127,7 +129,9 @@ function Shell({ page, setPage, logout, children }: {
           return <div key={item.id}>
             {item.group && <div className={`nav-group ${i ? 'spaced' : ''}`}>{item.group}</div>}
             <button className={`nav-item ${page === item.id ? 'active' : ''}`} onClick={() => { setPage(item.id); setOpen(false) }}>
-              <Icon size={18}/><span>{item.label}</span>{page === item.id && <span className="nav-glow"/>}
+              <Icon size={18}/><span>{item.label}</span>
+              {item.id === 'employee' && badge > 0 && <span className="nav-badge">{badge}</span>}
+              {page === item.id && <span className="nav-glow"/>}
             </button>
           </div>
         })}
@@ -996,6 +1000,10 @@ function EmployeeScreen() {
   const [error, setError] = useState('')
   const [busy, setBusy] = useState('')
   const [answerDrafts, setAnswerDrafts] = useState<Record<string, string>>({})
+  const [inboxFilter, setInboxFilter] = useState<'actionable' | 'in_progress' | 'waiting_external' | 'waiting_customer' | 'waiting_manager' | 'failed' | 'all'>('actionable')
+  const [selectedId, setSelectedId] = useState('')
+  const [instructNote, setInstructNote] = useState('')
+  const [selected, setSelected] = useState<WorkItem | null>(null)
   const [sections, setSections] = useState<Record<string, string>>({})
   const [mission, setMission] = useState('')
   const [roleTitle, setRoleTitle] = useState('')
@@ -1063,6 +1071,20 @@ function EmployeeScreen() {
 
   useEffect(() => { if (agentId) void load(agentId) }, [agentId])
 
+  useEffect(() => {
+    if (!agentId || !selectedId) {
+      setSelected(null)
+      return
+    }
+    let cancelled = false
+    api.agents.workItem(agentId, selectedId).then(item => {
+      if (!cancelled) setSelected(item)
+    }).catch(() => {
+      if (!cancelled) setSelected(null)
+    })
+    return () => { cancelled = true }
+  }, [agentId, selectedId, state?.work_items])
+
   async function saveProfile() {
     if (!agentId) return
     setBusy('save'); setError('')
@@ -1087,11 +1109,37 @@ function EmployeeScreen() {
   }
 
   const openConsults = consults.data?.items || []
+  const workItems = state?.work_items || []
+  const counts = state?.work_item_counts || {}
+  const inboxItems = workItems.filter(item => {
+    if (inboxFilter === 'all') return true
+    if (inboxFilter === 'actionable') return ['failed', 'waiting_manager', 'open', 'in_progress'].includes(item.status)
+    if (inboxFilter === 'in_progress') return ['open', 'in_progress'].includes(item.status)
+    return item.status === inboxFilter
+  })
+  const staffJobs = (state?.jobs || []).filter(job => (job.kind || 'cron') === 'cron')
+  const heartbeatJob = (state?.jobs || []).find(job => job.kind === 'heartbeat')
+
+  async function runWorkAction(action: 'resume' | 'pause' | 'close' | 'instruct') {
+    if (!agentId || !selectedId) return
+    setBusy(action); setError('')
+    try {
+      if (action === 'resume') await api.agents.resumeWorkItem(agentId, selectedId, instructNote)
+      if (action === 'pause') await api.agents.pauseWorkItem(agentId, selectedId, instructNote)
+      if (action === 'close') await api.agents.closeWorkItem(agentId, selectedId, instructNote)
+      if (action === 'instruct') await api.agents.instructWorkItem(agentId, selectedId, instructNote)
+      setInstructNote('')
+      await load(agentId)
+      await overview.refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Действие не удалось')
+    } finally { setBusy('') }
+  }
 
   return <>
     <SectionHead
       title="Автономный сотрудник"
-      text={`Автономных: ${overview.data?.autonomous_agents ?? 0} · на паузе: ${overview.data?.paused_agents ?? 0} · открытых консультаций: ${overview.data?.open_consultations ?? openConsults.length}`}
+      text={`Автономных: ${overview.data?.autonomous_agents ?? 0} · ошибок: ${overview.data?.failed_work_items ?? counts.failed ?? 0} · ждут вас: ${overview.data?.waiting_manager ?? counts.waiting_manager ?? 0}`}
       action={<div className="head-actions">
         <select value={agentId} onChange={e => setAgentId(e.target.value)} aria-label="Агент">
           <option value="">Выберите агента</option>
@@ -1101,9 +1149,9 @@ function EmployeeScreen() {
       </div>}
     />
     {(error || agents.error || overview.error || consults.error) && <Alert message={error || agents.error || overview.error || consults.error}/>}
-    {loading && !state ? <Loading/> : !agentId ? <Empty icon={Briefcase} title="Выберите агента" text="Включите автономию и задайте миссию — сотрудник начнёт жить по heartbeat."/> : state && <>
-      <section className="panel">
-        <SectionHead title={`${state.agent_name}`} text={`Тиков сегодня: ${state.profile.ticks_used_today}/${state.profile.budget_ticks_per_day} · последний тик: ${state.profile.last_tick_at ? new Date(state.profile.last_tick_at).toLocaleString() : '—'}`}
+    {loading && !state ? <Loading/> : !agentId ? <Empty icon={Briefcase} title="Выберите агента" text="Включите автономию — входящие задачи станут кейсами, heartbeat будет их сторожить."/> : state && <>
+      <section className="panel work-inbox">
+        <SectionHead title="Inbox кейсов" text="Единица работы — кейс, не строка cron. Сторож смотрит открытые, а не пишет журнал тика."
           action={<div className="head-actions">
             <button className="secondary" disabled={!!busy} onClick={async () => {
               setBusy('pause')
@@ -1112,7 +1160,7 @@ function EmployeeScreen() {
                 await load(agentId); await overview.refresh()
               } catch (err) { setError(err instanceof Error ? err.message : 'Пауза не удалась') }
               finally { setBusy('') }
-            }}>{state.profile.paused ? 'Снять паузу' : 'Пауза'}</button>
+            }}>{state.profile.paused ? 'Снять паузу агента' : 'Пауза агента'}</button>
             <button className="primary" disabled={!!busy} onClick={async () => {
               setBusy('tick')
               try { await api.agents.tickEmployee(agentId); await load(agentId) }
@@ -1121,6 +1169,61 @@ function EmployeeScreen() {
             }}>{busy === 'tick' ? <LoaderCircle className="spin" size={15}/> : <Play size={15}/>}Force tick</button>
           </div>}
         />
+        {heartbeatJob && <p className="heartbeat-health">Сторож {heartbeatJob.enabled ? 'включён' : 'выключен'} · {heartbeatJob.schedule}{heartbeatJob.last_run_at ? ` · проверка ${new Date(heartbeatJob.last_run_at).toLocaleString('ru-RU')}` : ''}</p>}
+        <div className="chip-row">
+          {([
+            ['actionable', 'Нужно действие', counts.actionable],
+            ['in_progress', 'В работе', (counts.in_progress || 0) + (counts.open || 0)],
+            ['waiting_external', 'Жду Cursor', counts.waiting_external],
+            ['waiting_customer', 'Жду клиента', counts.waiting_customer],
+            ['waiting_manager', 'Жду меня', counts.waiting_manager],
+            ['failed', 'Ошибки', counts.failed],
+            ['all', 'Все', workItems.length],
+          ] as const).map(([id, label, count]) => (
+            <button type="button" key={id} className={`chip ${inboxFilter === id ? 'on' : ''}`} onClick={() => setInboxFilter(id)}>
+              {label} · {count || 0}
+            </button>
+          ))}
+        </div>
+        {inboxItems.length === 0 ? <Empty icon={Inbox} title="Кейсов в этом фильтре нет" text="Новая заявка из Telegram создаст кейс. Heartbeat не должен плодить задания."/> :
+          <div className="list-panel">{inboxItems.map(item => (
+            <button type="button" className={`server-row work-row ${String(item.id) === selectedId ? 'selected' : ''} ${item.status === 'failed' ? 'failed' : ''}`} key={item.id} onClick={() => setSelectedId(String(item.id))}>
+              <span className={`chip status-${item.status}`}>{item.status_label || item.status}</span>
+              <div className="grow">
+                <strong>#{item.id} · {item.title}</strong>
+                <small>{item.next_action || 'нет next_action'}{item.wait_until ? ` · до ${new Date(item.wait_until).toLocaleString('ru-RU')}` : ''}{item.last_error ? ` · ${item.last_error}` : ''}</small>
+              </div>
+            </button>
+          ))}</div>}
+      </section>
+
+      {selected && <section className="panel work-card">
+        <SectionHead title={`Кейс #${selected.id}`} text={`${selected.status_label || selected.status} · ждёт ${selected.wait_owner || '—'}${selected.wait_until ? ` с ${new Date(selected.wait_until).toLocaleString('ru-RU')}` : ''}`}/>
+        <p className="work-goal">{selected.goal || selected.title}</p>
+        <small>Клиент {selected.chat_id || '—'}{selected.sender_username ? ` · @${selected.sender_username}` : ''}{selected.reply_phone ? ` · ${selected.reply_phone}` : ''}</small>
+        {selected.last_error && <Alert message={selected.last_error}/>}
+        <textarea rows={2} style={{ marginTop: 12, width: '100%' }} placeholder="Указание: продолжи / напиши клиенту / закрой…" value={instructNote} onChange={e => setInstructNote(e.target.value)}/>
+        <div className="head-actions" style={{ marginTop: 8 }}>
+          <button className="primary compact" disabled={!!busy} onClick={() => void runWorkAction('resume')}>Продолжи</button>
+          <button className="secondary compact" disabled={!!busy || !instructNote.trim()} onClick={() => void runWorkAction('instruct')}>Указать</button>
+          <button className="secondary compact" disabled={!!busy} onClick={() => void runWorkAction('pause')}>Пауза кейса</button>
+          <button className="danger compact" disabled={!!busy} onClick={() => void runWorkAction('close')}>Закрыть</button>
+        </div>
+        <h3 className="work-timeline-title">Лента действий</h3>
+        <div className="work-timeline">
+          {(selected.events || []).length === 0 ? <p className="transcript-empty">Пока нет событий по кейсу.</p> :
+            (selected.events || []).map(event => (
+              <div className={`work-event kind-${event.kind}`} key={event.id}>
+                <strong>{event.title}</strong>
+                <small>{event.created_at ? new Date(event.created_at).toLocaleString('ru-RU') : ''} · {event.kind}</small>
+                {event.detail && <p>{event.detail}</p>}
+              </div>
+            ))}
+        </div>
+      </section>}
+
+      <section className="panel">
+        <SectionHead title={`${state.agent_name}`} text={`Тиков сегодня: ${state.profile.ticks_used_today}/${state.profile.budget_ticks_per_day} · последний тик: ${state.profile.last_tick_at ? new Date(state.profile.last_tick_at).toLocaleString() : '—'}`}/>
         <div className="form-grid">
           <div className="toggle-box"><Toggle label="Автономия включена" checked={autonomy} onChange={setAutonomy}/></div>
           <Field label="Должность"><input value={roleTitle} onChange={e => setRoleTitle(e.target.value)} placeholder="Менеджер по продажам"/></Field>
@@ -1178,9 +1281,9 @@ function EmployeeScreen() {
       </section>
 
       <section className="panel">
-        <SectionHead title={`Расписание (${(state.jobs || []).filter(j => cronJobStatus(j) === 'active').length} активных)`} text="Штатное расписание агента. Разовые после запуска — выполненные, не пауза."/>
-        {(state.jobs || []).length === 0 ? <Empty icon={CalendarClock} title="Задач в расписании нет" text="Heartbeat и разовые follow-up (например проверка Cursor) появятся здесь."/> :
-          <div className="list-panel">{(state.jobs || []).map(job => <div className="server-row cron-row" key={job.id}>
+        <SectionHead title={`Штатное расписание (${staffJobs.filter(j => cronJobStatus(j) === 'active').length} активных)`} text="Только настоящие cron. Heartbeat и follow-up Cursor спрятаны внутрь кейса."/>
+        {staffJobs.length === 0 ? <Empty icon={CalendarClock} title="Штатных заданий нет" text="Разовые проверки Cursor больше не засоряют этот список."/> :
+          <div className="list-panel">{staffJobs.map(job => <div className="server-row cron-row" key={job.id}>
             <span className="chip">{job.run_once_at ? 'once' : 'cron'}</span>
             <div className="grow">
               <strong>{job.name}</strong>
@@ -1206,7 +1309,7 @@ function EmployeeScreen() {
           <div className="list-panel">{openConsults.map((item: Consultation) => <div className="server-row" key={item.id} style={{ alignItems: 'flex-start', paddingTop: 12, paddingBottom: 12 }}>
             <span className="chip">{item.requires_approval ? 'approval' : 'consult'}</span>
             <div className="grow">
-              <strong>#{item.id} · агент {item.agent_id}</strong>
+              <strong>#{item.id}{item.work_item_id ? ` · кейс #${item.work_item_id}` : ''} · агент {item.agent_id}</strong>
               <small>{item.question}</small>
               {item.context && <small>{item.context.slice(0, 240)}</small>}
               <textarea rows={2} style={{ marginTop: 8, width: '100%' }} placeholder="Ответ руководителя…" value={answerDrafts[item.id] || ''} onChange={e => setAnswerDrafts(d => ({ ...d, [item.id]: e.target.value }))}/>
@@ -1405,7 +1508,7 @@ const cronFilterLabel: Record<'active' | 'completed' | 'paused' | 'all', string>
 }
 
 function CronScreen() {
-  const jobs = useLoad(api.cron.list, []); const agents = useLoad(api.agents.list, []); const data = jobs.data || []
+  const jobs = useLoad(api.cron.list, []); const agents = useLoad(api.agents.list, []); const data = (jobs.data || []).filter(job => job.kind !== 'heartbeat' && job.kind !== 'followup')
   const [editing, setEditing] = useState<Partial<CronJob> | null>(null); const [deleting, setDeleting] = useState<CronJob | null>(null)
   const [filter, setFilter] = useState<'active' | 'completed' | 'paused' | 'all'>('active')
   if (jobs.loading || agents.loading) return <Loading/>

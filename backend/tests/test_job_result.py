@@ -27,6 +27,20 @@ def test_humanize_skipped_tick() -> None:
     assert "рабочих часов" in outcome["summary"]
 
 
+def test_humanize_hides_duplicate_cron_sql() -> None:
+    outcome = humanize_job_outcome(
+        None,
+        error=RuntimeError(
+            'PendingRollbackError: rolled back due to UniqueViolationError: '
+            'duplicate key value violates unique constraint "cron_jobs_name_key"'
+        ),
+    )
+    assert outcome["status"] == "error"
+    assert "PendingRollback" not in outcome["summary"]
+    assert "asyncpg" not in outcome["summary"]
+    assert "Сбой записи" in outcome["summary"]
+
+
 def test_humanize_error() -> None:
     outcome = humanize_job_outcome(None, error=RuntimeError("MCP session terminated"))
     assert outcome["ok"] is False
@@ -166,3 +180,44 @@ def test_cron_json_exposes_readable_last_result() -> None:
     assert data["last_result"]["title"] == "Выполнено"
     assert data["last_result"]["summary"] == "Cursor закончил работу."
     assert "raw_json" not in data["last_result"]
+    assert data["kind"] == "cron"
+
+
+def test_cron_json_hides_heartbeat_last_result() -> None:
+    job = type(
+        "Job",
+        (),
+        {
+            "id": 3,
+            "name": "employee-heartbeat-1",
+            "agent_id": 1,
+            "cron": "*/15 * * * *",
+            "enabled": True,
+            "last_run_at": None,
+            "created_at": None,
+            "updated_at": None,
+            "payload": {
+                "source": "employee_heartbeat",
+                "kind": "employee_tick",
+                "last_result": {
+                    "ok": True,
+                    "status": "completed",
+                    "title": "Сторож",
+                    "summary": "Проверено открытых кейсов: 0.",
+                },
+            },
+        },
+    )()
+    data = cron_json(job)
+    assert data["kind"] == "heartbeat"
+    assert data["last_result"] is None
+
+
+def test_humanize_heartbeat_is_watchdog_not_customer_result() -> None:
+    outcome = humanize_job_outcome(
+        {"ok": True, "result": "журнал тика", "watchdog": {"count": 2}},
+        payload={"source": "employee_heartbeat"},
+    )
+    assert outcome["title"] == "Сторож"
+    assert "2" in outcome["summary"]
+    assert "журнал тика" not in outcome["summary"]

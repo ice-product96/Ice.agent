@@ -35,7 +35,7 @@ def test_consult_command_parse() -> None:
     assert match.group(3).strip() == "yes, do it"
 
 
-def test_employee_context_uses_schedule_not_plans() -> None:
+def test_employee_context_uses_work_items_not_followup_cron() -> None:
     profile = SimpleNamespace(
         role_title="PM",
         mission="LAVVE",
@@ -54,14 +54,23 @@ def test_employee_context_uses_schedule_not_plans() -> None:
         payload={
             "run_once_at": "2026-08-17T13:00:00+00:00",
             "message": "cursorremote_check LAVVE",
+            "work_item_id": 7,
             "last_result": {"title": "Выполнено", "summary": "Cursor закончил работу."},
         },
     )
-    block = build_employee_context_block(profile, [job], [], [])
-    assert "Расписание" in block
-    assert "cursorremote_check LAVVE" in block
-    assert "итог: Cursor закончил работу" in block
-    assert "hour/day/week/month" in block
+    work = SimpleNamespace(
+        id=7,
+        title="Собрать ветку LAVVE",
+        status="waiting_external",
+        next_action="Проверить Cursor",
+        wait_owner="external",
+        last_error=None,
+        wait_until=None,
+    )
+    block = build_employee_context_block(profile, [job], [], [], [work])
+    assert "Открытые кейсы" in block
+    assert "#7" in block
+    assert "cursorremote_check LAVVE" not in block
     assert "Активные планы" not in block
 
 
@@ -71,6 +80,7 @@ def test_tick_instruction_uses_scheduler() -> None:
     assert "cursorremote_check" in text
     assert "планы (час/день" not in text
     assert "новый schedule_self не ставь" in text
+    assert "результат тика" in text
 
 
 def test_once_job_status_is_completed_after_run() -> None:

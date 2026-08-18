@@ -230,6 +230,9 @@ class MessageLog(Base):
     message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     text: Mapped[str] = mapped_column(Text)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    work_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("work_items.id", ondelete="SET NULL"), index=True
+    )
 
 
 class ConversationState(TimestampMixin, Base):
@@ -322,6 +325,9 @@ class Consultation(TimestampMixin, Base):
     __tablename__ = "consultations"
     id: Mapped[int] = mapped_column(primary_key=True)
     agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    work_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("work_items.id", ondelete="SET NULL"), index=True
+    )
     question: Mapped[str] = mapped_column(Text, default="")
     context: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(24), default="open", index=True)
@@ -345,6 +351,49 @@ class EmployeeNeed(TimestampMixin, Base):
     consultation_id: Mapped[int | None] = mapped_column(
         ForeignKey("consultations.id", ondelete="SET NULL"), index=True
     )
+
+
+class WorkItem(TimestampMixin, Base):
+    __tablename__ = "work_items"
+    __table_args__ = (
+        Index("ix_work_items_agent_status", "agent_id", "status"),
+        Index("ix_work_items_agent_chat", "agent_id", "chat_id"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(300), default="")
+    goal: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="open", index=True)
+    next_action: Mapped[str] = mapped_column(Text, default="")
+    wait_owner: Mapped[str] = mapped_column(String(24), default="self")
+    wait_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(32), default="telegram")
+    chat_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    reply_phone: Mapped[str | None] = mapped_column(String(32))
+    sender_id: Mapped[str | None] = mapped_column(String(64))
+    sender_username: Mapped[str | None] = mapped_column(String(120))
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    project_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    customer_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    consultation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("consultations.id", ondelete="SET NULL"), index=True
+    )
+    cron_job_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class WorkItemEvent(Base):
+    __tablename__ = "work_item_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    work_item_id: Mapped[int] = mapped_column(ForeignKey("work_items.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(32), default="note", index=True)
+    title: Mapped[str] = mapped_column(String(300), default="")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 settings = get_settings()
@@ -382,6 +431,8 @@ async def create_schema() -> None:
             "ALTER TABLE conversation_states ADD COLUMN IF NOT EXISTS thread_id VARCHAR(64) DEFAULT ''",
             "ALTER TABLE conversation_states ADD COLUMN IF NOT EXISTS project_id VARCHAR(120)",
             "ALTER TABLE conversation_states ADD COLUMN IF NOT EXISTS customer_id VARCHAR(120)",
+            "ALTER TABLE consultations ADD COLUMN IF NOT EXISTS work_item_id INTEGER",
+            "ALTER TABLE message_logs ADD COLUMN IF NOT EXISTS work_item_id INTEGER",
         ):
             try:
                 async with connection.begin_nested():

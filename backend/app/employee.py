@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from .timezones import normalize_timezone, zoneinfo as resolve_zoneinfo
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import (
@@ -35,6 +36,18 @@ HORIZONS = ("hour", "day", "week", "month")
 NEED_KINDS = ("info", "access", "decision", "resource", "rest")
 
 HEARTBEAT_JOB_PREFIX = "employee-heartbeat-"
+ORIGIN_PAYLOAD_KEYS = (
+    "reply_to_chat",
+    "reply_chat_id",
+    "reply_phone",
+    "chat_id",
+    "phone",
+    "sender_id",
+    "sender_username",
+    "is_admin",
+    "message_id",
+    "work_item_id",
+)
 
 from .employee_policy import (
     build_employee_tick_instruction,
@@ -151,6 +164,7 @@ def consultation_json(item: Consultation) -> dict[str, Any]:
     return {
         "id": item.id,
         "agent_id": item.agent_id,
+        "work_item_id": item.work_item_id,
         "question": item.question,
         "context": item.context,
         "status": item.status,
@@ -263,6 +277,82 @@ async def list_open_consultations(db: AsyncSession, agent_id: int) -> list[Consu
     )
 
 
+def clip_cron_name(name: str) -> str:
+    return " ".join((name or "").split())[:100]
+
+
+def unique_cron_name(base: str, agent_id: int) -> str:
+    prefix = clip_cron_name(base) or f"once-{agent_id}"
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"[:120]
+
+
+def _merge_origin_payload(payload: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(payload)
+    for key in ORIGIN_PAYLOAD_KEYS:
+        if merged.get(key) in (None, "") and previous.get(key) not in (None, ""):
+            merged[key] = previous[key]
+    return merged
+
+
+async def save_once_job(
+    db: AsyncSession,
+    scheduler: Any,
+    *,
+    agent_id: int,
+    name: str,
+    payload: dict[str, Any],
+    current_job_id: int | None = None,
+) -> CronJob:
+    """Create or reschedule a one-shot cron job without colliding on unique names."""
+    requested = clip_cron_name(name)
+    current_id: int | None
+    try:
+        current_id = int(current_job_id) if current_job_id is not None else None
+    except (TypeError, ValueError):
+        current_id = None
+    existing = None
+    if requested:
+        existing = await db.scalar(select(CronJob).where(CronJob.name == requested))
+    reuse = (
+        existing is not None
+        and existing.agent_id == agent_id
+        and existing.enabled
+        and existing.id != current_id
+    )
+    if reuse:
+        existing.payload = _merge_origin_payload(payload, dict(existing.payload or {}))
+        existing.cron = "@once"
+        existing.enabled = True
+        job = existing
+    else:
+        job_name = requested if existing is None and requested else unique_cron_name(requested, agent_id)
+        job = CronJob(
+            name=job_name,
+            agent_id=agent_id,
+            cron="@once",
+            payload=payload,
+            enabled=True,
+        )
+        db.add(job)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        job = CronJob(
+            name=unique_cron_name(requested, agent_id),
+            agent_id=agent_id,
+            cron="@once",
+            payload=payload,
+            enabled=True,
+        )
+        db.add(job)
+        await db.commit()
+    await db.refresh(job)
+    if scheduler is not None:
+        scheduler.upsert(job)
+    return job
+
+
 async def list_agent_jobs(
     db: AsyncSession,
     agent_id: int,
@@ -308,7 +398,10 @@ def build_employee_context_block(
     jobs: list[CronJob],
     needs: list[EmployeeNeed],
     consultations: list[Consultation],
+    work_items: list[Any] | None = None,
 ) -> str:
+    from .work_items import work_items_context_lines
+
     lines = [
         "Состояние сотрудника (служебно — не зачитывать клиентам):",
         f"Должность: {profile.role_title or '(не задана)'}",
@@ -317,34 +410,28 @@ def build_employee_context_block(
         f"Рабочий день: {profile.workday_start}-{profile.workday_end} {profile.timezone}",
         f"Тиков сегодня: {profile.ticks_used_today}/{profile.budget_ticks_per_day}",
     ]
-    if jobs:
-        lines.append("Расписание (штатное — schedule_self / cron, не hour/day/week/month планы):")
-        for job in jobs[:15]:
-            kind = "heartbeat" if job.name.startswith(HEARTBEAT_JOB_PREFIX) else "task"
-            msg = _job_message(job)
-            outcome = _job_result_text(job)
-            suffix = f" — {msg}" if msg else ""
-            if outcome:
-                suffix = f"{suffix} | итог: {outcome}"
-            lines.append(f"- [{kind}] #{job.id} {job.name} ({_job_when(job)}){suffix}")
-    else:
-        lines.append(
-            "Расписание: (пусто — следующие шаги ставь себе через schedule_self, "
-            "например проверку Cursor через 2 минуты)"
-        )
+    lines.extend(work_items_context_lines(work_items or []))
+    staff_jobs = [
+        job
+        for job in jobs
+        if not str(job.name or "").startswith(HEARTBEAT_JOB_PREFIX)
+        and not str(job.name or "").startswith("employee-tick-once-")
+        and not (job.payload or {}).get("work_item_id")
+    ]
+    if staff_jobs:
+        lines.append("Штатное расписание (не кейсы Cursor/follow-up):")
+        for job in staff_jobs[:8]:
+            lines.append(f"- #{job.id} {job.name} ({_job_when(job)})")
     if needs:
         lines.append("Открытые потребности:")
         for need in needs[:10]:
             lines.append(f"- #{need.id} [{need.kind}/{need.status} p={need.priority}] {need.title}")
-    else:
-        lines.append("Открытые потребности: (нет)")
     if consultations:
         lines.append("Ожидают ответа руководителя:")
         for item in consultations[:10]:
             kind = "одобрение" if item.requires_approval else "вопрос"
-            lines.append(f"- #{item.id} ({kind}) {item.question[:200]}")
-    else:
-        lines.append("Ожидают ответа руководителя: (нет)")
+            extra = f" кейс #{item.work_item_id}" if getattr(item, "work_item_id", None) else ""
+            lines.append(f"- #{item.id} ({kind}{extra}) {item.question[:200]}")
     return "\n".join(lines)
 
 
@@ -399,20 +486,28 @@ async def schedule_immediate_tick(
     agent_id: int,
     *,
     reason: str = "consult_resolved",
+    work_item_id: int | None = None,
 ) -> CronJob:
     profile = await get_or_create_profile(db, agent_id)
     run_at = utcnow() + timedelta(seconds=3)
+    payload: dict[str, Any] = {
+        "kind": "employee_tick",
+        "message": build_employee_tick_instruction(profile),
+        "source": reason,
+        "run_once_at": run_at.isoformat(),
+        "timezone": "UTC",
+    }
+    if work_item_id:
+        payload["work_item_id"] = work_item_id
+        payload["message"] = (
+            f"Продолжи кейс #{work_item_id} по ответу руководителя. Не создавай новый кейс. "
+            + payload["message"]
+        )
     job = CronJob(
         name=f"employee-tick-once-{agent_id}-{uuid.uuid4().hex[:10]}",
         agent_id=agent_id,
         cron="@once",
-        payload={
-            "kind": "employee_tick",
-            "message": build_employee_tick_instruction(profile),
-            "source": reason,
-            "run_once_at": run_at.isoformat(),
-            "timezone": "UTC",
-        },
+        payload=payload,
         enabled=True,
     )
     db.add(job)
@@ -472,9 +567,11 @@ class EmployeeService:
         requires_approval: bool = False,
         action_name: str | None = None,
         need_kind: str = "decision",
+        work_item_id: int | None = None,
     ) -> dict[str, Any]:
         item = Consultation(
             agent_id=agent.id,
+            work_item_id=work_item_id,
             question=question.strip(),
             context=(context or "").strip(),
             status="open",
@@ -573,10 +670,23 @@ class EmployeeService:
                     need.detail = (need.detail or "") + f"\nManager: {answer_text.strip()}"
         await db.commit()
         await db.refresh(item)
+        if item.work_item_id:
+            from .work_items import get_work_item, resume_work_item
+
+            work = await get_work_item(db, item.work_item_id)
+            if work is not None:
+                note = item.answer_text or status
+                await resume_work_item(db, work, note=f"Руководитель ({status}): {note}")
         if schedule_tick and self.scheduler is not None:
             profile = await get_or_create_profile(db, item.agent_id)
             if profile.autonomy_enabled and not profile.paused:
-                await schedule_immediate_tick(db, self.scheduler, item.agent_id, reason="consult_resolved")
+                await schedule_immediate_tick(
+                    db,
+                    self.scheduler,
+                    item.agent_id,
+                    reason="consult_resolved",
+                    work_item_id=item.work_item_id,
+                )
         if self.events:
             await self.events.publish(
                 "employee.consultation.resolved",
@@ -711,13 +821,16 @@ class EmployeeService:
         jobs = await list_agent_jobs(db, agent.id)
         needs = await list_open_needs(db, agent.id)
         consultations = await list_open_consultations(db, agent.id)
+        from .work_items import list_open_work_items
+
+        work_items = await list_open_work_items(db, agent.id)
         urgent = any(n.priority <= 2 and n.status in {"open", "waiting"} for n in needs)
         if reason == "off_hours" and not force and not urgent:
             return {"skip": True, "reason": "off_hours", "jobs": jobs, "needs": needs}
         if not ok and not force:
             return {"skip": True, "reason": reason, "jobs": jobs, "needs": needs}
         prompt = await assemble_system_prompt(db, agent)
-        block = build_employee_context_block(profile, jobs, needs, consultations)
+        block = build_employee_context_block(profile, jobs, needs, consultations, work_items)
         return {
             "skip": False,
             "reason": reason,

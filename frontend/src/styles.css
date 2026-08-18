@@ -40,7 +40,23 @@ h1, h2, h3, .brand { font-family: 'Manrope', sans-serif; }
 .nav-item:hover { color: #d8dce8; background: #ffffff08; }
 .nav-item.active { color: white; background: linear-gradient(90deg, #7967ee20, #7967ee0b); }
 .nav-item.active svg { color: #9c8cff; }
-.nav-glow { position: absolute; left: -17px; width: 3px; height: 22px; border-radius: 0 4px 4px 0; background: var(--accent); box-shadow: 0 0 13px var(--accent); }
+.nav-badge { margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px; display: grid; place-items: center; border-radius: 9px; background: #ff6f8326; color: #ff8b9a; font-size: 10px; font-weight: 700; }
+.work-inbox .list-panel { margin-top: 8px; }
+.work-row { width: 100%; border: 0; background: transparent; text-align: left; }
+.work-row.selected { background: #7967ee14; }
+.work-row.failed strong { color: #ff8b9a; }
+.chip.status-failed { color: #ff8b9a; border-color: #ff6f8340; background: #ff6f8314; }
+.chip.status-waiting_manager { color: var(--amber); border-color: #f8b95c40; background: #f8b95c14; }
+.chip.status-waiting_external { color: var(--blue); border-color: #5aa8ff40; background: #5aa8ff14; }
+.heartbeat-health { margin: 0 0 8px; color: #858da0; font-size: 12px; }
+.work-goal { margin: 8px 0 10px; color: #c5cbd8; font-size: 13px; line-height: 1.45; }
+.work-timeline-title { margin: 18px 0 8px; font-size: 12px; color: #aeb5c4; }
+.work-timeline { display: flex; flex-direction: column; gap: 8px; }
+.work-event { padding: 10px 12px; border: 1px solid #242a38; border-radius: 8px; background: #0d1118; }
+.work-event strong { display: block; font-size: 12px; }
+.work-event small { color: #6f778a; }
+.work-event p { margin-top: 6px; color: #b8bfcd; font-size: 12px; line-height: 1.4; }
+.work-event.kind-failed { border-color: #ff6f8333; }
 .sidebar-foot { margin-top: auto; }
 .system-mini { margin: 10px 5px 14px; padding: 12px; display: flex; gap: 10px; align-items: flex-start; background: #111720; border: 1px solid #202938; border-radius: 10px; }
 .system-mini strong, .system-mini small { display: block; }

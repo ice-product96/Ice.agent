@@ -13,9 +13,10 @@ from .db import (
     AdminSettings, Agent, AgentLink, AgentTask, CronJob, LlmProfile, McpServer,
     Consultation, ConversationState, EmployeeNeed, EmployeePlan, EmployeeProfile,
     MessageLog, PromptSection, RuntimeSettings, SipAccount, SipCall,
-    TelegramAccount, get_db,
+    TelegramAccount, WorkItem, get_db,
 )
 from .employee import (
+    HEARTBEAT_JOB_PREFIX,
     PROMPT_SECTION_KEYS,
     consultation_json,
     ensure_prompt_sections,
@@ -24,6 +25,7 @@ from .employee import (
     need_json,
     plan_json,
     profile_json,
+    schedule_immediate_tick,
     sync_heartbeat_job,
 )
 from .events import events
@@ -209,6 +211,18 @@ async def dashboard(
         "open_consultations": int(
             await db.scalar(
                 select(func.count()).select_from(Consultation).where(Consultation.status == "open")
+            )
+            or 0
+        ),
+        "failed_work_items": int(
+            await db.scalar(
+                select(func.count()).select_from(WorkItem).where(WorkItem.status == "failed")
+            )
+            or 0
+        ),
+        "waiting_manager": int(
+            await db.scalar(
+                select(func.count()).select_from(WorkItem).where(WorkItem.status == "waiting_manager")
             )
             or 0
         ),
@@ -616,6 +630,10 @@ class ConsultationResolveBody(BaseModel):
     answer_text: str = ""
 
 
+class WorkItemNoteBody(BaseModel):
+    note: str = ""
+
+
 @router.get("/agents/{agent_id}/employee", dependencies=auth)
 async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     agent = await one(db, Agent, agent_id)
@@ -646,6 +664,9 @@ async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depen
             .limit(40)
         )
     ).all()
+    from .work_items import counts_for_agent, list_work_items, work_item_json
+
+    work_items = await list_work_items(db, agent.id, status="all", limit=80)
     return {
         "agent_id": agent.id,
         "agent_name": agent.name,
@@ -655,6 +676,8 @@ async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depen
         "jobs": [cron_json(job) for job in jobs[:40]],
         "needs": [need_json(n) for n in needs],
         "consultations": [consultation_json(c) for c in consults],
+        "work_items": [work_item_json(item) for item in work_items],
+        "work_item_counts": await counts_for_agent(db, agent.id),
     }
 
 
@@ -732,6 +755,138 @@ async def force_employee_tick(
     return await runtime.tick(db, agent, force=True, reason="manual")
 
 
+async def _agent_work_item(db: AsyncSession, agent_id: str, work_item_id: int) -> tuple[Agent, Any]:
+    from .work_items import get_work_item
+
+    agent = await one(db, Agent, agent_id)
+    item = await get_work_item(db, work_item_id)
+    if item is None or item.agent_id != agent.id:
+        raise HTTPException(status_code=404, detail="Work item not found")
+    return agent, item
+
+
+@router.get("/agents/{agent_id}/work-items", dependencies=auth)
+async def list_agent_work_items(
+    agent_id: str,
+    db: AsyncSession = Depends(get_db),
+    status: str = "open",
+    limit: int = Query(80, ge=1, le=200),
+) -> dict[str, Any]:
+    from .work_items import counts_for_agent, list_work_items, work_item_json
+
+    agent = await one(db, Agent, agent_id)
+    items = await list_work_items(db, agent.id, status=status, limit=limit)
+    return {
+        "items": [work_item_json(item) for item in items],
+        "counts": await counts_for_agent(db, agent.id),
+    }
+
+
+@router.get("/agents/{agent_id}/work-items/{work_item_id}", dependencies=auth)
+async def get_agent_work_item(
+    agent_id: str,
+    work_item_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .work_items import list_events, work_item_json
+
+    _, item = await _agent_work_item(db, agent_id, work_item_id)
+    events = list(reversed(await list_events(db, item.id, limit=120)))
+    return work_item_json(item, events=events)
+
+
+@router.post("/agents/{agent_id}/work-items/{work_item_id}/resume", dependencies=auth)
+async def resume_agent_work_item(
+    agent_id: str,
+    work_item_id: int,
+    payload: WorkItemNoteBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .work_items import resume_work_item, work_item_json
+
+    agent, item = await _agent_work_item(db, agent_id, work_item_id)
+    await resume_work_item(db, item, note=payload.note)
+    runtime = getattr(request.app.state, "runtime", None)
+    tick = None
+    if runtime is not None:
+        tick = await runtime.tick(
+            db,
+            agent,
+            force=True,
+            reason="manual",
+            extra={"work_item_id": item.id, "instruction": payload.note},
+        )
+    return {"ok": True, "item": work_item_json(item), "tick": tick}
+
+
+@router.post("/agents/{agent_id}/work-items/{work_item_id}/pause", dependencies=auth)
+async def pause_agent_work_item(
+    agent_id: str,
+    work_item_id: int,
+    payload: WorkItemNoteBody,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .work_items import pause_work_item, work_item_json
+
+    _, item = await _agent_work_item(db, agent_id, work_item_id)
+    await pause_work_item(db, item, note=payload.note)
+    return {"ok": True, "item": work_item_json(item)}
+
+
+@router.post("/agents/{agent_id}/work-items/{work_item_id}/close", dependencies=auth)
+async def close_agent_work_item(
+    agent_id: str,
+    work_item_id: int,
+    payload: WorkItemNoteBody,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .work_items import close_work_item, work_item_json
+
+    _, item = await _agent_work_item(db, agent_id, work_item_id)
+    await close_work_item(db, item, note=payload.note)
+    return {"ok": True, "item": work_item_json(item)}
+
+
+@router.post("/agents/{agent_id}/work-items/{work_item_id}/instruct", dependencies=auth)
+async def instruct_agent_work_item(
+    agent_id: str,
+    work_item_id: int,
+    payload: WorkItemNoteBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .work_items import resume_work_item, work_item_json
+
+    agent, item = await _agent_work_item(db, agent_id, work_item_id)
+    note = (payload.note or "").strip()
+    if not note:
+        raise HTTPException(status_code=422, detail="note is required")
+    await resume_work_item(db, item, note=note)
+    runtime = getattr(request.app.state, "runtime", None)
+    tick = None
+    if runtime is not None:
+        tick = await runtime.tick(
+            db,
+            agent,
+            force=True,
+            reason="manual",
+            extra={
+                "work_item_id": item.id,
+                "instruction": (
+                    f"Указание руководителя по кейсу #{item.id}: {note}. "
+                    "Не создавай новый кейс. Выполни это указание."
+                ),
+            },
+        )
+    else:
+        scheduler = getattr(request.app.state, "scheduler", None)
+        await schedule_immediate_tick(
+            db, scheduler, agent.id, reason="consult_resolved", work_item_id=item.id
+        )
+    return {"ok": True, "item": work_item_json(item), "tick": tick}
+
+
 @router.get("/agents/{agent_id}/employee/plans", dependencies=auth)
 async def employee_plans(agent_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     agent = await one(db, Agent, agent_id)
@@ -805,11 +960,23 @@ async def list_employees(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     )
     paused = sum(1 for p in profiles if p.paused and p.autonomy_enabled)
     autonomous = sum(1 for p in profiles if p.autonomy_enabled)
+    failed_work = int(
+        await db.scalar(select(func.count()).select_from(WorkItem).where(WorkItem.status == "failed"))
+        or 0
+    )
+    waiting_manager = int(
+        await db.scalar(
+            select(func.count()).select_from(WorkItem).where(WorkItem.status == "waiting_manager")
+        )
+        or 0
+    )
     return {
         "items": [profile_json(p) for p in profiles],
         "open_consultations": open_consults,
         "paused_agents": paused,
         "autonomous_agents": autonomous,
+        "failed_work_items": failed_work,
+        "waiting_manager": waiting_manager,
     }
 
 
@@ -1665,8 +1832,28 @@ def cron_job_status(job: CronJob) -> str:
     return "paused"
 
 
+def cron_job_kind(job: CronJob) -> str:
+    payload = job.payload or {}
+    name = str(job.name or "")
+    source = str(payload.get("source") or "")
+    if name.startswith(HEARTBEAT_JOB_PREFIX) or source == "employee_heartbeat":
+        return "heartbeat"
+    if (
+        payload.get("work_item_id")
+        or name.startswith("employee-tick-once-")
+        or source in {"scheduled", "consult_resolved"}
+        or str(payload.get("kind") or "") == "employee_tick"
+    ):
+        return "followup"
+    return "cron"
+
+
 def cron_json(job: CronJob) -> dict[str, Any]:
     payload = job.payload or {}
+    kind = cron_job_kind(job)
+    last_result = public_job_result(payload.get("last_result"))
+    if kind == "heartbeat":
+        last_result = None
     return {
         "id": job.id,
         "name": job.name,
@@ -1680,7 +1867,9 @@ def cron_json(job: CronJob) -> dict[str, Any]:
         "created_at": iso(job.created_at),
         "updated_at": iso(job.updated_at),
         "status": cron_job_status(job),
-        "last_result": public_job_result(payload.get("last_result")),
+        "kind": kind,
+        "work_item_id": payload.get("work_item_id"),
+        "last_result": last_result,
     }
 
 
