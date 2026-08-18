@@ -88,6 +88,23 @@ def test_followup_payload_keeps_origin_chat() -> None:
     assert origin_chat_id(recovered) == 123456
 
 
+def test_telegram_already_sent_ignores_manager_redirect() -> None:
+    from app.job_result import telegram_already_sent
+
+    assert not telegram_already_sent(
+        [
+            {
+                "tool": "telegram_send_message",
+                "status": "success",
+                "result": {"ok": True, "redirected_to_manager": True, "customer_notified": False},
+            }
+        ]
+    )
+    assert telegram_already_sent(
+        [{"tool": "telegram_send_message", "status": "success", "result": {"ok": True}}]
+    )
+
+
 @pytest.mark.asyncio
 async def test_send_origin_reply_only_marks_sent_after_success() -> None:
     from app.job_result import send_origin_reply

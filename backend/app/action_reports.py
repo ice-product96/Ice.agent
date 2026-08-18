@@ -33,6 +33,10 @@ INTERNAL_FOLLOWUP_TOOLS = {
     "schedule_self_cancel",
 }
 
+INTERNAL_EXECUTION_SOURCES = frozenset(
+    {"intake_flush", "scheduled", "employee_tick", "employee_heartbeat"}
+)
+
 
 def is_side_effect_tool(name: str) -> bool:
     """True for mutating actions that admins should be notified about."""
@@ -89,6 +93,135 @@ def cursor_finished_in_audit(audit: list[dict[str, Any]] | None) -> bool:
     return False
 
 
+def is_internal_execution(context: dict[str, Any] | None) -> bool:
+    """True for scheduled/flush/tick runs — not a live customer Telegram turn."""
+    ctx = context or {}
+    if ctx.get("_intake_flush") or ctx.get("employee_tick"):
+        return True
+    return str(ctx.get("source") or "") in INTERNAL_EXECUTION_SOURCES
+
+
+def _peer_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lstrip("-").isdigit():
+        try:
+            return str(int(text))
+        except ValueError:
+            return text
+    return text.lower().lstrip("@")
+
+
+def peers_equal(left: Any, right: Any) -> bool:
+    a = _peer_key(left)
+    b = _peer_key(right)
+    return bool(a) and a == b
+
+
+def is_admin_peer(entity: Any, admin_ids: set[int] | None) -> bool:
+    key = _peer_key(entity)
+    if not key.lstrip("-").isdigit():
+        return False
+    try:
+        return int(key) in (admin_ids or set())
+    except ValueError:
+        return False
+
+
+def is_customer_origin_peer(
+    entity: Any,
+    context: dict[str, Any] | None,
+    admin_ids: set[int] | None = None,
+) -> bool:
+    if entity in (None, "", False):
+        return False
+    if is_admin_peer(entity, admin_ids):
+        return False
+    ctx = context or {}
+    for candidate in (
+        ctx.get("reply_chat_id"),
+        ctx.get("chat_id"),
+        ctx.get("sender_id"),
+        ctx.get("entity"),
+    ):
+        if peers_equal(entity, candidate):
+            return True
+    return False
+
+
+def cursor_result_ready_for_customer(
+    audit: list[dict[str, Any]] | None,
+    *,
+    cursor_was_in_flight: bool = False,
+) -> bool:
+    """True only when THIS assignment finished in Cursor — not a leftover idle summary."""
+    saw_prompt_sent = False
+    saw_in_progress = False
+    last_success: dict[str, Any] | None = None
+    for call in audit or []:
+        if not isinstance(call, dict):
+            continue
+        tool = str(call.get("tool") or "")
+        if tool not in {"cursorremote_check", "cursorremote_do"}:
+            continue
+        if call.get("status") != "success":
+            continue
+        payload = audit_tool_result(call)
+        if not isinstance(payload, dict):
+            continue
+        last_success = payload
+        if payload.get("skipped_prompt"):
+            continue
+        if payload.get("prompt_sent"):
+            saw_prompt_sent = True
+        if payload.get("done") is False:
+            saw_in_progress = True
+    if not last_success or not last_success.get("done"):
+        return False
+    if last_success.get("skipped_prompt") and not (cursor_was_in_flight or saw_in_progress):
+        return False
+    return bool(saw_prompt_sent or saw_in_progress or cursor_was_in_flight)
+
+
+def should_redirect_customer_outbound(
+    context: dict[str, Any] | None,
+    audit: list[dict[str, Any]] | None,
+    entity: Any,
+    *,
+    admin_ids: set[int] | None = None,
+) -> bool:
+    if not is_internal_execution(context):
+        return False
+    if not is_customer_origin_peer(entity, context, admin_ids):
+        return False
+    return not cursor_result_ready_for_customer(
+        audit,
+        cursor_was_in_flight=bool((context or {}).get("_cursor_was_in_flight")),
+    )
+
+
+def format_manager_status(
+    *,
+    agent_name: str,
+    text: str,
+    work_item_id: Any = None,
+    source: Any = None,
+) -> str:
+    labels = {
+        "intake_flush": "Запуск накопленного задания",
+        "scheduled": "Проверка работы",
+        "employee_tick": "Тик сотрудника",
+        "employee_heartbeat": "Сторож",
+    }
+    title = labels.get(str(source or "").strip(), "Служебный статус")
+    lines = [f"[Ice.agent] {title} — «{agent_name}»"]
+    if work_item_id not in (None, "", False):
+        lines.append(f"Кейс #{work_item_id}")
+    lines.append((text or "").strip())
+    return "\n".join(lines)
+
+
 def format_admin_action_report(
     *,
     agent_name: str,
@@ -101,7 +234,7 @@ def format_admin_action_report(
 ) -> str | None:
     """Build a Russian admin digest for mutating tool calls, or None if none."""
     src = str(source or "").strip()
-    if src in {"scheduled", "employee_tick", "employee_heartbeat"}:
+    if src in {"scheduled", "employee_tick", "employee_heartbeat", "intake_flush"}:
         extra = [
             call
             for call in (audit or [])

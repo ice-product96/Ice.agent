@@ -102,13 +102,26 @@ def customer_intake_instruction() -> str:
     )
 
 
+def customer_result_only_instruction() -> str:
+    return (
+        "The customer must receive ONLY the finished result of this assignment. "
+        "Do NOT write the customer progress, status, rechecking, 'handed to Cursor', "
+        "previous-task summaries, or that an executor returned an intermediate report. "
+        "Those service notes are for the manager — the platform delivers them. "
+        "Do NOT call telegram_send_message or telegram_send_file to the customer chat "
+        "until cursorremote_do/check returns done=true for THIS assignment. "
+        "A leftover idle summary from a previous Cursor job is not this result. "
+        "If done=false, schedule_self to check again and write nothing to the customer."
+    )
+
+
 def customer_intake_flush_instruction() -> str:
     return (
         "The quiet period ended. The user message is the accumulated customer assignment. "
         "Execute it now. You MAY call cursorremote_do if it is a coding/workspace task. "
         "If it is only small talk or already answered, do not start Cursor — finish without a new job. "
         "Do NOT mention that you waited, buffered messages, or that a timer fired. "
-        "Write the customer only a normal progress/result message when there is something real to say."
+        + customer_result_only_instruction()
     )
 
 
@@ -137,14 +150,17 @@ def approval_required_for_tool(
 def build_employee_tick_instruction(profile: Any) -> str:
     policy = employee_policy(profile)
     parts = [
-        "Ты автономный сотрудник. Это сторожевой тик, не сообщение клиента и не журнал для руководителя.",
+        "Ты автономный сотрудник. Это сторожевой тик, не живой чат с заказчиком.",
         "Работай только по открытым кейсам из блока состояния. Не создавай новый кейс, если номер уже есть.",
         "Следующие шаги ставь через schedule_self как таймер кейса — не используй hour/day/week/month планы.",
         "Если ждёшь Cursor: только cursorremote_check. Поиск/explore — это не остановка и не повод "
         "давать новую задачу. Пока done=false — снова schedule_self через ~2 минуты, "
-        "заказчику не пиши что готово. Если done=true — финальный текст это сообщение заказчику "
-        "(платформа отправит его в исходный чат), новый schedule_self и cursorremote_do не ставь.",
-        "Не пиши руководителю и клиенту «результат тика». Сообщения людям — только вопрос, готово или застревание.",
+        "заказчику ничего не пиши. Если done=true именно по ЭТОМУ заданию — финальный текст "
+        "это результат заказчику (платформа отправит его в исходный чат); "
+        "промежуточный журнал и сводку по чужой/прошлой задаче пиши руководителю, не заказчику. "
+        "Новый schedule_self и cursorremote_do при done=true не ставь.",
+        "Не пиши заказчику «результат тика», проверку или что работу передали исполнителю. "
+        "Заказчику — только готовый результат. Служебный статус — руководителю.",
         "Сделай один полезный шаг по кейсу и при необходимости сохрани заметки через self_configure.",
     ]
     if policy.get("consult_manager_on_idle_tick"):

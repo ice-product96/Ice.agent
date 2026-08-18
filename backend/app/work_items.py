@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .action_reports import audit_tool_result, cursor_finished_in_audit
+from .action_reports import audit_tool_result, cursor_result_ready_for_customer
 from .db import Agent, Consultation, WorkItem, WorkItemEvent, utcnow
 from .job_result import origin_chat_id, origin_phone, send_origin_reply
 
@@ -295,6 +295,7 @@ async def mark_intake_executing(db: AsyncSession, item: WorkItem) -> WorkItem:
     blob = dict(meta.get("intake") or {}) if isinstance(meta.get("intake"), dict) else {}
     blob["armed"] = False
     meta["intake"] = blob
+    meta["cursor_in_flight"] = False
     item.metadata_json = meta
     item.goal = compile_intake_brief(item) or item.goal
     return await set_status(
@@ -615,7 +616,10 @@ async def after_agent_run(
     audit = audit or []
     notes = []
     cursor_busy = False
-    cursor_done = cursor_finished_in_audit(audit)
+    cursor_done = cursor_result_ready_for_customer(
+        audit,
+        cursor_was_in_flight=bool(context.get("_cursor_was_in_flight")),
+    )
     scheduled_at: datetime | None = None
     consult_id: int | None = None
     for call in audit:
@@ -656,6 +660,14 @@ async def after_agent_run(
             item,
             kind="message_out",
             title="Ответ заказчику",
+            detail=_clip(result, 700),
+        )
+    elif context.get("_manager_status_sent"):
+        await add_event(
+            db,
+            item,
+            kind="message_out",
+            title="Статус руководителю",
             detail=_clip(result, 700),
         )
 

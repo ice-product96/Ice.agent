@@ -25,7 +25,13 @@ from .db import (
     agent_mcp_servers,
     utcnow,
 )
-from .action_reports import cursor_finished_in_audit, format_admin_action_report
+from .action_reports import (
+    cursor_result_ready_for_customer,
+    format_admin_action_report,
+    format_manager_status,
+    is_internal_execution,
+    should_redirect_customer_outbound,
+)
 from .job_result import (
     build_followup_payload,
     collect_origin_from_jobs,
@@ -73,6 +79,7 @@ from .employee_policy import (
     build_employee_tick_instruction,
     customer_intake_flush_instruction,
     customer_intake_instruction,
+    customer_result_only_instruction,
     customer_telegram_instruction,
     intake_debounce_minutes,
     manager_telegram_instruction,
@@ -310,6 +317,103 @@ class AgentRuntime:
         self.scheduler = scheduler
         self.employee.scheduler = scheduler
 
+    def _guard_internal_customer_telegram(
+        self,
+        registry: ToolRegistry,
+        agent: Agent,
+        phone: str,
+        context: dict[str, Any],
+    ) -> None:
+        """Redirect customer progress on internal runs to the manager."""
+        import inspect
+
+        admin_ids = set(self.telegram.admin_ids) if self.telegram else set()
+
+        async def redirect_to_manager(text: str) -> dict[str, Any]:
+            sent = await self._notify_manager_status(phone, agent, context, text)
+            return {
+                "ok": True,
+                "redirected_to_manager": True,
+                "customer_notified": False,
+                "recipients": len(sent),
+                "reason": (
+                    "Customer receives only the finished result. "
+                    "This progress note was sent to the manager."
+                ),
+            }
+
+        send_tool = registry.tools.get("telegram_send_message")
+        if send_tool is not None:
+            inner_send = send_tool.function
+
+            async def telegram_send_message(
+                entity: Any,
+                text: str,
+                reply_to: int | None = None,
+                *,
+                humanize: bool = True,
+            ) -> Any:
+                if should_redirect_customer_outbound(
+                    context, registry.audit, entity, admin_ids=admin_ids
+                ):
+                    return await redirect_to_manager(str(text or ""))
+                result = inner_send(entity, text, reply_to=reply_to, humanize=humanize)
+                return await result if inspect.isawaitable(result) else result
+
+            registry.register(
+                telegram_send_message,
+                "telegram_send_message",
+                send_tool.description,
+                send_tool.parameters,
+            )
+
+        file_tool = registry.tools.get("telegram_send_file")
+        if file_tool is not None:
+            inner_file = file_tool.function
+
+            async def telegram_send_file(entity: Any, file: str, caption: str = "") -> Any:
+                if should_redirect_customer_outbound(
+                    context, registry.audit, entity, admin_ids=admin_ids
+                ):
+                    note = caption.strip() or "Файл для заказчика (ещё не результат)."
+                    return await redirect_to_manager(note)
+                result = inner_file(entity, file, caption=caption)
+                return await result if inspect.isawaitable(result) else result
+
+            registry.register(
+                telegram_send_file,
+                "telegram_send_file",
+                file_tool.description,
+                file_tool.parameters,
+            )
+
+    async def _notify_manager_status(
+        self,
+        phone: str | None,
+        agent: Agent,
+        context: dict[str, Any],
+        text: str,
+    ) -> list[Any]:
+        cleaned = (text or "").strip()
+        if not cleaned or not phone or not self.telegram or not self.telegram.admin_ids:
+            return []
+        previous = str(context.get("_manager_status_text") or "").strip()
+        if previous and previous == cleaned:
+            return []
+        body = format_manager_status(
+            agent_name=agent.name,
+            text=cleaned,
+            work_item_id=context.get("work_item_id"),
+            source=context.get("source"),
+        )
+        try:
+            sent = await self.telegram.notify_admins(str(phone), body)
+        except Exception:
+            return []
+        context["_manager_status_sent"] = True
+        context["_manager_status_text"] = cleaned
+        return list(sent)
+
     async def registry(
         self,
         agent: Agent,
@@ -433,6 +537,8 @@ class AgentRuntime:
         if phone and self.telegram:
             telegram_tools = self.telegram.tool_registry(phone)
             registry.tools.update(telegram_tools.tools)
+            if context is not None:
+                self._guard_internal_customer_telegram(registry, agent, phone, context)
             if context is not None and context.get("source") == "telegram":
                 async def telegram_suppress_reply(reason: str = "") -> dict[str, Any]:
                     """Suppress the automatic Telegram reply for the current incoming message."""
@@ -1157,6 +1263,13 @@ class AgentRuntime:
             is_intake_flush = str(context.get("source") or "") == "intake_flush" or str(
                 context.get("kind") or ""
             ) == "intake_flush"
+            was_in_flight = bool(
+                work_item is not None
+                and (
+                    work_item.status == "waiting_external"
+                    or (work_item.metadata_json or {}).get("cursor_in_flight")
+                )
+            )
             if work_item is not None and is_intake_flush:
                 context["_intake_flush"] = True
                 context["_intake_collecting"] = False
@@ -1165,6 +1278,7 @@ class AgentRuntime:
                     message = compiled
                     context["_user_message"] = message
                 work_item = await mark_intake_executing(db, work_item)
+                context["_cursor_was_in_flight"] = False
             elif work_item is not None and should_collect_customer_intake(
                 work_item, context, minutes=debounce_minutes
             ):
@@ -1178,6 +1292,9 @@ class AgentRuntime:
                 )
                 context["_intake_collecting"] = True
                 context["work_item_id"] = work_item.id
+                context["_cursor_was_in_flight"] = False
+            else:
+                context["_cursor_was_in_flight"] = was_in_flight
             system_prompt = await assemble_system_prompt(db, agent)
             employee_block = ""
             if employee_profile.autonomy_enabled or context.get("employee_tick"):
@@ -1224,11 +1341,11 @@ class AgentRuntime:
                 role_instruction = (
                     "This is a scheduled follow-up for a customer request. "
                     f"The original Telegram chat is {chat}. "
-                    "Your FINAL assistant message is delivered to that chat by the platform — "
-                    "write the result for the customer, not an internal journal and not JSON. "
+                    "If THIS assignment finished (done=true), write the customer-facing result — "
+                    "the platform will send that text to the chat. "
+                    "Otherwise write a short status for the manager, not a journal for the customer. "
                     "Do not claim that a Telegram message was already sent. "
-                    "If Cursor done=true, summarize what was done. "
-                    "If done=false, do not tell the customer it is ready. "
+                    + customer_result_only_instruction()
                     + customer_telegram_instruction()
                 )
             elif is_intake_flush:
@@ -1487,8 +1604,23 @@ class AgentRuntime:
             await self.events.publish("agent.completed", {"agent_id": agent.id, "text": result})
             context["_job_notes"] = notes_from_audit(registry.audit)
             context["_origin_already_sent"] = telegram_already_sent(registry.audit)
-            if cursor_finished_in_audit(registry.audit) and not suppressed:
+            result_ready = cursor_result_ready_for_customer(
+                registry.audit,
+                cursor_was_in_flight=bool(context.get("_cursor_was_in_flight")),
+            )
+            if result_ready and not suppressed:
                 context["_deliver_origin_reply"] = True
+            elif (
+                is_internal_execution(context)
+                and not suppressed
+                and result.strip()
+            ):
+                notify_phone = (
+                    (account.phone if account else None)
+                    or context.get("reply_phone")
+                    or context.get("phone")
+                )
+                await self._notify_manager_status(notify_phone, agent, context, result)
             await after_agent_run(
                 db, agent, context, result, registry.audit, employee=self.employee
             )

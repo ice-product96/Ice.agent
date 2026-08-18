@@ -98,8 +98,14 @@ def telegram_already_sent(audit: list[dict[str, Any]] | None) -> bool:
     for call in audit or []:
         if not isinstance(call, dict):
             continue
-        if str(call.get("tool") or "") == "telegram_send_message" and call.get("status") == "success":
-            return True
+        if str(call.get("tool") or "") != "telegram_send_message":
+            continue
+        if call.get("status") != "success":
+            continue
+        payload = audit_tool_result(call)
+        if isinstance(payload, dict) and payload.get("redirected_to_manager"):
+            continue
+        return True
     return False
 
 

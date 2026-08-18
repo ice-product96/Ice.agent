@@ -5,10 +5,11 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import Agent, Base, WorkItem, utcnow
-from app.employee_policy import customer_intake_instruction, intake_debounce_minutes
+from app.employee_policy import customer_intake_flush_instruction, customer_intake_instruction, intake_debounce_minutes
 from app.work_items import (
     begin_customer_intake,
     compile_intake_brief,
+    mark_intake_executing,
     should_collect_customer_intake,
     watchdog_items,
 )
@@ -40,6 +41,13 @@ def test_intake_reply_forbids_mentioning_the_wait() -> None:
     text = customer_intake_instruction()
     assert "Do NOT mention a delay" in text
     assert "cursorremote_do" in text
+
+
+def test_flush_instruction_keeps_progress_off_customer() -> None:
+    text = customer_intake_flush_instruction()
+    assert "progress/result" not in text
+    assert "ONLY the finished result" in text
+    assert "manager" in text.lower()
 
 
 def test_should_collect_customer_telegram_not_admin() -> None:
@@ -125,4 +133,28 @@ async def test_watchdog_skips_future_collecting(tmp_path: Path) -> None:
         ids = {item.id for item in items}
         assert overdue.id in ids
         assert future.id not in ids
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mark_intake_executing_clears_stale_cursor_flag(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "flush.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.commit()
+        await db.refresh(agent)
+        item = WorkItem(
+            agent_id=agent.id,
+            title="LAVVE",
+            status="collecting",
+            metadata_json={"cursor_in_flight": True, "intake": {"armed": True, "messages": [{"text": "скругления"}]}},
+        )
+        db.add(item)
+        await db.commit()
+        await db.refresh(item)
+        flushed = await mark_intake_executing(db, item)
+        assert flushed.status == "in_progress"
+        assert not (flushed.metadata_json or {}).get("cursor_in_flight")
+        assert (flushed.metadata_json or {}).get("intake", {}).get("armed") is False
     await engine.dispose()
