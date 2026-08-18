@@ -491,15 +491,11 @@ async def counts_for_agent(db: AsyncSession, agent_id: int) -> dict[str, int]:
         "actionable": 0,
     }
     for item in items:
+        if work_item_aborted(item):
+            continue
         if item.status in counts:
             counts[item.status] += 1
-        if item.status == "collecting":
-            if item.wait_until and _as_aware(item.wait_until) <= utcnow():
-                counts["actionable"] += 1
-            continue
-        if item.status in {"failed", "waiting_manager"} or (
-            item.status in OPEN_STATUSES and not item.paused
-        ):
+        if is_inbox_actionable(item):
             counts["actionable"] += 1
     return counts
 
@@ -950,6 +946,8 @@ async def watchdog_items(db: AsyncSession, agent_id: int) -> list[WorkItem]:
     now = utcnow()
     actionable: list[WorkItem] = []
     for item in await list_open_work_items(db, agent_id, include_paused=False):
+        if work_item_aborted(item):
+            continue
         if item.status == "collecting":
             due = item.wait_until
             if due is None:
@@ -1155,6 +1153,17 @@ def work_item_aborted(item: WorkItem | None) -> bool:
     if item is None:
         return False
     return bool((item.metadata_json or {}).get("aborted"))
+
+
+def is_inbox_actionable(item: WorkItem, *, now: datetime | None = None) -> bool:
+    """Match employee UI «Нужно действие» filter — excludes Cursor/customer waits."""
+    if work_item_aborted(item):
+        return False
+    if item.status in {"failed", "waiting_manager", "open", "in_progress", "collecting"}:
+        if item.paused and item.status not in {"failed", "waiting_manager"}:
+            return False
+        return True
+    return False
 
 
 def work_items_context_lines(items: list[WorkItem]) -> list[str]:

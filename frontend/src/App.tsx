@@ -1056,6 +1056,39 @@ function EmployeeScreen() {
     if (preferred) setAgentId(String(preferred.agent_id))
   }, [roster, agentId])
 
+  useEffect(() => {
+    if (!agentId) {
+      setState(null)
+      setSelectedId('')
+      setSelected(null)
+      return
+    }
+    let cancelled = false
+    setLoading(true)
+    setError('')
+    void api.agents.employee(agentId).then(data => {
+      if (cancelled) return
+      setState(data)
+      setSections(data.prompt_sections || {})
+      setMission(data.profile.mission || '')
+      setRoleTitle(data.profile.role_title || '')
+      setHeartbeat(data.profile.heartbeat_minutes || 15)
+      setWorkStart(data.profile.workday_start || '09:00')
+      setWorkEnd(data.profile.workday_end || '18:00')
+      setTimezone(data.profile.timezone || 'UTC')
+      setBudget(data.profile.budget_ticks_per_day || 48)
+      setAutonomy(Boolean(data.profile.autonomy_enabled))
+      applyPolicy(data.profile.policy)
+    }).catch(err => {
+      if (cancelled) return
+      setState(null)
+      setError(err instanceof Error ? err.message : 'Не удалось загрузить сотрудника')
+    }).finally(() => {
+      if (!cancelled) setLoading(false)
+    })
+    return () => { cancelled = true }
+  }, [agentId])
+
   async function load(id: string) {
     if (!id) return
     setLoading(true); setError('')
@@ -1122,6 +1155,7 @@ function EmployeeScreen() {
   const workItems = state?.work_items || []
   const counts = state?.work_item_counts || {}
   const inboxItems = workItems.filter(item => {
+    if (item.aborted) return false
     if (inboxFilter === 'all') return true
     if (inboxFilter === 'actionable') return ['failed', 'waiting_manager', 'open', 'in_progress', 'collecting'].includes(item.status)
     if (inboxFilter === 'in_progress') return ['open', 'in_progress'].includes(item.status)
@@ -1220,11 +1254,11 @@ function EmployeeScreen() {
         <button className="secondary" disabled={!agentId || loading} onClick={() => void load(agentId)}><RefreshCw size={15}/>Обновить</button>
       </div>}
     />
-    {roster.length > 0 && <section className="panel employee-roster">
+    {overview.loading && !overview.data ? <Loading/> : roster.length > 0 && <section className="panel employee-roster">
       <SectionHead title="Команда" text="Каждый агент работает отдельно: свой inbox, heartbeat и политика."/>
       <div className="employee-roster-grid">
         {roster.map(item => {
-          const badge = (item.failed_work_items || 0) + (item.waiting_manager || 0) + (item.open_consultations || 0)
+          const badge = (item.actionable_work_items || 0) + (item.open_consultations || 0)
           const selected = String(item.agent_id) === agentId
           return <button
             type="button"
@@ -1246,6 +1280,9 @@ function EmployeeScreen() {
         })}
       </div>
     </section>}
+    {!overview.loading && roster.length === 0 && !overview.error && (
+      <Empty icon={Briefcase} title="Нет сотрудников" text="Создайте агента и включите для него профиль автономного сотрудника."/>
+    )}
     {(error || notice || overview.error || consults.error) && (
       <>
         {error && <Alert message={error}/>}
@@ -1255,7 +1292,10 @@ function EmployeeScreen() {
         )}
       </>
     )}
-    {loading && !state ? <Loading/> : !agentId ? <Empty icon={Briefcase} title="Выберите сотрудника" text="Настройте нескольких агентов — каждый будет работать со своими кейсами и клиентами."/> : state && <>
+    {!agentId ? <Empty icon={Briefcase} title="Выберите сотрудника" text="Настройте нескольких агентов — каждый будет работать со своими кейсами и клиентами."/> :
+      loading && !state ? <Loading/> :
+      !state ? <div className="panel"><p className="transcript-empty">{error || 'Не удалось загрузить сотрудника.'}</p><button className="secondary" onClick={() => void load(agentId)}><RefreshCw size={15}/>Повторить</button></div> :
+      state && <>
       <section className="panel work-inbox">
         <SectionHead title={`Inbox · ${selectedRoster?.agent_name || state.agent_name || ''}`} text="Единица работы — кейс, не строка cron. Сторож смотрит открытые, а не пишет журнал тика."
           action={<div className="head-actions">
