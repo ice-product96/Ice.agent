@@ -802,6 +802,31 @@ async def after_agent_run(
         )
         return item
 
+    meta = dict(item.metadata_json or {})
+    intake = meta.get("intake") if isinstance(meta.get("intake"), dict) else {}
+    cursor_called = any(
+        isinstance(call, dict)
+        and str(call.get("tool") or "") in {"cursorremote_check", "cursorremote_do"}
+        for call in audit
+    )
+    if (
+        item.status == "in_progress"
+        and bool(intake.get("flushing"))
+        and not cursor_called
+        and str(context.get("source") or "") in {"intake_flush", "employee_tick", "scheduled"}
+    ):
+        await set_status(
+            db,
+            item,
+            "waiting_external",
+            next_action="Отправить задачу в Cursor или дождаться проверки",
+            wait_owner="external",
+            wait_until=utcnow() + timedelta(minutes=2),
+            event_title="Жду Cursor",
+            event_detail="Задание принято, но Cursor ещё не опрошен.",
+        )
+        return item
+
     if cursor_done:
         meta = dict(item.metadata_json or {})
         meta["cursor_in_flight"] = False
@@ -1153,6 +1178,64 @@ def work_item_aborted(item: WorkItem | None) -> bool:
     if item is None:
         return False
     return bool((item.metadata_json or {}).get("aborted"))
+
+
+def needs_cursor_poll(item: WorkItem | None) -> bool:
+    if item is None or work_item_aborted(item):
+        return False
+    meta = dict(item.metadata_json or {})
+    if item.status == "waiting_external":
+        return True
+    if meta.get("cursor_in_flight"):
+        return True
+    intake = meta.get("intake") if isinstance(meta.get("intake"), dict) else {}
+    return item.status == "in_progress" and bool(intake.get("flushing"))
+
+
+async def sync_cursor_work_items(
+    db: AsyncSession,
+    agent: Agent,
+    cursor_session: Any,
+    items: list[WorkItem] | None = None,
+    *,
+    employee: Any | None = None,
+) -> list[int]:
+    """Poll CursorRemote for open cases and refresh work-item status without an LLM round."""
+    from .cursorremote_drive import check_and_drive
+
+    if items is None:
+        items = await list_open_work_items(db, agent.id, include_paused=False)
+    updated: list[int] = []
+    seen: set[int] = set()
+    for item in items:
+        if item.id in seen or not needs_cursor_poll(item):
+            continue
+        seen.add(item.id)
+        try:
+            result = await check_and_drive(cursor_session)
+        except Exception as exc:
+            logger.warning("cursor poll failed for work item %s: %s", item.id, exc)
+            continue
+        audit = [{"tool": "cursorremote_check", "status": "success", "result": result}]
+        context: dict[str, Any] = {
+            "work_item_id": item.id,
+            "_cursor_was_in_flight": True,
+            "source": "employee_tick",
+            "employee_tick": True,
+        }
+        if item.chat_id:
+            context["reply_chat_id"] = item.chat_id
+            context["chat_id"] = item.chat_id
+        if item.reply_phone:
+            context["reply_phone"] = item.reply_phone
+            context["phone"] = item.reply_phone
+        summary = str(result.get("summary") or result.get("reason") or "")
+        before = item.status
+        await after_agent_run(db, agent, context, summary, audit, employee=employee)
+        await db.refresh(item)
+        if item.status != before or bool(result.get("done")):
+            updated.append(item.id)
+    return updated
 
 
 def is_inbox_actionable(item: WorkItem, *, now: datetime | None = None) -> bool:

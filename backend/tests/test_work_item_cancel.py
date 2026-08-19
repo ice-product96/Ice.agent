@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from app.db import Agent, CronJob, WorkItem
-from app.work_items import abort_work_item, cancel_work_item_schedules, counts_for_agent, is_inbox_actionable, work_item_aborted
+from app.work_items import abort_work_item, cancel_work_item_schedules, counts_for_agent, is_inbox_actionable, needs_cursor_poll, work_item_aborted
 
 from test_intake import sessions_for
 
@@ -98,4 +98,25 @@ async def test_is_inbox_actionable_matches_ui_filter(tmp_path: Path) -> None:
         db.add(waiting)
         await db.commit()
         assert not is_inbox_actionable(waiting)
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_needs_cursor_poll_for_flushing_in_progress(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "poll.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="flush",
+            status="in_progress",
+            metadata_json={"intake": {"flushing": True}, "cursor_in_flight": True},
+        )
+        db.add(item)
+        await db.commit()
+        assert needs_cursor_poll(item)
+        done = WorkItem(agent_id=agent.id, title="done", status="done")
+        assert not needs_cursor_poll(done)
     await engine.dispose()

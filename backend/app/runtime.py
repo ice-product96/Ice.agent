@@ -48,6 +48,7 @@ from .work_items import (
     get_work_item,
     list_open_work_items,
     mark_intake_executing,
+    sync_cursor_work_items,
     should_collect_customer_intake,
     watchdog_items,
 )
@@ -317,6 +318,40 @@ class AgentRuntime:
             lock = asyncio.Lock()
             self._agent_locks[agent_id] = lock
         return lock
+
+    async def _cursorremote_session(
+        self,
+        db: AsyncSession,
+        agent: Agent,
+    ) -> Any | None:
+        if self.mcp is None:
+            return None
+        mcp_server_names = set(
+            await db.scalars(
+                select(McpServer.name)
+                .join(agent_mcp_servers, agent_mcp_servers.c.mcp_server_id == McpServer.id)
+                .where(
+                    agent_mcp_servers.c.agent_id == agent.id,
+                    McpServer.enabled.is_(True),
+                )
+            )
+        )
+        tools = set((agent.config or {}).get("tools") or [])
+        if not mcp_server_names and "mcp" in tools:
+            mcp_server_names = {
+                name
+                for name in self.mcp.sessions
+                if name != "cursorremote"
+            }
+        return next(
+            (
+                session
+                for name, session in self.mcp.sessions.items()
+                if name.lower() == "cursorremote"
+                and (not mcp_server_names or name in mcp_server_names)
+            ),
+            None,
+        )
 
     def bind_task_bus(self, task_bus: TaskBus) -> None:
         self.task_bus = task_bus
@@ -1117,6 +1152,20 @@ class AgentRuntime:
             tick_item = await get_work_item(db, context.get("work_item_id"))
             if work_item_aborted(tick_item):
                 return {"ok": True, "skipped": True, "reason": "work_item_aborted"}
+            cursor_session = await self._cursorremote_session(db, agent)
+            if cursor_session is not None:
+                poll_items = list(pending)
+                if tick_item is not None and all(item.id != tick_item.id for item in poll_items):
+                    poll_items.append(tick_item)
+                await sync_cursor_work_items(
+                    db,
+                    agent,
+                    cursor_session,
+                    poll_items,
+                    employee=self.employee,
+                )
+                tick_item = await get_work_item(db, context.get("work_item_id"))
+                pending = await watchdog_items(db, agent.id)
             if pending:
                 message = build_watchdog_instruction(pending)
             else:

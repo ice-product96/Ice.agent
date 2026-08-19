@@ -1154,9 +1154,10 @@ function EmployeeScreen() {
   const openConsults = consults.data?.items || []
   const workItems = state?.work_items || []
   const counts = state?.work_item_counts || {}
+  const openWorkItems = workItems.filter(item => !item.aborted && item.status !== 'done')
   const inboxItems = workItems.filter(item => {
     if (item.aborted) return false
-    if (inboxFilter === 'all') return true
+    if (inboxFilter === 'all') return item.status !== 'done'
     if (inboxFilter === 'actionable') return ['failed', 'waiting_manager', 'open', 'in_progress', 'collecting'].includes(item.status)
     if (inboxFilter === 'in_progress') return ['open', 'in_progress'].includes(item.status)
     return item.status === inboxFilter
@@ -1258,7 +1259,7 @@ function EmployeeScreen() {
       <SectionHead title="Команда" text="Каждый агент работает отдельно: свой inbox, heartbeat и политика."/>
       <div className="employee-roster-grid">
         {roster.map(item => {
-          const badge = (item.actionable_work_items || 0) + (item.open_consultations || 0)
+          const badge = item.actionable_work_items || 0
           const selected = String(item.agent_id) === agentId
           return <button
             type="button"
@@ -1273,6 +1274,7 @@ function EmployeeScreen() {
             <small>{item.role_title || 'Роль не задана'}{item.autonomy_enabled ? ' · автономия' : ''}{item.paused ? ' · пауза' : ''}</small>
             <div className="employee-roster-stats">
               <span>кейсов: {item.actionable_work_items || 0}</span>
+              {(item.open_consultations || 0) > 0 && <span>консультаций: {item.open_consultations || 0}</span>}
               <span>ошибок: {item.failed_work_items || 0}</span>
               <span>ждут: {item.waiting_manager || 0}</span>
             </div>
@@ -1325,7 +1327,7 @@ function EmployeeScreen() {
             ['waiting_customer', 'Жду клиента', counts.waiting_customer],
             ['waiting_manager', 'Жду меня', counts.waiting_manager],
             ['failed', 'Ошибки', counts.failed],
-            ['all', 'Все', workItems.length],
+            ['all', 'Все', openWorkItems.length],
           ] as const).map(([id, label, count]) => (
             <button type="button" key={id} className={`chip ${inboxFilter === id ? 'on' : ''}`} onClick={() => setInboxFilter(id)}>
               {label} · {count || 0}
