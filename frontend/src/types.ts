@@ -497,6 +497,30 @@ export interface EmployeeState {
   consultations: Consultation[]
   work_items?: WorkItem[]
   work_item_counts?: WorkItemCounts
+  customers?: Customer[]
+}
+
+export interface Customer {
+  id: ID
+  name: string
+  notes?: string
+  agent_id?: ID | null
+  project_id?: string
+  cursor_workspace?: string
+  cursor_window_id?: string | null
+  is_default?: boolean
+  prompt_block?: string
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface CursorProjectOption {
+  id: string
+  label: string
+  workspace?: string
+  window_id?: string | null
+  project_id?: string
+  source?: 'live' | 'allowlist' | 'saved' | string
 }
 
 export interface Paginated<T> {

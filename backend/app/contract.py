@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import Settings, get_settings
 from .db import (
     AdminSettings, Agent, AgentLink, AgentTask, CronJob, LlmProfile, McpServer,
-    Consultation, ConversationState, CursorRun, DecisionRecord, EmployeeNeed, EmployeePlan, EmployeeProfile,
+    Consultation, ConversationState, CursorRun, Customer, DecisionRecord, EmployeeNeed, EmployeePlan, EmployeeProfile,
     MessageLog, PromptSection, RuntimeSettings, SipAccount, SipCall,
     ProjectState, TelegramAccount, WorkItem, agent_mcp_servers, get_db,
 )
@@ -747,6 +747,135 @@ async def update_pm_project(
     return project_state_json(state)
 
 
+class CustomerBody(BaseModel):
+    id: str | None = None
+    name: str = Field(min_length=1, max_length=200)
+    notes: str = ""
+    agent_id: int | str | None = None
+    project_id: str = ""
+    cursor_workspace: str = ""
+    cursor_window_id: str | None = None
+    is_default: bool = False
+
+
+@router.get("/customers", dependencies=auth)
+async def list_customers(
+    db: AsyncSession = Depends(get_db),
+    agent_id: int | None = None,
+) -> list[dict[str, Any]]:
+    from .customers import customer_json
+
+    query = select(Customer).order_by(Customer.is_default.desc(), Customer.name.asc())
+    if agent_id is not None:
+        query = query.where(Customer.agent_id == agent_id)
+    rows = (await db.scalars(query)).all()
+    return [customer_json(row) for row in rows]
+
+
+@router.get("/cursor/projects", dependencies=auth)
+async def list_cursor_projects(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    from .customers import collect_cursor_projects
+
+    return await collect_cursor_projects(db, getattr(request.app.state, "mcp", None))
+
+
+@router.post("/customers", dependencies=auth, status_code=201)
+async def create_customer(
+    payload: CustomerBody,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .customers import apply_customer_defaults, customer_json, slugify
+
+    customer_id = slugify(payload.id or payload.name)
+    if await db.get(Customer, customer_id) is not None:
+        raise HTTPException(status_code=409, detail=f"Customer '{customer_id}' already exists")
+    agent_id = (
+        as_int(payload.agent_id, "agent_id")
+        if payload.agent_id is not None and str(payload.agent_id).strip() != ""
+        else None
+    )
+    if agent_id is not None and await db.get(Agent, agent_id) is None:
+        raise HTTPException(status_code=422, detail="agent_id not found")
+    project_id = (payload.project_id or "").strip() or customer_id
+    customer = Customer(
+        id=customer_id,
+        name=payload.name.strip(),
+        notes=(payload.notes or "").strip(),
+        agent_id=agent_id,
+        project_id=project_id,
+        cursor_workspace=(payload.cursor_workspace or "").strip(),
+        cursor_window_id=(payload.cursor_window_id or None),
+        is_default=False,
+    )
+    db.add(customer)
+    await db.flush()
+    make_default = bool(payload.is_default)
+    if agent_id is not None and not make_default:
+        others = await db.scalar(
+            select(func.count())
+            .select_from(Customer)
+            .where(Customer.agent_id == agent_id, Customer.id != customer.id)
+        )
+        make_default = int(others or 0) == 0
+    await apply_customer_defaults(db, customer, make_default=make_default)
+    await db.commit()
+    await db.refresh(customer)
+    return customer_json(customer)
+
+
+@router.patch("/customers/{customer_id}", dependencies=auth)
+async def update_customer(
+    customer_id: str,
+    payload: CustomerBody,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .customers import apply_customer_defaults, customer_json
+
+    customer = await db.get(Customer, customer_id)
+    if customer is None:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    agent_id = (
+        as_int(payload.agent_id, "agent_id")
+        if payload.agent_id is not None and str(payload.agent_id).strip() != ""
+        else None
+    )
+    if agent_id is not None and await db.get(Agent, agent_id) is None:
+        raise HTTPException(status_code=422, detail="agent_id not found")
+    customer.name = payload.name.strip()
+    customer.notes = (payload.notes or "").strip()
+    customer.agent_id = agent_id
+    customer.project_id = (payload.project_id or "").strip() or customer.id
+    customer.cursor_workspace = (payload.cursor_workspace or "").strip()
+    customer.cursor_window_id = payload.cursor_window_id or None
+    await apply_customer_defaults(db, customer, make_default=payload.is_default)
+    await db.commit()
+    await db.refresh(customer)
+    return customer_json(customer)
+
+
+@router.delete("/customers/{customer_id}", dependencies=auth, status_code=204)
+async def delete_customer(customer_id: str, db: AsyncSession = Depends(get_db)) -> Response:
+    customer = await db.get(Customer, customer_id)
+    if customer is None:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    if customer.agent_id is not None:
+        agent = await db.get(Agent, customer.agent_id)
+        if agent is not None:
+            config = dict(agent.config or {})
+            memory = dict(config.get("memory") or {})
+            if memory.get("default_customer_id") == customer.id:
+                memory.pop("default_customer_id", None)
+                memory.pop("default_project_id", None)
+                config["memory"] = memory
+                agent.config = config
+    await db.delete(customer)
+    await db.commit()
+    return Response(status_code=204)
+
+
 @router.get("/agents/{agent_id}/employee", dependencies=auth)
 async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     agent = await one(db, Agent, agent_id)
@@ -780,6 +909,15 @@ async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depen
     from .work_items import counts_for_agent, list_work_items, work_item_json
 
     work_items = await list_work_items(db, agent.id, status="all", limit=80)
+    from .customers import customer_json
+
+    customers = (
+        await db.scalars(
+            select(Customer)
+            .where(Customer.agent_id == agent.id)
+            .order_by(Customer.is_default.desc(), Customer.name.asc())
+        )
+    ).all()
     return {
         "agent_id": agent.id,
         "agent_name": agent.name,
@@ -791,6 +929,7 @@ async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depen
         "consultations": [consultation_json(c) for c in consults],
         "work_items": [work_item_json(item) for item in work_items],
         "work_item_counts": await counts_for_agent(db, agent.id),
+        "customers": [customer_json(row) for row in customers],
     }
 
 

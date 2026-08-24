@@ -208,8 +208,25 @@ async def ensure_prompt_sections(db: AsyncSession, agent: Agent) -> dict[str, st
     return {key: (by_key[key].content if key in by_key else "") for key in PROMPT_SECTION_KEYS}
 
 
-async def assemble_system_prompt(db: AsyncSession, agent: Agent) -> str:
+async def assemble_system_prompt(
+    db: AsyncSession,
+    agent: Agent,
+    *,
+    customer: Any | None = None,
+    customer_id: str | None = None,
+    project_id: str | None = None,
+) -> str:
+    from .customers import customer_prompt_block, resolve_customer
+
     sections = await ensure_prompt_sections(db, agent)
+    if customer is None:
+        customer = await resolve_customer(
+            db,
+            agent,
+            customer_id=customer_id,
+            project_id=project_id,
+        )
+    assignment = customer_prompt_block(customer)
     parts: list[str] = []
     labels = {
         "identity": "Личность",
@@ -219,12 +236,19 @@ async def assemble_system_prompt(db: AsyncSession, agent: Agent) -> str:
         "tone": "Тон общения",
         "self_notes": "Заметки сотрудника",
     }
+    inserted = False
     for key in PROMPT_SECTION_KEYS:
         text = (sections.get(key) or "").strip()
         if text:
             parts.append(f"## {labels.get(key, key)}\n{text}")
+        if key == "identity" and assignment:
+            parts.append(assignment)
+            inserted = True
+    if assignment and not inserted:
+        parts.insert(0, assignment)
     if not parts and (agent.prompt or "").strip():
-        return agent.prompt
+        body = agent.prompt
+        return f"{assignment}\n\n{body}" if assignment else body
     return "\n\n".join(parts) if parts else (agent.prompt or "You are a professional employee agent.")
 
 

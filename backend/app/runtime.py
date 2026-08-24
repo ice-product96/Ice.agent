@@ -2157,6 +2157,20 @@ class AgentRuntime:
                     summarizer=summarize,
                 )
                 bind_conversation_from_config(state, agent.config, context)
+                if not (state.customer_id or "").strip() or not (state.project_id or "").strip():
+                    from .customers import resolve_customer
+
+                    customer = await resolve_customer(
+                        db,
+                        agent,
+                        customer_id=state.customer_id,
+                        project_id=state.project_id,
+                    )
+                    if customer is not None:
+                        if not (state.customer_id or "").strip():
+                            state.customer_id = customer.id
+                        if not (state.project_id or "").strip() and customer.project_id:
+                            state.project_id = customer.project_id
                 context["_conversation_state"] = state
                 memory_scope = resolve_memory_scope(context, agent, state=state)
                 context["_memory_scope"] = memory_scope
@@ -2263,7 +2277,20 @@ class AgentRuntime:
 
                     persist_customer_images(work_item, attachments)
                     await db.commit()
-            system_prompt = await assemble_system_prompt(db, agent)
+            system_prompt = await assemble_system_prompt(
+                db,
+                agent,
+                customer_id=(
+                    getattr(state, "customer_id", None)
+                    or context.get("customer_id")
+                    or getattr(work_item, "customer_id", None)
+                ),
+                project_id=(
+                    getattr(state, "project_id", None)
+                    or context.get("project_id")
+                    or getattr(work_item, "project_id", None)
+                ),
+            )
             employee_block = ""
             if employee_profile.autonomy_enabled or context.get("employee_tick"):
                 from .employee import build_employee_context_block

@@ -10,17 +10,18 @@ import { agentModelPresets, profileModelPresets } from './llmModels'
 import type {
   AdminSettings, Agent, AgentTask, Consultation, CronJob, Dashboard, EmployeeState, LogEntry, McpServer,
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, RuntimeSettings,
-  EmployeePolicy, EmployeePolicyCatalog,
+  Customer, CursorProjectOption, EmployeePolicy, EmployeePolicyCatalog,
   SipAccount, SipCall, Status, TelegramAccount, WorkItem,
 } from './types'
 
-type Page = 'dashboard' | 'agents' | 'connections' | 'runtime' | 'telegram' | 'sip' | 'calls' | 'conversations' | 'employee' | 'memory' | 'mcp' | 'cron' | 'settings' | 'logs' | 'tasks'
+type Page = 'dashboard' | 'agents' | 'connections' | 'runtime' | 'telegram' | 'sip' | 'calls' | 'conversations' | 'employee' | 'customers' | 'memory' | 'mcp' | 'cron' | 'settings' | 'logs' | 'tasks'
 type Icon = typeof LayoutDashboard
 
 const nav: { id: Page; label: string; icon: Icon; group?: string }[] = [
   { id: 'dashboard', label: 'Обзор', icon: LayoutDashboard, group: 'Рабочая область' },
   { id: 'agents', label: 'Агенты', icon: Bot },
   { id: 'employee', label: 'Сотрудники', icon: Briefcase },
+  { id: 'customers', label: 'Заказчики', icon: Users },
   { id: 'connections', label: 'Подключения', icon: KeyRound },
   { id: 'telegram', label: 'Telegram', icon: MessageCircle },
   { id: 'sip', label: 'SIP', icon: Phone },
@@ -39,6 +40,7 @@ const title: Record<Page, [string, string]> = {
   dashboard: ['Центр управления', 'Статус рабочей области Ice.agent в реальном времени'],
   agents: ['Агенты', 'Настройка интеллекта, подключений и возможностей'],
   employee: ['Сотрудники', 'Несколько автономных агентов — каждый со своим inbox и политикой'],
+  customers: ['Заказчики', 'Карточка заказчика и привязка проекта Cursor MCP'],
   connections: ['Подключения и провайдеры', 'Управление учётными данными LLM и эндпоинтами моделей'],
   telegram: ['Аккаунты Telegram', 'Управление подключёнными пользовательскими и бот-сессиями'],
   sip: ['SIP-аккаунты', 'Регистрация в АТС и привязка к агентам для голосовых звонков'],
@@ -56,7 +58,8 @@ const title: Record<Page, [string, string]> = {
 const PM_SKILLS_TEMPLATE = `Память (Mem0):
 - Факты по проекту: memory_add(..., category="project"|"decision"|"contact")
 - Глобальные предпочтения (язык, стиль): memory_add(..., global_scope=true)
-- Новый клиент/проект в чате: memory_set_project("project-slug", customer_id="client")
+- Заказчик и проект берутся из карточки «Заказчики» / привязки диалога — не выдумывай их.
+- Новый клиент в чате: memory_set_project("project-slug", customer_id="client") только если карточки ещё нет.
 - Перед уточнением сначала проверь память проекта и журнал решений.
 
 ice_tracker (MCP):
@@ -84,6 +87,7 @@ Cursor IDE:
 - done=false или отправленный prompt — это НЕ готовность.
 - Поиск/explore в Cursor — это не остановка. Не давай вторую задачу «продолжи, ты остановился».
 - Не пересылай Cursor необработанное сообщение клиента и не показывай заказчику raw Cursor output.
+- Работай только в проекте Cursor, привязанном к текущему заказчику.
 `
 
 const statusLabel: Record<string, string> = {
@@ -871,6 +875,7 @@ function ConversationDetailModal({ id, agentName, onClose, onClear, onUpdated }:
   onUpdated?: () => void
 }) {
   const loaded = useLoad(() => api.conversations.get(id), [id])
+  const customers = useLoad(api.customers.list, [])
   const conversation = loaded.data
   const [projectId, setProjectId] = useState('')
   const [customerId, setCustomerId] = useState('')
@@ -885,6 +890,11 @@ function ConversationDetailModal({ id, agentName, onClose, onClear, onUpdated }:
   const messages = useMemo(() => [...(conversation?.messages || [])].sort((a, b) =>
     new Date(a.message_at || a.created_at).getTime() - new Date(b.message_at || b.created_at).getTime()
   ), [conversation])
+  function pickCustomer(nextId: string) {
+    setCustomerId(nextId)
+    const match = (customers.data || []).find(item => String(item.id) === nextId)
+    if (match?.project_id) setProjectId(match.project_id)
+  }
   async function saveScope(clear = false) {
     if (!conversation) return
     setScopeBusy(true); setScopeError('')
@@ -919,16 +929,23 @@ function ConversationDetailModal({ id, agentName, onClose, onClear, onUpdated }:
         <span><small>Последняя активность</small><strong>{exactDate(conversation.last_message_at)}</strong></span>
       </div>
       <section className="summary-box">
-        <span>Scope памяти (опционально)</span>
-        <p>Привязка диалога к проекту/клиенту для изолированной долговременной памяти агента.</p>
+        <span>Заказчик и проект</span>
+        <p>Выберите карточку заказчика — проект подставится сам. Это же попадает в промпт агента.</p>
         <div className="form-grid" style={{ marginTop: 10 }}>
-          <Field label="Project ID"><input value={projectId} onChange={event => setProjectId(event.target.value)} placeholder="acme-site"/></Field>
-          <Field label="Customer ID"><input value={customerId} onChange={event => setCustomerId(event.target.value)} placeholder="acme-corp"/></Field>
+          <Field label="Заказчик" hint="Из раздела «Заказчики»">
+            <select value={customerId} onChange={event => pickCustomer(event.target.value)}>
+              <option value="">Без заказчика</option>
+              {(customers.data || []).map(item => (
+                <option key={item.id} value={item.id}>{item.name} · {item.project_id || item.id}</option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Project ID"><input value={projectId} onChange={event => setProjectId(event.target.value)} placeholder="lavve"/></Field>
         </div>
         {scopeError && <Alert message={scopeError}/>}
         <div className="head-actions" style={{ marginTop: 10 }}>
           <button className="primary compact" type="button" disabled={scopeBusy} onClick={() => void saveScope()}>
-            {scopeBusy ? <LoaderCircle className="spin" size={15}/> : null}Сохранить scope
+            {scopeBusy ? <LoaderCircle className="spin" size={15}/> : null}Сохранить
           </button>
           {(conversation.project_id || conversation.customer_id) && (
             <button className="secondary compact" type="button" disabled={scopeBusy} onClick={() => void saveScope(true)}>Сбросить</button>
@@ -1342,6 +1359,31 @@ function EmployeeScreen() {
       loading && !state ? <Loading/> :
       !state ? <div className="panel"><p className="transcript-empty">{error || 'Не удалось загрузить сотрудника.'}</p><button className="secondary" onClick={() => void load(agentId)}><RefreshCw size={15}/>Повторить</button></div> :
       state && <>
+      <section className="panel">
+        <SectionHead
+          title="Заказчик и проект Cursor"
+          text="Промпт сотрудника подставляет заказчика и проект из этой карточки. Список проектов — из MCP cursorremote."
+          action={<button className="secondary compact" type="button" onClick={() => window.dispatchEvent(new CustomEvent('ice:goto', { detail: 'customers' }))}>Открыть заказчиков</button>}
+        />
+        {(state.customers || []).length === 0 ? (
+          <p className="transcript-empty">Пока нет карточек. Создайте заказчика в разделе «Заказчики» и отметьте его по умолчанию для этого сотрудника.</p>
+        ) : (
+          <div className="list-panel">
+            {(state.customers || []).map(item => (
+              <div className="server-row" key={item.id}>
+                <span className="chip">{item.is_default ? 'default' : 'customer'}</span>
+                <div className="grow">
+                  <strong>{item.name}</strong>
+                  <small>{item.project_id || 'без project_id'}{item.cursor_workspace ? ` · ${item.cursor_workspace}` : ''}</small>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {(state.customers || []).find(item => item.is_default)?.prompt_block && (
+          <pre className="customer-prompt-inline">{(state.customers || []).find(item => item.is_default)?.prompt_block}</pre>
+        )}
+      </section>
       <section className="panel work-inbox">
         <SectionHead title={`Inbox · ${selectedRoster?.agent_name || state.agent_name || ''}`} text="Единица работы — кейс, не строка cron. Сторож смотрит открытые, а не пишет журнал тика."
           action={<div className="head-actions">
@@ -1577,6 +1619,177 @@ function EmployeeScreen() {
           </div>)}</div>}
       </section>
     </>}
+  </>
+}
+
+function CustomerForm({
+  value,
+  agents,
+  projects,
+  onClose,
+  onSave,
+  refreshingProjects,
+  onRefreshProjects,
+}: {
+  value: Partial<Customer>
+  agents: Agent[]
+  projects: CursorProjectOption[]
+  onClose: () => void
+  onSave: (value: Partial<Customer>) => Promise<void>
+  refreshingProjects?: boolean
+  onRefreshProjects?: () => void
+}) {
+  const [form, setForm] = useState<Partial<Customer>>(value)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const patch = (next: Partial<Customer>) => setForm(current => ({ ...current, ...next }))
+  const selectedWorkspace = form.cursor_workspace || ''
+  return <Modal title={form.id ? 'Заказчик' : 'Новый заказчик'} subtitle="Имя заказчика и проект Cursor MCP. Из этой карточки собирается блок промпта." onClose={onClose}>
+    <form onSubmit={async event => {
+      event.preventDefault(); setBusy(true); setError('')
+      try {
+        await onSave(form)
+        onClose()
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Не удалось сохранить')
+        setBusy(false)
+      }
+    }}>
+      {error && <Alert message={error}/>}
+      <div className="form-grid">
+        <Field label="Название заказчика" hint="Как представлять в переписке"><input required value={form.name || ''} onChange={e => patch({ name: e.target.value })} placeholder="Типография LAVVE"/></Field>
+        <Field label="ID" hint="Латиница, уникальный slug"><input required={!form.id} disabled={Boolean(value.id)} value={form.id || ''} onChange={e => patch({ id: e.target.value })} placeholder="lavve"/></Field>
+        <Field label="Сотрудник" hint="Кому по умолчанию привязать"><select value={form.agent_id ? String(form.agent_id) : ''} onChange={e => patch({ agent_id: e.target.value || null })}><option value="">Без сотрудника</option>{agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></Field>
+        <Field label="Проект Cursor MCP" hint="Список из MCP cursorremote + allowlist" wide>
+          <div className="head-actions" style={{ marginBottom: 8 }}>
+            <button type="button" className="secondary compact" disabled={refreshingProjects} onClick={() => onRefreshProjects?.()}>
+              {refreshingProjects ? <LoaderCircle className="spin" size={14}/> : <RefreshCw size={14}/>}Обновить проекты
+            </button>
+          </div>
+          <select
+            value={selectedWorkspace || (form.project_id ? `__project__:${form.project_id}` : '')}
+            onChange={e => {
+              const raw = e.target.value
+              if (!raw) {
+                patch({ cursor_workspace: '', cursor_window_id: null, project_id: form.project_id || '' })
+                return
+              }
+              if (raw.startsWith('__project__:')) {
+                const projectId = raw.slice('__project__:'.length)
+                patch({ project_id: projectId, cursor_workspace: '', cursor_window_id: null })
+                return
+              }
+              const match = projects.find(item => (item.workspace || item.project_id) === raw || item.workspace === raw)
+              if (match) {
+                patch({
+                  cursor_workspace: match.workspace || '',
+                  cursor_window_id: match.window_id || null,
+                  project_id: match.project_id || form.project_id || match.id,
+                })
+              } else {
+                patch({ cursor_workspace: raw })
+              }
+            }}
+          >
+            <option value="">Выберите проект Cursor…</option>
+            {projects.map(item => (
+              <option key={`${item.source}-${item.workspace || item.project_id || item.id}`} value={item.workspace || item.project_id || item.id}>
+                {item.label}{item.workspace ? ` · ${item.workspace}` : ''}{item.source === 'live' ? ' · live' : item.source === 'allowlist' ? ' · allowlist' : ''}
+              </option>
+            ))}
+          </select>
+          <input style={{ marginTop: 8 }} value={form.cursor_workspace || ''} onChange={e => patch({ cursor_workspace: e.target.value })} placeholder="Или путь вручную: D:\projects\…"/>
+        </Field>
+        <Field label="Project ID" hint="Slug для PM / memory"><input value={form.project_id || ''} onChange={e => patch({ project_id: e.target.value })} placeholder="lavve"/></Field>
+        <Field label="Заметки" wide><textarea rows={3} value={form.notes || ''} onChange={e => patch({ notes: e.target.value })} placeholder="Контакты, договорённости, нюансы"/></Field>
+        <div className="toggle-box wide"><Toggle label="Заказчик по умолчанию для выбранного сотрудника" checked={Boolean(form.is_default)} onChange={v => patch({ is_default: v })}/></div>
+      </div>
+      {(form.name || form.project_id || form.cursor_workspace) && (
+        <section className="customer-prompt-preview">
+          <strong>Блок промпта</strong>
+          <pre>{[
+            '## Заказчик и проект',
+            `Заказчик: ${form.name || '—'} (id=${form.id || '…'}).`,
+            form.project_id ? `Проект разработки: ${form.project_id}.` : null,
+            form.cursor_workspace ? `Проект Cursor MCP: ${form.cursor_workspace}.` : null,
+            'Представляйся и веди работу от имени этого заказчика и этого проекта.',
+          ].filter(Boolean).join('\n')}</pre>
+        </section>
+      )}
+      <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Отмена</button><button className="primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16}/> : null}Сохранить</button></div>
+    </form>
+  </Modal>
+}
+
+function CustomersScreen() {
+  const agents = useLoad(api.agents.list, [])
+  const loaded = useLoad(api.customers.list, [])
+  const projects = useLoad(api.cursor.projects, [])
+  const [editing, setEditing] = useState<Partial<Customer> | null>(null)
+  const [deleting, setDeleting] = useState<Customer | null>(null)
+  const [filterAgent, setFilterAgent] = useState('')
+  const items = (loaded.data || []).filter(item => !filterAgent || String(item.agent_id || '') === filterAgent)
+  const agentName = (id?: string | null) => agents.data?.find(agent => String(agent.id) === String(id))?.name || (id ? `Агент ${id}` : 'Без сотрудника')
+  return <>
+    {(loaded.error || agents.error || projects.error) && <Alert message={loaded.error || agents.error || projects.error || ''}/>}
+    <SectionHead
+      title={`${items.length} заказчиков`}
+      text="Укажите заказчика и выберите доступный проект Cursor MCP. Промпт сотрудника подставит их сам."
+      action={<button className="primary" onClick={() => setEditing({ name: '', id: '', notes: '', project_id: '', cursor_workspace: '', is_default: true, agent_id: filterAgent || undefined })}><Plus size={17}/>Новый заказчик</button>}
+    />
+    <form className="filter-bar" onSubmit={e => e.preventDefault()}>
+      <select aria-label="Сотрудник" value={filterAgent} onChange={e => setFilterAgent(e.target.value)}>
+        <option value="">Все сотрудники</option>
+        {(agents.data || []).map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+      </select>
+      <button type="button" className="secondary" onClick={() => void projects.refresh()}><RefreshCw size={15}/>Проекты Cursor</button>
+    </form>
+    {loaded.loading ? <Loading/> : items.length === 0 ? <Empty icon={Users} title="Заказчиков пока нет" text="Создайте карточку и привяжите проект из MCP Cursor."/> :
+      <div className="card-grid">{items.map(item => <article className="entity-card" key={item.id}>
+        <div className="entity-top"><span className="entity-avatar"><Users/></span>{item.is_default ? <span className="chip">по умолчанию</span> : <span className="chip">заказчик</span>}</div>
+        <h3>{item.name}</h3>
+        <p>{item.notes || 'Без заметок.'}</p>
+        <div className="binding-list">
+          <span><Briefcase size={13}/>{agentName(item.agent_id)}</span>
+          <span><ServerCog size={13}/>{item.project_id || '—'}</span>
+        </div>
+        <div className="entity-meta"><span>{item.cursor_workspace || 'Cursor workspace не задан'}</span><span>id={item.id}</span></div>
+        {item.prompt_block && <pre className="customer-prompt-inline">{item.prompt_block}</pre>}
+        <div className="card-actions">
+          <button className="secondary" onClick={() => setEditing(item)}>Изменить</button>
+          <button className="icon-button danger-ghost" onClick={() => setDeleting(item)}><Trash2 size={17}/></button>
+        </div>
+      </article>)}</div>}
+    {editing && <CustomerForm
+      value={editing}
+      agents={agents.data || []}
+      projects={projects.data || []}
+      refreshingProjects={projects.loading}
+      onRefreshProjects={() => void projects.refresh()}
+      onClose={() => setEditing(null)}
+      onSave={async value => {
+        const payload = {
+          id: value.id,
+          name: value.name || '',
+          notes: value.notes || '',
+          agent_id: value.agent_id || null,
+          project_id: value.project_id || '',
+          cursor_workspace: value.cursor_workspace || '',
+          cursor_window_id: value.cursor_window_id || null,
+          is_default: Boolean(value.is_default),
+        }
+        if (editing.id && (loaded.data || []).some(item => item.id === editing.id)) {
+          await api.customers.update(String(editing.id), payload)
+        } else {
+          await api.customers.create(payload)
+        }
+        await loaded.refresh()
+      }}
+    />}
+    {deleting && <ConfirmDelete name={deleting.name} onClose={() => setDeleting(null)} onDelete={async () => {
+      await api.customers.remove(String(deleting.id))
+      loaded.setData((loaded.data || []).filter(item => item.id !== deleting.id))
+    }}/>}
   </>
 }
 
@@ -1949,11 +2162,20 @@ export default function App() {
   })
   useEffect(() => { const unauthorized = () => { localStorage.removeItem('ice_token'); setAuthenticated(false) }; window.addEventListener('ice:unauthorized', unauthorized); return () => window.removeEventListener('ice:unauthorized', unauthorized) }, [])
   useEffect(() => { sessionStorage.setItem('ice_page', page) }, [page])
+  useEffect(() => {
+    const go = (event: Event) => {
+      const detail = (event as CustomEvent<string>).detail
+      if (detail === 'customers') setPage('customers')
+    }
+    window.addEventListener('ice:goto', go as EventListener)
+    return () => window.removeEventListener('ice:goto', go as EventListener)
+  }, [])
   if (!authenticated) return <Login onLogin={() => setAuthenticated(true)}/>
   const screen = {
     dashboard: <DashboardScreen go={setPage}/>, agents: <AgentsScreen/>, telegram: <TelegramScreen/>,
     sip: <SipScreen/>, calls: <CallsScreen/>,
-    conversations: <ConversationsScreen/>, employee: <EmployeeScreen/>, connections: <ConnectionsScreen/>, runtime: <RuntimeScreen/>, memory: <MemoryScreen/>, mcp: <McpScreen/>, cron: <CronScreen/>, settings: <SettingsScreen/>,
+    conversations: <ConversationsScreen/>, employee: <EmployeeScreen/>, customers: <CustomersScreen/>,
+    connections: <ConnectionsScreen/>, runtime: <RuntimeScreen/>, memory: <MemoryScreen/>, mcp: <McpScreen/>, cron: <CronScreen/>, settings: <SettingsScreen/>,
     logs: <LiveScreen mode="logs"/>, tasks: <LiveScreen mode="tasks"/>,
   }[page] ?? <DashboardScreen go={setPage}/>
   return <Shell page={page} setPage={setPage} logout={() => { localStorage.removeItem('ice_token'); setAuthenticated(false) }}>{screen}</Shell>

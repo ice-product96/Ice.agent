@@ -1,7 +1,7 @@
 import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
   Conversation, ConversationDetail, Consultation, EmployeePolicy, EmployeePolicyCatalog, EmployeeProfile, EmployeeRosterEntry, EmployeeState,
-  LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
+  Customer, CursorProjectOption, LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
   PmProjectDetail, ProjectState, RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts,
 } from './types'
 
@@ -128,6 +128,34 @@ export const api = {
     project: (id: string) => request<PmProjectDetail>(`/pm/projects/${encodeURIComponent(id)}`),
     updateProject: (id: string, data: Pick<ProjectState, 'autonomy_level'> & { config?: Record<string, unknown> }) =>
       request<ProjectState>(`/pm/projects/${encodeURIComponent(id)}`, { method: 'PATCH', ...body(data) }),
+  },
+  customers: {
+    list: (agentId?: string) =>
+      request<Customer[]>(`/customers${qs({ agent_id: agentId })}`),
+    create: (data: {
+      id?: string
+      name: string
+      notes?: string
+      agent_id?: string | null
+      project_id?: string
+      cursor_workspace?: string
+      cursor_window_id?: string | null
+      is_default?: boolean
+    }) => request<Customer>('/customers', { method: 'POST', ...body(data) }),
+    update: (id: string, data: {
+      id?: string
+      name: string
+      notes?: string
+      agent_id?: string | null
+      project_id?: string
+      cursor_workspace?: string
+      cursor_window_id?: string | null
+      is_default?: boolean
+    }) => request<Customer>(`/customers/${encodeURIComponent(id)}`, { method: 'PATCH', ...body(data) }),
+    remove: (id: string) => request<void>(`/customers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  },
+  cursor: {
+    projects: () => request<CursorProjectOption[]>('/cursor/projects'),
   },
   consultations: {
     list: (agentId?: string, status = 'open') =>

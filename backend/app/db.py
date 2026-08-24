@@ -430,6 +430,22 @@ class ProjectState(TimestampMixin, Base):
     config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class Customer(TimestampMixin, Base):
+    """Customer card with optional default agent and Cursor MCP project binding."""
+
+    __tablename__ = "customers"
+    id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), default="")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    agent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agents.id", ondelete="SET NULL"), index=True
+    )
+    project_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    cursor_workspace: Mapped[str] = mapped_column(String(512), default="")
+    cursor_window_id: Mapped[str | None] = mapped_column(String(128))
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
 class DecisionRecord(Base):
     __tablename__ = "decision_records"
     __table_args__ = (
