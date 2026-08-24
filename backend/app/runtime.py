@@ -1199,7 +1199,7 @@ class AgentRuntime:
 
                 async def cursorremote_do(prompt: str) -> dict[str, Any]:
                     """Send a task to Cursor IDE, auto-click Allow/Accept/Run, wait until it actually finishes or times out."""
-                    from .work_items import get_work_item
+                    from .work_items import cursor_prompt_already_active, get_work_item
 
                     item = await get_work_item(db, (context or {}).get("work_item_id"))
                     if (context or {}).get("_intake_collecting") or (
@@ -1218,16 +1218,12 @@ class AgentRuntime:
                     is_fresh_assignment = bool((context or {}).get("_intake_flush")) or str(
                         (context or {}).get("source") or ""
                     ) in {"intake_flush", "consult_resolved"}
-                    in_flight = (
-                        not is_fresh_assignment
-                        and item is not None
-                        and (
-                            item.status == "waiting_external"
-                            or bool((item.metadata_json or {}).get("cursor_in_flight"))
-                        )
-                    )
                     already_sent = bool(cursor_state.get("prompt_sent"))
-                    if in_flight or already_sent:
+                    if cursor_prompt_already_active(
+                        item,
+                        already_sent=already_sent,
+                        is_fresh_assignment=is_fresh_assignment,
+                    ):
                         result = await check_and_drive(cursor_session)
                         result = {
                             **result,

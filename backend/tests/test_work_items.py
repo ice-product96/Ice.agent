@@ -138,6 +138,46 @@ async def test_pm_cursor_done_requires_explicit_qa_acceptance(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_leftover_idle_unsticks_waiting_external(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "leftover-idle.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="LAVVE carousel",
+            goal="починить карусель",
+            status="waiting_external",
+            metadata_json={"cursor_in_flight": False},
+        )
+        db.add(item)
+        await db.commit()
+        await after_agent_run(
+            db,
+            agent,
+            {"work_item_id": item.id},
+            "Cursor idle leftover",
+            [
+                {
+                    "tool": "cursorremote_do",
+                    "status": "success",
+                    "result": {
+                        "done": True,
+                        "skipped_prompt": True,
+                        "prompt_sent": False,
+                        "summary": "idle leftover from ssh MCP chat",
+                    },
+                }
+            ],
+        )
+        assert item.status == "in_progress"
+        assert not (item.metadata_json or {}).get("cursor_in_flight")
+        assert "Cursor" in (item.next_action or "")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_handle_run_failure_retries_then_consults(tmp_path: Path) -> None:
     engine, sessions = await sessions_for(tmp_path / "fail.db")
     scheduler = FakeScheduler()

@@ -388,6 +388,25 @@ async def mark_intake_executing(
     )
 
 
+def cursor_prompt_already_active(
+    item: WorkItem | None,
+    *,
+    already_sent: bool = False,
+    is_fresh_assignment: bool = False,
+) -> bool:
+    """True only when THIS case already sent a live Cursor job.
+
+    A leftover idle Composer (done=true from another window/workspace) can leave
+    status=waiting_external without cursor_in_flight. That must not block a new
+    prompt — otherwise LAVVE-style cases get stuck after an unrelated MCP chat.
+    """
+    if already_sent:
+        return True
+    if is_fresh_assignment or item is None:
+        return False
+    return bool((item.metadata_json or {}).get("cursor_in_flight"))
+
+
 async def reset_cursor_assignment(
     db: AsyncSession,
     item: WorkItem,
@@ -894,6 +913,31 @@ async def after_agent_run(
             wait_until=utcnow() + timedelta(minutes=2),
             event_title="Жду Cursor",
             event_detail="Задание принято, но Cursor ещё не опрошен.",
+        )
+        return item
+
+    leftover_idle = (
+        item.status == "waiting_external"
+        and not cursor_busy
+        and not cursor_done
+        and not scheduled_at
+        and cursor_called
+    )
+    if leftover_idle:
+        meta = dict(item.metadata_json or {})
+        meta["cursor_in_flight"] = False
+        item.metadata_json = meta
+        await set_status(
+            db,
+            item,
+            "in_progress",
+            next_action="Отправить задачу в Cursor — предыдущий job уже idle",
+            wait_owner="self",
+            event_title="Cursor свободен",
+            event_detail=(
+                "Leftover idle from another Composer/window is not this assignment. "
+                "cursorremote_do may send a new prompt."
+            ),
         )
         return item
 

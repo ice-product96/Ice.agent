@@ -9,6 +9,7 @@ from app.employee_policy import customer_intake_flush_instruction, customer_inta
 from app.work_items import (
     begin_customer_intake,
     compile_intake_brief,
+    cursor_prompt_already_active,
     mark_intake_executing,
     should_collect_customer_intake,
     watchdog_items,
@@ -198,6 +199,21 @@ async def test_watchdog_skips_collecting_when_flush_job_exists(tmp_path: Path) -
         items = await watchdog_items(db, agent.id)
         assert item.id not in {row.id for row in items}
     await engine.dispose()
+
+
+def test_cursor_prompt_already_active_ignores_stale_waiting_external() -> None:
+    leftover = WorkItem(
+        agent_id=1,
+        title="LAVVE",
+        status="waiting_external",
+        metadata_json={"cursor_in_flight": False},
+    )
+    assert cursor_prompt_already_active(leftover) is False
+    leftover.metadata_json = {"cursor_in_flight": True}
+    assert cursor_prompt_already_active(leftover) is True
+    assert cursor_prompt_already_active(leftover, is_fresh_assignment=True) is False
+    assert cursor_prompt_already_active(leftover, already_sent=True) is True
+    assert cursor_prompt_already_active(None) is False
 
 
 @pytest.mark.asyncio
