@@ -1308,6 +1308,8 @@ class AgentRuntime:
                         run: CursorRun,
                         result: dict[str, Any],
                     ) -> dict[str, Any]:
+                        from .pm_state import is_leftover_cursor_idle, parse_cursor_result
+
                         if not result.get("done"):
                             await update_cursor_run(db, run, status="running", result=result)
                             await db.commit()
@@ -1317,6 +1319,50 @@ class AgentRuntime:
                                 "status": "in_progress",
                                 "done": False,
                             }
+                        # Idle Composer from another chat/job must not finalize this run.
+                        if is_leftover_cursor_idle(result):
+                            await update_cursor_run(
+                                db,
+                                run,
+                                status="cancelled",
+                                result=result,
+                                error=(
+                                    "Leftover idle Cursor summary — prompt was not for this "
+                                    "assignment"
+                                ),
+                            )
+                            if item.pm_phase == "IN_DEVELOPMENT":
+                                await transition_pm_phase(
+                                    db,
+                                    item,
+                                    "READY_FOR_DEV",
+                                    detail="Leftover Cursor idle; resubmit when Composer is free",
+                                )
+                            meta = dict(item.metadata_json or {})
+                            meta["cursor_in_flight"] = False
+                            item.metadata_json = meta
+                            item.active_cursor_run_id = None
+                            item.status = "in_progress"
+                            item.wait_owner = "self"
+                            item.next_action = (
+                                "Cursor was idle from another job. "
+                                "Resubmit with submit_development_task when Composer is free."
+                            )
+                            item.last_error = None
+                            await db.commit()
+                            return {
+                                "task_id": str(item.id),
+                                "run_id": run.id,
+                                "status": "leftover_idle",
+                                "done": False,
+                                "leftover": True,
+                                "reason": (
+                                    "Leftover idle from another Cursor job — not this task. "
+                                    "Do not consult the manager. Wait until Composer is free, "
+                                    "then call submit_development_task again."
+                                ),
+                                "result": result,
+                            }
                         structured: dict[str, Any] | None = None
                         candidates = [result.get("result"), result.get("summary")]
                         candidates.extend(
@@ -1324,11 +1370,13 @@ class AgentRuntime:
                             if isinstance(result.get("messages"), list)
                             else []
                         )
-                        from .pm_state import parse_cursor_result
-
                         for candidate in candidates:
                             if isinstance(candidate, dict):
-                                candidate = candidate.get("content") or candidate.get("text") or candidate
+                                candidate = (
+                                    candidate.get("content")
+                                    or candidate.get("text")
+                                    or candidate
+                                )
                             try:
                                 structured = parse_cursor_result(candidate)
                                 break
@@ -1336,15 +1384,51 @@ class AgentRuntime:
                                 continue
                         if structured is not None and str(
                             structured.get("task_id") or ""
-                        ) != str(item.id):
+                        ) not in {"", str(item.id)}:
+                            # Wrong task_id — treat as leftover contamination.
                             structured = None
+                            await update_cursor_run(
+                                db,
+                                run,
+                                status="cancelled",
+                                result=result,
+                                error="Cursor result task_id mismatch",
+                            )
+                            if item.pm_phase == "IN_DEVELOPMENT":
+                                await transition_pm_phase(
+                                    db,
+                                    item,
+                                    "READY_FOR_DEV",
+                                    detail="Cursor result belonged to another task",
+                                )
+                            meta = dict(item.metadata_json or {})
+                            meta["cursor_in_flight"] = False
+                            item.metadata_json = meta
+                            item.active_cursor_run_id = None
+                            item.status = "in_progress"
+                            item.wait_owner = "self"
+                            item.next_action = "Resubmit development — previous Cursor result mismatched task_id"
+                            item.last_error = None
+                            await db.commit()
+                            return {
+                                "task_id": str(item.id),
+                                "run_id": run.id,
+                                "status": "leftover_idle",
+                                "done": False,
+                                "leftover": True,
+                                "reason": "Cursor result task_id mismatch — resubmit",
+                                "result": result,
+                            }
                         if structured is None:
                             structured = {
                                 "status": "blocked",
-                                "implementation": {"summary": str(result.get("summary") or "")},
+                                "implementation": {
+                                    "summary": str(result.get("summary") or "")
+                                },
                                 "verification": {},
                                 "questions": [
-                                    "Cursor returned no valid structured completion payload."
+                                    "Cursor returned no valid structured completion payload. "
+                                    "Ask Cursor to reply with the required JSON schema only."
                                 ],
                                 "risks": [],
                                 "limitations": [],

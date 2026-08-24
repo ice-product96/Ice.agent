@@ -52,7 +52,7 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
         }
     ),
     "IN_DEVELOPMENT": frozenset(
-        {"DEV_COMPLETE", "CHANGES_REQUESTED", "BLOCKED", "CANCELLED"}
+        {"DEV_COMPLETE", "CHANGES_REQUESTED", "BLOCKED", "READY_FOR_DEV", "CANCELLED"}
     ),
     "BLOCKED": frozenset(
         {
@@ -319,23 +319,52 @@ def render_task_brief(item: WorkItem) -> str:
 task_brief = render_task_brief
 
 
+def extract_json_object(text: str) -> dict[str, Any] | None:
+    """Pull the first JSON object from prose or a fenced block."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL)
+    if fenced:
+        raw = fenced.group(1).strip()
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            value = json.loads(raw[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return value if isinstance(value, dict) else None
+
+
+def is_leftover_cursor_idle(result: Mapping[str, Any] | None) -> bool:
+    """True when Cursor looks idle but this assignment did not actually run."""
+    if not isinstance(result, Mapping):
+        return False
+    if result.get("skipped_prompt"):
+        return True
+    if result.get("prompt_sent"):
+        return False
+    if result.get("seen_busy"):
+        return False
+    # check_and_drive / busy-skip path: idle Composer from another chat.
+    return bool(result.get("done"))
+
+
 def parse_cursor_result(result: str | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(result, Mapping):
         parsed = dict(result)
     else:
         if not isinstance(result, str):
             raise ValueError("Cursor result must be a JSON object or JSON string")
-        text = result.strip()
-        fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL)
-        candidate = fenced.group(1) if fenced else text
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError:
+        value = extract_json_object(result)
+        if value is None:
             raise ValueError("Cursor result must be a structured JSON object")
-        else:
-            if not isinstance(value, dict):
-                raise ValueError("Cursor result JSON must be an object")
-            parsed = value
+        parsed = value
 
     status = str(parsed.get("status", "")).strip().lower()
     status_aliases = {"success": "completed", "succeeded": "completed", "error": "failed"}

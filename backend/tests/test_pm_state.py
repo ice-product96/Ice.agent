@@ -355,3 +355,18 @@ def test_brief_and_result_parsing_are_canonical() -> None:
     assert parsed["verification"]["tests_passed"] is True
     with pytest.raises(ValueError):
         parse_cursor_result("plain summary")
+
+    embedded = parse_cursor_result(
+        'Готово.\n{"status":"blocked","implementation":{"summary":"need ssh"},'
+        '"verification":{},"questions":["give key"],"risks":[],"limitations":[]}\n'
+    )
+    assert embedded["status"] == "blocked"
+    assert embedded["implementation"]["summary"] == "need ssh"
+
+    from app.pm_state import is_leftover_cursor_idle
+
+    assert is_leftover_cursor_idle({"done": True, "skipped_prompt": True})
+    assert is_leftover_cursor_idle({"done": True})
+    assert not is_leftover_cursor_idle({"done": True, "prompt_sent": True})
+    assert not is_leftover_cursor_idle({"done": True, "seen_busy": True})
+    assert not is_leftover_cursor_idle({"done": False})
