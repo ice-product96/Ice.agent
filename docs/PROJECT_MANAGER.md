@@ -1,10 +1,10 @@
-# Project-manager workflow
+# Рабочий процесс менеджера проектов
 
-This document describes the project-manager implementation currently present in **ice.agent**. The application is the existing FastAPI/SQLAlchemy service; it is not Hermes and does not introduce a second runtime. Existing LLM model and provider configuration is deliberately unchanged.
+Этот документ описывает реализацию менеджера проектов, которая сейчас присутствует в **ice.agent**. Приложение представляет собой существующий сервис FastAPI/SQLAlchemy; это не Hermes, и оно не добавляет второй runtime. Существующая конфигурация модели и провайдера LLM намеренно оставлена без изменений.
 
-## Activation and existing context
+## Активация и существующий контекст
 
-PM behavior is opt-in per Employee profile. The default Employee policy contains `"pm_mode": false`; enable it in the Employee UI or by PATCHing `/api/v1/agents/{agent_id}/employee` while preserving the rest of the policy:
+Поведение PM включается отдельно для каждого профиля Employee. Политика Employee по умолчанию содержит `"pm_mode": false`; включите его в интерфейсе Employee или отправив PATCH-запрос к `/api/v1/agents/{agent_id}/employee` с сохранением остальной части политики:
 
 ```json
 {
@@ -14,19 +14,19 @@ PM behavior is opt-in per Employee profile. The default Employee policy contains
 }
 ```
 
-The PM instruction and tools are layered into the existing runtime only when this flag is true. Existing `PromptSection` records (`identity`, `role`, `rules`, `skills`, `tone`, and `self_notes`), scoped Mem0 retrieval, and rolling conversation summaries continue to supply context. The implementation does not replace those mechanisms.
+Инструкция и инструменты PM добавляются в существующий runtime только тогда, когда этот флаг имеет значение true. Существующие записи `PromptSection` (`identity`, `role`, `rules`, `skills`, `tone` и `self_notes`), получение данных из Mem0 с учётом области видимости и скользящие сводки диалогов продолжают предоставлять контекст. Реализация не заменяет эти механизмы.
 
-Inbound Telegram messages are converted to the channel-neutral `NormalizedInboundEvent` envelope before entering the runtime. It carries `channel`, `conversation_id`, `message_id`, `client_id`, optional `project_id`, text, attachments, timestamp, thread, and channel metadata. This preserves source identity while allowing PM logic to consume a normalized context.
+Входящие сообщения Telegram преобразуются в независимую от канала оболочку `NormalizedInboundEvent` перед поступлением в runtime. Она содержит `channel`, `conversation_id`, `message_id`, `client_id`, необязательный `project_id`, текст, вложения, временную метку, ветку и метаданные канала. Это сохраняет идентификацию источника и одновременно позволяет логике PM использовать нормализованный контекст.
 
-## Persistent PM state
+## Персистентное состояние PM
 
-- `WorkItem` is the authoritative task record. It now stores task type, business context, requirements, acceptance criteria, constraints, edge cases, priority, PM phase, source message ID, and the active Cursor run.
-- `WorkItemEvent` is the append-only task timeline/audit stream. Phase transitions, scope changes, tool activity, fixes, and QA acceptance are recorded here.
-- `ProjectState` stores per-project configuration and autonomy. Its levels are `LEVEL_0` through `LEVEL_3`; a newly created project defaults to `LEVEL_1`.
-- `DecisionRecord` stores idempotent project or task decisions, including topic, rationale, confirmer, source message, and context.
-- `CursorRun` stores each development attempt, its idempotency key, request, status, structured result, error, and timestamps. A task cannot have two active runs.
+- `WorkItem` — авторитетная запись задачи. Теперь она хранит тип задачи, бизнес-контекст, требования, критерии приёмки, ограничения, пограничные случаи, приоритет, фазу PM, ID исходного сообщения и активный запуск Cursor.
+- `WorkItemEvent` — доступная только для добавления временная шкала задачи и поток аудита. Здесь фиксируются переходы между фазами, изменения области работ, действия инструментов, исправления и приёмка QA.
+- `ProjectState` хранит конфигурацию и уровень автономности отдельного проекта. Уровни варьируются от `LEVEL_0` до `LEVEL_3`; новый проект по умолчанию получает `LEVEL_1`.
+- `DecisionRecord` идемпотентно хранит решения по проекту или задаче, включая тему, обоснование, подтвердившего, исходное сообщение и контекст.
+- `CursorRun` хранит каждую попытку разработки, её ключ идемпотентности, запрос, статус, структурированный результат, ошибку и временные метки. У задачи не может быть двух активных запусков.
 
-The canonical PM phases are:
+Канонические фазы PM:
 
 ```text
 DISCUSSION → CLARIFICATION → REQUIREMENTS_READY → CLIENT_CONFIRMED
@@ -34,61 +34,61 @@ DISCUSSION → CLARIFICATION → REQUIREMENTS_READY → CLIENT_CONFIRMED
 → CLIENT_REVIEW → DONE
 ```
 
-The state machine also supports `BLOCKED`, `CHANGES_REQUESTED`, and `CANCELLED`, with explicit allowed transitions. Not every task visits every phase: for example, a ready task may move from `REQUIREMENTS_READY` directly to `READY_FOR_DEV` when its autonomy gate permits it. Invalid transitions are rejected and readiness gates require a goal, task type, requirements, and acceptance criteria.
+Конечный автомат также поддерживает `BLOCKED`, `CHANGES_REQUESTED` и `CANCELLED` с явно заданными разрешёнными переходами. Не каждая задача проходит через все фазы: например, готовая задача может перейти из `REQUIREMENTS_READY` непосредственно в `READY_FOR_DEV`, если это допускает её проверка автономности. Недопустимые переходы отклоняются, а проверки готовности требуют наличия цели, типа задачи, требований и критериев приёмки.
 
-## Semantic tool surface
+## Семантический набор инструментов
 
-With `pm_mode` enabled, the runtime exposes:
+При включённом `pm_mode` runtime предоставляет:
 
-- `pm_structure_task` — create/update a structured, deduplicated `WorkItem`; `create_new_task=true` starts a separate requirement in the same conversation instead of overwriting the current task; raw customer text is not sent directly to development.
-- `pm_get_task` — read authoritative task, decisions, Cursor runs, and audit events.
-- `pm_record_decision` — persist a confirmed decision idempotently.
-- `pm_transition_task` — apply a valid PM phase transition and append an event.
-- `submit_development_task` — enforce readiness and autonomy, render a task brief, create a `CursorRun`, and submit it.
-- `get_development_status` — poll the active run and persist progress or completion.
-- `get_development_result` — read the persisted structured result without changing state.
-- `request_development_fix` — record failed QA/change state and start a distinct follow-up attempt.
-- `pm_accept_task` — mark `DONE` only after tests and lint pass and the latest run supplies passing evidence for every stored acceptance criterion.
+- `pm_structure_task` — создаёт или обновляет структурированный дедуплицированный `WorkItem`; `create_new_task=true` начинает отдельное требование в том же диалоге вместо перезаписи текущей задачи; необработанный текст заказчика не отправляется напрямую в разработку.
+- `pm_get_task` — читает авторитетную задачу, решения, запуски Cursor и события аудита.
+- `pm_record_decision` — идемпотентно сохраняет подтверждённое решение.
+- `pm_transition_task` — применяет допустимый переход между фазами PM и добавляет событие.
+- `submit_development_task` — обеспечивает соблюдение требований готовности и автономности, формирует описание задачи, создаёт `CursorRun` и отправляет его.
+- `get_development_status` — опрашивает активный запуск и сохраняет ход выполнения или завершение.
+- `get_development_result` — читает сохранённый структурированный результат без изменения состояния.
+- `request_development_fix` — фиксирует неуспешное состояние QA или состояние изменения и запускает отдельную последующую попытку.
+- `pm_accept_task` — устанавливает `DONE` только после успешного прохождения тестов и lint, а также если последний запуск предоставляет свидетельство успешной проверки каждого сохранённого критерия приёмки.
 
-The existing `CursorRemote` MCP transport is reused. PM mode wraps it with the semantic development tools above and removes the generic CursorRemote run/tool entry points from the agent's tool registry, preventing arbitrary raw prompts from bypassing task structure. The CursorRemote server still must be named `cursorremote`, use a bearer token, be restricted to an allowlisted workspace, and be explicitly attached to the agent.
+Существующий транспорт MCP `CursorRemote` используется повторно. Режим PM дополняет его перечисленными выше семантическими инструментами разработки и удаляет универсальные точки входа запуска и инструментов CursorRemote из реестра инструментов агента, не позволяя произвольным необработанным промптам обходить структуру задачи. Сервер CursorRemote по-прежнему должен называться `cursorremote`, использовать bearer-токен, быть ограничен рабочей областью из списка разрешённых и явно подключён к агенту.
 
-## Autonomy and least privilege
+## Автономность и минимальные привилегии
 
-Project autonomy controls development submission:
+Автономность проекта управляет отправкой задач в разработку:
 
-- `LEVEL_0`: observe/plan; development requires confirmation.
-- `LEVEL_1` (default): only a small bug fix inside agreed scope may proceed without further confirmation.
-- `LEVEL_2`: work inside agreed scope may proceed.
-- `LEVEL_3`: ordinary development may proceed, but it does not bypass high-risk or out-of-scope confirmation.
+- `LEVEL_0`: наблюдение и планирование; разработка требует подтверждения.
+- `LEVEL_1` (по умолчанию): без дополнительного подтверждения можно выполнять только небольшое исправление ошибки в согласованной области работ.
+- `LEVEL_2`: можно выполнять работы в согласованной области.
+- `LEVEL_3`: можно выполнять обычную разработку, но подтверждение всё равно требуется для работ с высоким риском или за пределами согласованной области.
 
-High-risk work and work outside agreed scope remain gated. Commercial terms, serious deadline commitments, scope conflicts, destructive production actions, security incidents, production-data deletion, and billing changes must be escalated.
-High-risk `owner_approved` state is accepted only from a persisted consultation whose status is `approved` and which records the approver; an ordinary admin message or rejected consultation is not approval. `CLIENT_CONFIRMED` records the current identifiable client message as provenance.
+Работы с высоким риском и работы за пределами согласованной области по-прежнему требуют разрешения. Коммерческие условия, серьёзные обязательства по срокам, конфликты области работ, разрушительные действия в production, инциденты безопасности, удаление production-данных и изменения биллинга необходимо эскалировать.
+Состояние высокого риска `owner_approved` принимается только из сохранённой консультации со статусом `approved`, в которой указан утвердивший; обычное сообщение администратора или отклонённая консультация не считаются одобрением. `CLIENT_CONFIRMED` фиксирует текущее идентифицируемое сообщение клиента как источник происхождения.
 
-Apply least privilege:
+Применяйте принцип минимальных привилегий:
 
-1. Keep `pm_mode` disabled for employees that do not manage development.
-2. Attach only the MCP servers an agent needs. CursorRemote is not inherited merely because MCP is enabled.
-3. Restrict CursorRemote to the exact workspace and keep its bearer token secret.
-4. Grant the `cursorremote` mutating permission only to the PM agent that submits work.
-5. Start projects at `LEVEL_1`; raise autonomy only for a documented reason and lower it when the broader permission is no longer needed.
-6. Treat `WorkItemEvent`, `DecisionRecord`, and `CursorRun` as the audit trail; do not infer completion from conversational text.
+1. Оставляйте `pm_mode` отключённым для сотрудников, которые не управляют разработкой.
+2. Подключайте только те серверы MCP, которые нужны агенту. CursorRemote не наследуется только на том основании, что MCP включён.
+3. Ограничьте CursorRemote конкретной рабочей областью и храните его bearer-токен в секрете.
+4. Предоставляйте изменяющее состояние разрешение `cursorremote` только тому агенту PM, который отправляет задачи.
+5. Запускайте проекты с `LEVEL_1`; повышайте автономность только по документально зафиксированной причине и снижайте её, когда более широкое разрешение больше не требуется.
+6. Считайте `WorkItemEvent`, `DecisionRecord` и `CursorRun` журналом аудита; не делайте вывод о завершении из текста диалога.
 
-## Inspecting and operating PM state
+## Просмотр состояния PM и управление им
 
-All `/api/v1` endpoints below require the admin bearer token returned by `POST /api/v1/auth/login`.
+Все перечисленные ниже endpoint-ы `/api/v1` требуют bearer-токен администратора, возвращаемый `POST /api/v1/auth/login`.
 
-| Operation | Endpoint |
+| Операция | Endpoint |
 | --- | --- |
-| List project states | `GET /api/v1/pm/projects` |
-| Project state, tasks, decisions | `GET /api/v1/pm/projects/{project_id}` |
-| Change autonomy/config | `PATCH /api/v1/pm/projects/{project_id}` |
-| List an agent's tasks | `GET /api/v1/agents/{agent_id}/work-items?status=all` |
-| Task details, decisions, runs, audit | `GET /api/v1/agents/{agent_id}/work-items/{work_item_id}` |
-| List attached MCP servers | `GET /api/v1/agents/{agent_id}/mcp-servers` |
-| Attach an MCP server | `PUT /api/v1/agents/{agent_id}/mcp-servers/{server_id}` |
-| Detach an MCP server | `DELETE /api/v1/agents/{agent_id}/mcp-servers/{server_id}` |
+| Получить список состояний проектов | `GET /api/v1/pm/projects` |
+| Состояние проекта, задачи и решения | `GET /api/v1/pm/projects/{project_id}` |
+| Изменить автономность или конфигурацию | `PATCH /api/v1/pm/projects/{project_id}` |
+| Получить список задач агента | `GET /api/v1/agents/{agent_id}/work-items?status=all` |
+| Сведения о задаче, решения, запуски и аудит | `GET /api/v1/agents/{agent_id}/work-items/{work_item_id}` |
+| Получить список подключённых серверов MCP | `GET /api/v1/agents/{agent_id}/mcp-servers` |
+| Подключить сервер MCP | `PUT /api/v1/agents/{agent_id}/mcp-servers/{server_id}` |
+| Отключить сервер MCP | `DELETE /api/v1/agents/{agent_id}/mcp-servers/{server_id}` |
 
-Example autonomy change:
+Пример изменения автономности:
 
 ```bash
 curl -X PATCH "http://127.0.0.1:8040/api/v1/pm/projects/acme" \
@@ -97,19 +97,19 @@ curl -X PATCH "http://127.0.0.1:8040/api/v1/pm/projects/acme" \
   -d '{"autonomy_level":"LEVEL_1"}'
 ```
 
-The task-detail response is the most complete inspection surface: `events` is the audit timeline, `decisions` contains task decisions, `cursor_runs` contains all development attempts, and `project` shows the effective autonomy. The Employee UI displays the same PM phase, project autonomy, decisions, and Cursor runs.
+Ответ с подробными сведениями о задаче предоставляет наиболее полные возможности просмотра: `events` — временная шкала аудита, `decisions` содержит решения по задаче, `cursor_runs` содержит все попытки разработки, а `project` показывает действующий уровень автономности. Интерфейс Employee отображает ту же фазу PM, автономность проекта, решения и запуски Cursor.
 
-## Migration
+## Миграция
 
-Revision `e1f2a3b4c5d6` (down revision `c9d0e1f2a3b4`) creates `project_states`, `decision_records`, and `cursor_runs`, and extends `work_items` with PM fields and indexes.
+Ревизия `e1f2a3b4c5d6` (предыдущая ревизия `c9d0e1f2a3b4`) создаёт `project_states`, `decision_records` и `cursor_runs`, а также расширяет `work_items` полями и индексами PM.
 
-The API container entrypoint runs `python -m app.migrate` before Uvicorn. On an Alembic-managed database this upgrades to head. A legacy schema with an existing `work_items` table is stamped at the pre-PM revision `c9d0e1f2a3b4` and then upgraded normally, so SQLite and PostgreSQL both execute the real PM migration. A much older schema without `work_items` creates the entirely missing current tables before stamping head.
+Точка входа контейнера API запускает `python -m app.migrate` перед Uvicorn. В базе данных под управлением Alembic это выполняет обновление до head. Устаревшая схема с существующей таблицей `work_items` помечается ревизией до PM `c9d0e1f2a3b4`, а затем обновляется обычным образом, поэтому и SQLite, и PostgreSQL выполняют настоящую миграцию PM. В значительно более старой схеме без `work_items` перед установкой метки head создаются все отсутствующие актуальные таблицы.
 
-Use the repository's Compose stack:
+Используйте стек Compose из репозитория:
 
 ```bash
 cp .env.example .env
-# Set ICE_SECRET_KEY and ICE_ADMIN_PASSWORD.
+# Задайте ICE_SECRET_KEY и ICE_ADMIN_PASSWORD.
 docker compose up -d --build
 
 docker compose ps
@@ -118,21 +118,21 @@ docker compose logs api --tail 100
 docker compose exec api alembic current
 ```
 
-To run migration explicitly in a one-off API container:
+Чтобы явно запустить миграцию в одноразовом контейнере API:
 
 ```bash
 docker compose run --rm --entrypoint python api -m app.migrate
 docker compose run --rm --entrypoint alembic api current
 ```
 
-To test in a Docker-capable environment (the production image does not include test extras by default):
+Для тестирования в среде с поддержкой Docker (production-образ по умолчанию не содержит дополнительных зависимостей для тестов):
 
 ```bash
 docker compose run --rm api sh -lc 'pip install -e ".[test,mem0]" && python -m pytest -q -p pytest_asyncio.plugin'
 docker compose run --rm api sh -lc 'pip install -e ".[test,mem0]" && ruff check .'
 ```
 
-Frontend verification can run directly:
+Проверку frontend можно запустить напрямую:
 
 ```bash
 cd frontend
@@ -140,37 +140,37 @@ npm ci
 npm run build
 ```
 
-## Rollback
+## Откат
 
-Use the pre-change repository bundle at:
+Используйте bundle репозитория до изменений по адресу:
 
 ```text
 data/backups/pm-20260824-103901/ice-agent-head.bundle
 ```
 
-Before changing a deployed database, take a fresh PostgreSQL dump and preserve the `iceagent_agent_data` volume. Then:
+Перед изменением развёрнутой базы данных создайте свежий дамп PostgreSQL и сохраните том `iceagent_agent_data`. Затем:
 
-1. Stop writers: `docker compose stop api ui`.
-2. Verify the repository backup: `git bundle verify data/backups/pm-20260824-103901/ice-agent-head.bundle`.
-3. Restore the pre-PM application revision from that bundle in a separate checkout/worktree; do not overwrite an unreviewed working tree.
-4. With the database backup confirmed, run the schema rollback against the Compose database:
+1. Остановите процессы записи: `docker compose stop api ui`.
+2. Проверьте резервную копию репозитория: `git bundle verify data/backups/pm-20260824-103901/ice-agent-head.bundle`.
+3. Восстановите из этого bundle ревизию приложения до PM в отдельном checkout/worktree; не перезаписывайте непроверенное рабочее дерево.
+4. Убедившись в наличии резервной копии базы данных, выполните откат схемы в базе данных Compose:
 
    ```bash
    docker compose run --rm --entrypoint alembic api downgrade c9d0e1f2a3b4
    ```
 
-5. Rebuild/start the restored revision: `docker compose up -d --build`.
-6. Check `docker compose ps`, `/health`, API logs, and the UI. If downgrade or validation fails, stop and restore the PostgreSQL dump rather than attempting ad-hoc schema edits.
+5. Пересоберите и запустите восстановленную ревизию: `docker compose up -d --build`.
+6. Проверьте `docker compose ps`, `/health`, журналы API и интерфейс. Если downgrade или проверка завершается с ошибкой, остановитесь и восстановите дамп PostgreSQL вместо попыток внепланового изменения схемы.
 
-The downgrade removes the PM tables and PM columns from `work_items`; preserve any required PM records before running it.
+Downgrade удаляет таблицы PM и столбцы PM из `work_items`; перед его запуском сохраните все необходимые записи PM.
 
-## Current local-only blockers
+## Текущие ограничения локальной среды
 
-This workstation cannot perform deployment validation:
+На этой рабочей станции невозможно проверить развёртывание:
 
-- there is no SSH access to `192.168.10.64`;
-- no production backup or restart can be performed here;
-- no live production Cursor MCP connection can be exercised here;
-- this machine lacks Python and Docker, so backend pytest and Alembic migration smoke tests require a Docker-capable environment.
+- отсутствует SSH-доступ к `192.168.10.64`;
+- здесь невозможно создать резервную копию production или выполнить его перезапуск;
+- здесь невозможно проверить действующее production-подключение Cursor MCP;
+- на этой машине отсутствуют Python и Docker, поэтому для дымовых тестов backend с pytest и миграции Alembic требуется среда с поддержкой Docker.
 
-The frontend build can run on this machine. These constraints are environment blockers, not evidence that production migration or CursorRemote execution succeeded.
+Сборку frontend можно выполнить на этой машине. Эти ограничения являются препятствиями среды, а не доказательством успешного выполнения миграции production или CursorRemote.
