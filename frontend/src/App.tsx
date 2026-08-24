@@ -11,7 +11,7 @@ import type {
   AdminSettings, Agent, AgentTask, Consultation, CronJob, Dashboard, EmployeeState, LogEntry, McpServer,
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, RuntimeSettings,
   Customer, CursorProjectOption, EmployeePolicy, EmployeePolicyCatalog,
-  SipAccount, SipCall, Status, TelegramAccount, WorkItem,
+  PromptSectionRevision, SipAccount, SipCall, Status, TelegramAccount, WorkItem,
 } from './types'
 
 type Page = 'dashboard' | 'agents' | 'connections' | 'runtime' | 'telegram' | 'sip' | 'calls' | 'conversations' | 'employee' | 'customers' | 'memory' | 'mcp' | 'cron' | 'settings' | 'logs' | 'tasks'
@@ -58,7 +58,7 @@ const title: Record<Page, [string, string]> = {
 const PM_SKILLS_TEMPLATE = `Память (Mem0):
 - Факты по проекту: memory_add(..., category="project"|"decision"|"contact")
 - Глобальные предпочтения (язык, стиль): memory_add(..., global_scope=true)
-- Заказчик и проект берутся из карточки «Заказчики» / привязки диалога — не выдумывай их.
+- Заказчик, контакты, проект и Cursor workspace — только из карточки «Заказчики» / привязки диалога. Не дублируй их в rules/skills/self_notes.
 - Новый клиент в чате: memory_set_project("project-slug", customer_id="client") только если карточки ещё нет.
 - Перед уточнением сначала проверь память проекта и журнал решений.
 
@@ -1070,6 +1070,9 @@ function EmployeeScreen() {
   const [selected, setSelected] = useState<WorkItem | null>(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [sections, setSections] = useState<Record<string, string>>({})
+  const [historyKey, setHistoryKey] = useState('')
+  const [historyItems, setHistoryItems] = useState<PromptSectionRevision[]>([])
+  const [historyBusy, setHistoryBusy] = useState(false)
   const [mission, setMission] = useState('')
   const [roleTitle, setRoleTitle] = useState('')
   const [heartbeat, setHeartbeat] = useState(15)
@@ -1207,9 +1210,40 @@ function EmployeeScreen() {
       })
       setState(data)
       await overview.refresh()
+      if (historyKey) await loadPromptHistory(historyKey)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Не удалось сохранить')
     } finally { setBusy('') }
+  }
+
+  async function loadPromptHistory(key: string) {
+    if (!agentId) return
+    setHistoryBusy(true); setError('')
+    try {
+      const data = await api.agents.promptRevisions(agentId, key)
+      setHistoryKey(key)
+      setHistoryItems(data.items || [])
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось загрузить историю промпта')
+    } finally {
+      setHistoryBusy(false)
+    }
+  }
+
+  async function restorePromptHistory(revisionId: string | number) {
+    if (!agentId) return
+    setHistoryBusy(true); setError(''); setNotice('')
+    try {
+      const data = await api.agents.restorePromptRevision(agentId, revisionId, 'Восстановлено из панели')
+      setState(data.employee)
+      setSections(data.employee.prompt_sections || {})
+      setNotice(`Секция «${data.restored_key}» восстановлена из версии #${revisionId}`)
+      await loadPromptHistory(data.restored_key)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось восстановить версию')
+    } finally {
+      setHistoryBusy(false)
+    }
   }
 
   const openConsults = consults.data?.items || []
@@ -1553,17 +1587,46 @@ function EmployeeScreen() {
             ['self_notes', 'Заметки сотрудника', 'Сотрудник может править сам'],
           ] as const).map(([key, label, hint]) => (
             <Field key={key} label={label} wide hint={hint}>
-              {key === 'skills' && (
-                <div className="head-actions" style={{ marginBottom: 8 }}>
+              <div className="head-actions" style={{ marginBottom: 8 }}>
+                {key === 'skills' && (
                   <button type="button" className="secondary compact" onClick={() => setSections(s => ({
                     ...s,
                     skills: s.skills?.trim()
                       ? `${s.skills.trim()}\n\n${PM_SKILLS_TEMPLATE}`
                       : PM_SKILLS_TEMPLATE,
                   }))}>Вставить шаблон PM</button>
+                )}
+                <button
+                  type="button"
+                  className="secondary compact"
+                  disabled={historyBusy || !agentId}
+                  onClick={() => void loadPromptHistory(key)}
+                >
+                  {historyKey === key && historyBusy ? 'История…' : 'История'}
+                </button>
+              </div>
+              <textarea rows={key === 'identity' || key === 'rules' ? 5 : 3} value={sections[key] || ''} onChange={e => setSections(s => ({ ...s, [key]: e.target.value }))}/>
+              {historyKey === key && (
+                <div className="list-panel" style={{ marginTop: 8 }}>
+                  {historyItems.length === 0 ? (
+                    <p className="transcript-empty">Версий пока нет — появятся после следующего сохранения.</p>
+                  ) : historyItems.map(item => (
+                    <div className="server-row" key={item.id}>
+                      <div className="grow">
+                        <strong>#{item.id} · {item.source} · {item.chars} симв.</strong>
+                        <small>{item.created_at ? new Date(item.created_at).toLocaleString('ru-RU') : ''}{item.note ? ` · ${item.note}` : ''}</small>
+                        <p>{item.preview}</p>
+                      </div>
+                      <button
+                        type="button"
+                        className="secondary compact"
+                        disabled={historyBusy}
+                        onClick={() => void restorePromptHistory(item.id)}
+                      >Восстановить</button>
+                    </div>
+                  ))}
                 </div>
               )}
-              <textarea rows={key === 'identity' || key === 'rules' ? 5 : 3} value={sections[key] || ''} onChange={e => setSections(s => ({ ...s, [key]: e.target.value }))}/>
             </Field>
           ))}
         </div>

@@ -486,6 +486,18 @@ export interface WorkItemCounts {
   actionable?: number
 }
 
+export interface PromptSectionRevision {
+  id: ID
+  agent_id: ID
+  key: string
+  source: string
+  note?: string
+  chars: number
+  preview: string
+  content: string
+  created_at?: string | null
+}
+
 export interface EmployeeState {
   agent_id: ID
   agent_name: string

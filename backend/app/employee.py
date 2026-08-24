@@ -24,6 +24,7 @@ from .db import (
     EmployeeProfile,
     MessageLog,
     PromptSection,
+    PromptSectionRevision,
     utcnow,
 )
 
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 PROMPT_SECTION_KEYS = ("identity", "role", "rules", "skills", "tone", "self_notes")
 AGENT_EDITABLE_SECTIONS = frozenset({"self_notes", "skills", "tone"})
 MANAGER_ONLY_SECTIONS = frozenset({"identity", "role", "rules"})
+PROMPT_REVISION_LIMIT = 40
+PROMPT_SECTION_MAX_CHARS = 12000
 HORIZONS = ("hour", "day", "week", "month")
 NEED_KINDS = ("info", "access", "decision", "resource", "rest")
 
@@ -206,6 +209,131 @@ async def ensure_prompt_sections(db: AsyncSession, agent: Agent) -> dict[str, st
             by_key[key] = section
     await db.commit()
     return {key: (by_key[key].content if key in by_key else "") for key in PROMPT_SECTION_KEYS}
+
+
+def prompt_revision_json(row: PromptSectionRevision) -> dict[str, Any]:
+    preview = (row.content or "").strip().replace("\n", " ")
+    if len(preview) > 160:
+        preview = preview[:157] + "…"
+    return {
+        "id": row.id,
+        "agent_id": row.agent_id,
+        "key": row.key,
+        "source": row.source,
+        "note": row.note or "",
+        "chars": len(row.content or ""),
+        "preview": preview,
+        "content": row.content or "",
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+async def _prune_prompt_revisions(
+    db: AsyncSession,
+    *,
+    agent_id: int,
+    key: str,
+    keep: int = PROMPT_REVISION_LIMIT,
+) -> None:
+    rows = (
+        await db.scalars(
+            select(PromptSectionRevision)
+            .where(
+                PromptSectionRevision.agent_id == agent_id,
+                PromptSectionRevision.key == key,
+            )
+            .order_by(PromptSectionRevision.id.desc())
+        )
+    ).all()
+    for stale in rows[keep:]:
+        await db.delete(stale)
+
+
+async def save_prompt_section(
+    db: AsyncSession,
+    agent: Agent,
+    key: str,
+    content: str,
+    *,
+    source: str = "manager",
+    note: str = "",
+    max_chars: int = PROMPT_SECTION_MAX_CHARS,
+    commit: bool = False,
+) -> PromptSection:
+    """Overwrite a section, archiving the previous content when it changes."""
+    if key not in PROMPT_SECTION_KEYS:
+        raise ValueError(f"Unknown prompt section: {key}")
+    cleaned = str(content or "")[:max_chars]
+    source_name = (source or "manager").strip()[:32] or "manager"
+    note_text = (note or "").strip()[:300]
+    row = await db.scalar(
+        select(PromptSection).where(
+            PromptSection.agent_id == agent.id,
+            PromptSection.key == key,
+        )
+    )
+    previous = (row.content if row is not None else "") or ""
+    if row is None:
+        row = PromptSection(agent_id=agent.id, key=key, content=cleaned)
+        db.add(row)
+    elif previous != cleaned:
+        db.add(
+            PromptSectionRevision(
+                agent_id=agent.id,
+                key=key,
+                content=previous,
+                source=source_name,
+                note=note_text,
+            )
+        )
+        row.content = cleaned
+        await db.flush()
+        await _prune_prompt_revisions(db, agent_id=agent.id, key=key)
+    else:
+        row.content = cleaned
+    if key == "identity":
+        agent.prompt = cleaned
+    if commit:
+        await db.commit()
+        await db.refresh(row)
+    return row
+
+
+async def list_prompt_revisions(
+    db: AsyncSession,
+    agent_id: int,
+    *,
+    key: str | None = None,
+    limit: int = 40,
+) -> list[PromptSectionRevision]:
+    stmt = select(PromptSectionRevision).where(PromptSectionRevision.agent_id == agent_id)
+    if key:
+        if key not in PROMPT_SECTION_KEYS:
+            raise ValueError(f"Unknown prompt section: {key}")
+        stmt = stmt.where(PromptSectionRevision.key == key)
+    stmt = stmt.order_by(PromptSectionRevision.id.desc()).limit(max(1, min(int(limit or 40), 100)))
+    return list(await db.scalars(stmt))
+
+
+async def restore_prompt_revision(
+    db: AsyncSession,
+    agent: Agent,
+    revision_id: int,
+    *,
+    note: str = "",
+) -> PromptSection:
+    revision = await db.get(PromptSectionRevision, int(revision_id))
+    if revision is None or revision.agent_id != agent.id:
+        raise KeyError(revision_id)
+    return await save_prompt_section(
+        db,
+        agent,
+        revision.key,
+        revision.content or "",
+        source="restore",
+        note=(note or f"Восстановлено из ревизии #{revision.id}")[:300],
+        commit=True,
+    )
 
 
 async def assemble_system_prompt(

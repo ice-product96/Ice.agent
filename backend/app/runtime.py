@@ -1942,6 +1942,8 @@ class AgentRuntime:
 
         async def self_configure(section_key: str, content: str) -> dict[str, Any]:
             """Update an editable prompt section: self_notes, skills, or tone."""
+            from .employee import save_prompt_section
+
             key = section_key.strip().lower()
             if key not in AGENT_EDITABLE_SECTIONS:
                 raise PermissionError(
@@ -1950,19 +1952,17 @@ class AgentRuntime:
                 )
             if key not in PROMPT_SECTION_KEYS:
                 raise ValueError("Unknown section")
-            row = await db.scalar(
-                select(PromptSection).where(
-                    PromptSection.agent_id == agent.id,
-                    PromptSection.key == key,
-                )
+            row = await save_prompt_section(
+                db,
+                agent,
+                key,
+                content[:8000],
+                source="self_configure",
+                note="Изменено сотрудником",
+                max_chars=8000,
+                commit=True,
             )
-            if row is None:
-                row = PromptSection(agent_id=agent.id, key=key, content=content[:8000])
-                db.add(row)
-            else:
-                row.content = content[:8000]
-            await db.commit()
-            return {"ok": True, "key": key, "chars": len(row.content)}
+            return {"ok": True, "key": key, "chars": len(row.content or "")}
 
         async def employee_status() -> dict[str, Any]:
             """Return current mission, schedule, needs and open consultations."""

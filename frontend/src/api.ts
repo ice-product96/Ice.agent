@@ -2,7 +2,7 @@ import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
   Conversation, ConversationDetail, Consultation, EmployeePolicy, EmployeePolicyCatalog, EmployeeProfile, EmployeeRosterEntry, EmployeeState,
   Customer, CursorProjectOption, LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
-  PmProjectDetail, ProjectState, RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts,
+  PmProjectDetail, ProjectState, PromptSectionRevision, RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api/v1'
@@ -82,6 +82,15 @@ export const api = {
     employee: (id: string) => request<EmployeeState>(`/agents/${id}/employee`),
     updateEmployee: (id: string, data: Partial<EmployeeProfile> & { prompt_sections?: Record<string, string>; policy?: EmployeePolicy }) =>
       request<EmployeeState>(`/agents/${id}/employee`, { method: 'PATCH', ...body(data) }),
+    promptRevisions: (id: string, key?: string, limit = 40) =>
+      request<{ items: PromptSectionRevision[]; total: number; key?: string | null }>(
+        `/agents/${id}/employee/prompt-revisions${qs({ key, limit })}`,
+      ),
+    restorePromptRevision: (id: string, revisionId: string | number, note = '') =>
+      request<{ ok: boolean; restored_key: string; revision_id: number; employee: EmployeeState }>(
+        `/agents/${id}/employee/prompt-revisions/${revisionId}/restore`,
+        { method: 'POST', ...body({ note }) },
+      ),
     pauseEmployee: (id: string, paused = true) =>
       request<{ ok: boolean; paused: boolean }>(`/agents/${id}/employee/pause?paused=${paused ? 'true' : 'false'}`, { method: 'POST' }),
     tickEmployee: (id: string) => request<{ ok: boolean; skipped?: boolean; reason?: string; result?: string }>(`/agents/${id}/employee/tick`, { method: 'POST' }),

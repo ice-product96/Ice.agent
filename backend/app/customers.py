@@ -81,9 +81,15 @@ def customer_prompt_block(customer: Customer | None) -> str:
         lines.append(f"Проект разработки: {customer.project_id.strip()}.")
     if (customer.cursor_workspace or "").strip():
         lines.append(f"Проект Cursor MCP: {customer.cursor_workspace.strip()}.")
+    notes = (customer.notes or "").strip()
+    if notes:
+        lines.append("Контакты и договорённости заказчика:")
+        lines.append(notes)
     lines.append(
         "Представляйся и веди работу от имени этого заказчика и этого проекта. "
-        "Не подменяй заказчика, не путай проекты и не выдумывай другого клиента."
+        "Не подменяй заказчика, не путай проекты и не выдумывай другого клиента. "
+        "Контакты заказчика, проект и workspace бери только из раздела «Заказчики», "
+        "не храни их в своих правилах/заметках."
     )
     return "\n".join(lines)
 

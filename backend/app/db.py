@@ -309,6 +309,27 @@ class PromptSection(TimestampMixin, Base):
     content: Mapped[str] = mapped_column(Text, default="")
 
 
+class PromptSectionRevision(Base):
+    """Immutable snapshot of a prompt section before an overwrite (for restore)."""
+
+    __tablename__ = "prompt_section_revisions"
+    __table_args__ = (
+        Index(
+            "ix_prompt_section_revisions_agent_key_created",
+            "agent_id",
+            "key",
+            "created_at",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    key: Mapped[str] = mapped_column(String(64), index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(32), default="manager")  # manager|self_configure|restore
+    note: Mapped[str] = mapped_column(String(300), default="")
+
+
 class EmployeePlan(TimestampMixin, Base):
     __tablename__ = "employee_plans"
     id: Mapped[int] = mapped_column(primary_key=True)

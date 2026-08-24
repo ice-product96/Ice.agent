@@ -24,9 +24,13 @@ from .employee import (
     ensure_prompt_sections,
     get_or_create_profile,
     list_agent_jobs,
+    list_prompt_revisions,
     need_json,
     plan_json,
     profile_json,
+    prompt_revision_json,
+    restore_prompt_revision,
+    save_prompt_section,
     schedule_immediate_tick,
     sync_heartbeat_job,
 )
@@ -961,23 +965,74 @@ async def patch_employee(
         for key, content in sections_payload.items():
             if key not in PROMPT_SECTION_KEYS:
                 continue
-            row = await db.scalar(
-                select(PromptSection).where(
-                    PromptSection.agent_id == agent.id,
-                    PromptSection.key == key,
-                )
+            await save_prompt_section(
+                db,
+                agent,
+                key,
+                str(content or ""),
+                source="manager",
+                note="Сохранено руководителем",
             )
-            if row is None:
-                db.add(PromptSection(agent_id=agent.id, key=key, content=str(content or "")[:12000]))
-            else:
-                row.content = str(content or "")[:12000]
-            if key == "identity":
-                agent.prompt = str(content or "")
     await db.commit()
     await db.refresh(profile)
     scheduler = getattr(request.app.state, "scheduler", None)
     await sync_heartbeat_job(db, scheduler, profile)
     return await get_employee(str(agent.id), request, db)
+
+
+@router.get("/agents/{agent_id}/employee/prompt-revisions", dependencies=auth)
+async def get_employee_prompt_revisions(
+    agent_id: str,
+    db: AsyncSession = Depends(get_db),
+    key: str | None = Query(default=None),
+    limit: int = Query(40, ge=1, le=100),
+) -> dict[str, Any]:
+    agent = await one(db, Agent, agent_id)
+    try:
+        rows = await list_prompt_revisions(db, agent.id, key=key, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "items": [prompt_revision_json(row) for row in rows],
+        "total": len(rows),
+        "key": key,
+    }
+
+
+class PromptRevisionRestoreBody(BaseModel):
+    note: str = ""
+
+
+@router.post(
+    "/agents/{agent_id}/employee/prompt-revisions/{revision_id}/restore",
+    dependencies=auth,
+)
+async def restore_employee_prompt_revision(
+    agent_id: str,
+    revision_id: int,
+    payload: PromptRevisionRestoreBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    agent = await one(db, Agent, agent_id)
+    try:
+        section = await restore_prompt_revision(
+            db,
+            agent,
+            revision_id,
+            note=payload.note,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Revision not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    employee = await get_employee(str(agent.id), request, db)
+    return {
+        "ok": True,
+        "restored_key": section.key,
+        "revision_id": revision_id,
+        "employee": employee,
+    }
 
 
 @router.post("/agents/{agent_id}/employee/pause", dependencies=auth)

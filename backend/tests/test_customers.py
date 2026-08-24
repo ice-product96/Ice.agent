@@ -50,13 +50,16 @@ def test_customer_prompt_block_presents_customer_and_project() -> None:
         name="Типография LAVVE",
         project_id="lavve",
         cursor_workspace=r"D:\projects\DigitalWorker\LAVVE",
+        notes="Telegram: @HappyBuildCom — основной заказчик задач.",
     )
     block = customer_prompt_block(customer)
     assert "Типография LAVVE" in block
     assert "id=lavve" in block
     assert "Проект разработки: lavve" in block
     assert r"D:\projects\DigitalWorker\LAVVE" in block
+    assert "@HappyBuildCom" in block
     assert "Представляйся" in block
+    assert "Заказчики" in block
 
 
 @pytest.mark.asyncio
