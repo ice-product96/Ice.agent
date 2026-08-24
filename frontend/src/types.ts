@@ -301,6 +301,7 @@ export interface EmployeePolicy {
   consult_manager_on_idle_tick: boolean
   tick_instruction_extra: string
   intake_debounce_minutes: number
+  pm_mode: boolean
 }
 
 export interface EmployeePolicyCatalog {
@@ -384,6 +385,46 @@ export interface WorkItemEvent {
   payload?: Record<string, unknown>
 }
 
+export interface DecisionRecord {
+  id: ID
+  project_id: string
+  work_item_id?: ID | null
+  topic?: string
+  decision: string
+  rationale?: string
+  confirmed_by?: string
+  source_message_id?: string | null
+  context?: Record<string, unknown>
+  created_at?: string | null
+}
+
+export interface CursorRun {
+  id: ID
+  work_item_id: ID
+  project_id: string
+  attempt: number
+  status: string
+  request?: Record<string, unknown>
+  result?: Record<string, unknown> | null
+  error?: string | null
+  started_at?: string | null
+  completed_at?: string | null
+  created_at?: string | null
+}
+
+export interface ProjectState {
+  project_id: string
+  autonomy_level: 'LEVEL_0' | 'LEVEL_1' | 'LEVEL_2' | 'LEVEL_3'
+  config?: Record<string, unknown>
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface PmProjectDetail extends ProjectState {
+  decisions: DecisionRecord[]
+  tasks: WorkItem[]
+}
+
 export interface WorkItem {
   id: ID
   agent_id: ID
@@ -405,6 +446,21 @@ export interface WorkItem {
   last_error?: string | null
   consultation_id?: ID | number | null
   cron_job_id?: ID | number | null
+  task_type?: 'feature' | 'bug' | 'change' | 'technical' | string
+  context?: Record<string, unknown>
+  requirements?: string[]
+  acceptance_criteria?: string[]
+  constraints?: string[]
+  edge_cases?: string[]
+  priority?: 'critical' | 'high' | 'normal' | 'low' | string
+  pm_phase?: string
+  project_id?: string | null
+  customer_id?: string | null
+  source_message_id?: string | null
+  active_cursor_run_id?: ID | null
+  project?: ProjectState | null
+  decisions?: DecisionRecord[]
+  cursor_runs?: CursorRun[]
   created_at?: string | null
   updated_at?: string | null
   events?: WorkItemEvent[]

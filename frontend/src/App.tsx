@@ -1,4 +1,4 @@
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
+import { Dispatch, FormEvent, ReactNode, SetStateAction, useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Activity, Bot, BrainCircuit, Briefcase, CalendarClock, CheckCircle2, ChevronRight, CircleAlert,
   Clock3, Database, FileText, Globe2, KeyRound, LayoutDashboard, Link2, LoaderCircle, LogOut, Menu,
@@ -57,22 +57,32 @@ const PM_SKILLS_TEMPLATE = `Память (Mem0):
 - Факты по проекту: memory_add(..., category="project"|"decision"|"contact")
 - Глобальные предпочтения (язык, стиль): memory_add(..., global_scope=true)
 - Новый клиент/проект в чате: memory_set_project("project-slug", customer_id="client")
-- ice_tracker — задачи и статусы; memory — решения, контакты, договорённости
+- Перед уточнением сначала проверь память проекта и журнал решений.
 
 ice_tracker (MCP):
 - Карточки, статусы, дедлайны — только через ice_tracker
+- create_task принимает name, а не title.
 - Не дублируй задачи в память, если они уже в трекере
 
 playwright (MCP):
 - Открытие страниц, формы, скриншоты — для проверки сайтов клиентов
 
-Cursor IDE (cursorremote_do / cursorremote_check):
-- Задачу в Cursor отдавай через cursorremote_do("что сделать"). Allow/Accept/Run нажимает платформа сама.
+PM workflow:
+- Идея и обсуждение не запускают разработку. При неоднозначном намерении уточни.
+- Сначала pm_structure_task: requirements, проверяемые acceptance criteria, ограничения и edge cases.
+- Для отдельного нового требования в том же чате используй create_new_task=true; clarification обновляет текущую задачу.
+- LEVEL_1 запускает без подтверждения только явно помеченный small_fix внутри agreed scope.
+- Подтверждения и важные договорённости сохраняй через pm_record_decision.
+- В разработку передавай через submit_development_task только готовую структурированную задачу.
+- Статус бери из pm_get_task; не выдумывай его.
+
+Cursor IDE:
 - Никогда не проси человека нажать Allow в IDE.
-- done=true — Cursor закончил. Напиши заказчику результат и НЕ ставь новый schedule_self.
-- done=false или один send_prompt — это НЕ готовность. schedule_self через ~2 минуты: cursorremote_check и снова ждать.
+- done=true означает DEV_COMPLETE, но не DONE. Сверь результат с acceptance criteria.
+- Если критерий не выполнен — request_development_fix. Если всё проверено — pm_accept_task.
+- done=false или отправленный prompt — это НЕ готовность.
 - Поиск/explore в Cursor — это не остановка. Не давай вторую задачу «продолжи, ты остановился».
-- Не используй hour/day/week/month планы. Следующие шаги — только schedule_self.
+- Не пересылай Cursor необработанное сообщение клиента и не показывай заказчику raw Cursor output.
 `
 
 const statusLabel: Record<string, string> = {
@@ -1026,6 +1036,7 @@ function EmployeeScreen() {
     consult_manager_on_idle_tick: false,
     tick_instruction_extra: '',
     intake_debounce_minutes: 15,
+    pm_mode: false,
   })
   const policyCatalog = useLoad(api.employees.policyCatalog, [])
 
@@ -1038,6 +1049,7 @@ function EmployeeScreen() {
       consult_manager_on_idle_tick: raw?.consult_manager_on_idle_tick ?? defaults?.consult_manager_on_idle_tick ?? false,
       tick_instruction_extra: raw?.tick_instruction_extra ?? defaults?.tick_instruction_extra ?? '',
       intake_debounce_minutes: raw?.intake_debounce_minutes ?? defaults?.intake_debounce_minutes ?? 15,
+      pm_mode: raw?.pm_mode ?? defaults?.pm_mode ?? false,
     })
   }
 
@@ -1351,6 +1363,26 @@ function EmployeeScreen() {
         <p className="work-goal">{selected.goal || selected.title}</p>
         <small>Клиент {selected.chat_id || '—'}{selected.sender_username ? ` · @${selected.sender_username}` : ''}{selected.reply_phone ? ` · ${selected.reply_phone}` : ''}</small>
         {selected.last_error && <Alert message={selected.last_error}/>}
+        {selected.pm_phase && <div className="intake-box">
+          <strong>PM state · {selected.pm_phase}</strong>
+          <small>{selected.task_type || 'task'} · приоритет {selected.priority || 'normal'} · проект {selected.project_id || 'не указан'}</small>
+          {selected.project && <Field label="Автономия проекта" hint="LEVEL_1 — только небольшие однозначные bug fixes без подтверждения.">
+            <select value={selected.project.autonomy_level} onChange={async event => {
+              const autonomy_level = event.target.value as 'LEVEL_0' | 'LEVEL_1' | 'LEVEL_2' | 'LEVEL_3'
+              await api.pm.updateProject(selected.project!.project_id, { autonomy_level })
+              setSelected(await api.agents.workItem(agentId, selected.id))
+            }}>
+              <option value="LEVEL_0">LEVEL_0 · всё с подтверждением</option>
+              <option value="LEVEL_1">LEVEL_1 · только малые bug fixes</option>
+              <option value="LEVEL_2">LEVEL_2 · согласованный scope</option>
+              <option value="LEVEL_3">LEVEL_3 · обычная разработка автономно</option>
+            </select>
+          </Field>}
+          {(selected.requirements || []).length > 0 && <p><strong>Требования:</strong> {(selected.requirements || []).join(' · ')}</p>}
+          {(selected.acceptance_criteria || []).length > 0 && <p><strong>Acceptance criteria:</strong> {(selected.acceptance_criteria || []).join(' · ')}</p>}
+          {(selected.decisions || []).length > 0 && <div><strong>Решения</strong>{(selected.decisions || []).map(decision => <p key={decision.id}>{decision.topic ? `${decision.topic}: ` : ''}{decision.decision}</p>)}</div>}
+          {(selected.cursor_runs || []).length > 0 && <div><strong>Cursor runs</strong>{(selected.cursor_runs || []).map(run => <p key={run.id}>#{run.attempt} · {run.status}{run.error ? ` · ${run.error}` : ''}</p>)}</div>}
+        </div>}
         {selected.status === 'collecting' && (
           <div className="intake-box">
             <strong>Накопленное задание</strong>
@@ -1416,6 +1448,7 @@ function EmployeeScreen() {
         </div>
         <SectionHead title="Политика автономии" text="Когда спрашивать руководителя и какие действия требуют approve"/>
         <div className="form-grid">
+          <div className="toggle-box"><Toggle label="Режим AI Project Manager" checked={policy.pm_mode} onChange={value => setPolicy(p => ({ ...p, pm_mode: value }))}/></div>
           <div className="toggle-box"><Toggle label="Поручения руководителя без approve" checked={policy.manager_orders_without_approval} onChange={value => setPolicy(p => ({ ...p, manager_orders_without_approval: value }))}/></div>
           <div className="toggle-box"><Toggle label="Запросы заказчика (звонок/SIP) без approve" checked={policy.customer_requests_without_approval} onChange={value => setPolicy(p => ({ ...p, customer_requests_without_approval: value }))}/></div>
           <div className="toggle-box"><Toggle label="Спрашивать руководителя на heartbeat если нечего делать" checked={policy.consult_manager_on_idle_tick} onChange={value => setPolicy(p => ({ ...p, consult_manager_on_idle_tick: value }))}/></div>
@@ -1612,12 +1645,27 @@ function parseMcpHeaders(value: string): Record<string, string> {
 
 function McpScreen() {
   const loaded = useLoad(api.mcp.list, []); const data = loaded.data || []
+  const agentsLoaded = useLoad(api.agents.list, [])
+  const [attached, setAttached] = useState<Record<string, string[]>>({})
   const [editing, setEditing] = useState<Partial<McpServer> | null>(null); const [deleting, setDeleting] = useState<McpServer | null>(null)
+  const [attaching, setAttaching] = useState<McpServer | null>(null)
+  useEffect(() => {
+    const agents = agentsLoaded.data || []
+    if (!agents.length) return
+    void Promise.all(agents.map(async agent => {
+      const result = await api.agents.mcpServers(agent.id)
+      return [agent.id, result.server_ids.map(String)] as const
+    })).then(rows => setAttached(Object.fromEntries(rows))).catch(() => undefined)
+  }, [agentsLoaded.data])
   if (loaded.loading) return <Loading/>
   return <>
     {loaded.error && <Alert message={loaded.error}/>}<SectionHead title={`${data.length} серверов инструментов`} text="Подключения Model Context Protocol" action={<button className="primary" onClick={() => setEditing(emptyMcp)}><Plus size={17}/>Добавить сервер</button>}/>
     {data.length === 0 ? <Empty icon={ServerCog} title="Нет MCP-серверов" text="Подключите удалённый SSE/HTTP-сервер или локальный stdio-процесс."/> :
-    <div className="list-panel">{data.map(server => <div className="server-row" key={server.id}><span className="entity-avatar"><ServerCog/></span><div className="grow"><strong>{server.name}</strong><small>{server.transport === 'stdio' ? server.command : server.url}{server.connection_error ? ` · ${server.connection_error}` : ''}</small></div><span className="chip">{server.transport}</span><StatusDot status={server.connection_status === 'connected' ? 'online' : server.connection_status === 'error' ? 'error' : server.enabled ? 'pending' : 'paused'}/><button className="secondary compact" onClick={() => setEditing(server)}>Изменить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(server)}><Trash2 size={17}/></button></div>)}</div>}
+    <div className="list-panel">{data.map(server => {
+      const serverId = String(server.id)
+      const agentNames = (agentsLoaded.data || []).filter(agent => (attached[String(agent.id)] || []).includes(serverId)).map(agent => agent.name)
+      return <div className="server-row" key={server.id}><span className="entity-avatar"><ServerCog/></span><div className="grow"><strong>{server.name}</strong><small>{server.transport === 'stdio' ? server.command : server.url}{server.connection_error ? ` · ${server.connection_error}` : ''}{` · агенты: ${agentNames.join(', ') || 'не привязан'}`}</small></div><span className="chip">{server.transport}</span><StatusDot status={server.connection_status === 'connected' ? 'online' : server.connection_status === 'error' ? 'error' : server.enabled ? 'pending' : 'paused'}/><button className="secondary compact" onClick={() => setAttaching(server)}>Агенты</button><button className="secondary compact" onClick={() => setEditing(server)}>Изменить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(server)}><Trash2 size={17}/></button></div>
+    })}</div>}
     {editing && <McpForm value={editing} onClose={() => setEditing(null)} onSave={async v => {
       const payload = {
         name: v.name || '',
@@ -1631,8 +1679,40 @@ function McpScreen() {
       const saved = v.id ? await api.mcp.update(v.id, payload) : await api.mcp.create(payload as Omit<McpServer, 'id'>)
       loaded.setData(v.id ? data.map(s => s.id === saved.id ? saved : s) : [...data, saved]); setEditing(null)
     }}/>}
+    {attaching && <McpAttachForm server={attaching} agents={agentsLoaded.data || []} attached={attached} setAttached={setAttached} onClose={() => setAttaching(null)}/>}
     {deleting && <ConfirmDelete name={deleting.name} onClose={() => setDeleting(null)} onDelete={async () => { await api.mcp.remove(deleting.id); loaded.setData(data.filter(s => s.id !== deleting.id)) }}/>}
   </>
+}
+function McpAttachForm({ server, agents, attached, setAttached, onClose }: { server: McpServer; agents: Agent[]; attached: Record<string, string[]>; setAttached: Dispatch<SetStateAction<Record<string, string[]>>>; onClose: () => void }) {
+  const [busy, setBusy] = useState('')
+  const [error, setError] = useState('')
+  async function toggle(agent: Agent, enabled: boolean) {
+    const agentId = String(agent.id)
+    const serverId = String(server.id)
+    setBusy(agentId); setError('')
+    try {
+      if (enabled) await api.agents.attachMcpServer(agentId, serverId)
+      else await api.agents.detachMcpServer(agentId, serverId)
+      setAttached(current => ({
+        ...current,
+        [agentId]: enabled
+          ? Array.from(new Set([...(current[agentId] || []), serverId]))
+          : (current[agentId] || []).filter(id => id !== serverId),
+      }))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось изменить привязку')
+    } finally {
+      setBusy('')
+    }
+  }
+  return <Modal title={`Агенты · ${server.name}`} subtitle="CursorRemote должен быть явно привязан к PM-агенту." onClose={onClose}>
+    {error && <Alert message={error}/>}
+    <div className="list-panel">{agents.map(agent => {
+      const agentId = String(agent.id); const serverId = String(server.id); const enabled = (attached[agentId] || []).includes(serverId)
+      return <div className="server-row" key={agent.id}><div className="grow"><strong>{agent.name}</strong><small>{agent.description || 'Без описания'}</small></div><Toggle label={enabled ? 'Подключён' : 'Не подключён'} checked={enabled} onChange={value => void toggle(agent, value)}/>{busy === agentId && <LoaderCircle className="spin" size={17}/>}</div>
+    })}</div>
+    <div className="modal-actions"><button className="primary" onClick={onClose}>Готово</button></div>
+  </Modal>
 }
 function McpForm({ value, onClose, onSave }: { value: Partial<McpServer>; onClose: () => void; onSave: (v: Partial<McpServer>) => Promise<void> }) {
   const [form, setForm] = useState<Partial<McpServer>>({ ...value, env: {} }); const [error, setError] = useState(''); const [busy, setBusy] = useState(false)

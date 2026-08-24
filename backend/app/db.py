@@ -358,6 +358,15 @@ class WorkItem(TimestampMixin, Base):
     __table_args__ = (
         Index("ix_work_items_agent_status", "agent_id", "status"),
         Index("ix_work_items_agent_chat", "agent_id", "chat_id"),
+        Index("ix_work_items_project_pm_phase", "project_id", "pm_phase"),
+        Index("ix_work_items_project_priority", "project_id", "priority"),
+        UniqueConstraint(
+            "agent_id",
+            "source",
+            "chat_id",
+            "source_message_id",
+            name="uq_work_items_source_message",
+        ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
@@ -383,6 +392,24 @@ class WorkItem(TimestampMixin, Base):
     )
     cron_job_id: Mapped[int | None] = mapped_column(Integer, index=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    task_type: Mapped[str] = mapped_column(String(64), default="task", index=True)
+    context_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    requirements: Mapped[list[str]] = mapped_column(JSON, default=list)
+    acceptance_criteria: Mapped[list[str]] = mapped_column(JSON, default=list)
+    constraints: Mapped[list[str]] = mapped_column(JSON, default=list)
+    edge_cases: Mapped[list[str]] = mapped_column(JSON, default=list)
+    priority: Mapped[str] = mapped_column(String(16), default="normal", index=True)
+    pm_phase: Mapped[str] = mapped_column(String(32), default="DISCUSSION", index=True)
+    source_message_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    active_cursor_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "cursor_runs.id",
+            name="fk_work_items_active_cursor_run_id",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        index=True,
+    )
 
 
 class WorkItemEvent(Base):
@@ -394,6 +421,56 @@ class WorkItemEvent(Base):
     title: Mapped[str] = mapped_column(String(300), default="")
     detail: Mapped[str] = mapped_column(Text, default="")
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ProjectState(TimestampMixin, Base):
+    __tablename__ = "project_states"
+    project_id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    autonomy_level: Mapped[str] = mapped_column(String(16), default="LEVEL_1", index=True)
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class DecisionRecord(Base):
+    __tablename__ = "decision_records"
+    __table_args__ = (
+        UniqueConstraint("project_id", "decision_key", name="uq_decision_records_project_key"),
+        Index("ix_decision_records_project_created", "project_id", "created_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    project_id: Mapped[str] = mapped_column(String(120), index=True)
+    work_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("work_items.id", ondelete="SET NULL"), index=True
+    )
+    decision_key: Mapped[str] = mapped_column(String(64))
+    topic: Mapped[str] = mapped_column(String(300), default="")
+    decision: Mapped[str] = mapped_column(Text)
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    confirmed_by: Mapped[str] = mapped_column(String(120), default="")
+    source_message_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    context_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class CursorRun(TimestampMixin, Base):
+    __tablename__ = "cursor_runs"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_cursor_runs_idempotency_key"),
+        UniqueConstraint("work_item_id", "attempt", name="uq_cursor_runs_work_item_attempt"),
+        Index("ix_cursor_runs_project_status", "project_id", "status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    work_item_id: Mapped[int] = mapped_column(
+        ForeignKey("work_items.id", ondelete="CASCADE"), index=True
+    )
+    project_id: Mapped[str] = mapped_column(String(120), index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    idempotency_key: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 settings = get_settings()
@@ -433,6 +510,66 @@ async def create_schema() -> None:
             "ALTER TABLE conversation_states ADD COLUMN IF NOT EXISTS customer_id VARCHAR(120)",
             "ALTER TABLE consultations ADD COLUMN IF NOT EXISTS work_item_id INTEGER",
             "ALTER TABLE message_logs ADD COLUMN IF NOT EXISTS work_item_id INTEGER",
+            (
+                "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS "
+                "task_type VARCHAR(64) DEFAULT 'task' NOT NULL"
+            ),
+            (
+                "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS "
+                "context_json JSON DEFAULT '{}' NOT NULL"
+            ),
+            (
+                "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS "
+                "requirements JSON DEFAULT '[]' NOT NULL"
+            ),
+            (
+                "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS "
+                "acceptance_criteria JSON DEFAULT '[]' NOT NULL"
+            ),
+            (
+                "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS "
+                "constraints JSON DEFAULT '[]' NOT NULL"
+            ),
+            (
+                "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS "
+                "edge_cases JSON DEFAULT '[]' NOT NULL"
+            ),
+            (
+                "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS "
+                "priority VARCHAR(16) DEFAULT 'normal' NOT NULL"
+            ),
+            (
+                "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS "
+                "pm_phase VARCHAR(32) DEFAULT 'DISCUSSION' NOT NULL"
+            ),
+            "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS source_message_id VARCHAR(64)",
+            (
+                "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS active_cursor_run_id INTEGER "
+                "REFERENCES cursor_runs(id) ON DELETE SET NULL"
+            ),
+            "CREATE INDEX IF NOT EXISTS ix_work_items_task_type ON work_items (task_type)",
+            "CREATE INDEX IF NOT EXISTS ix_work_items_priority ON work_items (priority)",
+            "CREATE INDEX IF NOT EXISTS ix_work_items_pm_phase ON work_items (pm_phase)",
+            (
+                "CREATE INDEX IF NOT EXISTS ix_work_items_source_message_id "
+                "ON work_items (source_message_id)"
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS ix_work_items_active_cursor_run_id "
+                "ON work_items (active_cursor_run_id)"
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS ix_work_items_project_pm_phase "
+                "ON work_items (project_id, pm_phase)"
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS ix_work_items_project_priority "
+                "ON work_items (project_id, priority)"
+            ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_work_items_source_message "
+                "ON work_items (agent_id, source, chat_id, source_message_id)"
+            ),
         ):
             try:
                 async with connection.begin_nested():

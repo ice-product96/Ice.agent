@@ -25,6 +25,8 @@ DEFAULT_EMPLOYEE_POLICY: dict[str, Any] = {
     "tick_instruction_extra": "",
     # Quiet window after a customer Telegram message before Cursor/execution.
     "intake_debounce_minutes": 15,
+    # Enables the structured project-manager workflow for this employee.
+    "pm_mode": False,
 }
 
 
@@ -89,6 +91,40 @@ def action_matches_tool(action_name: str | None, tool_name: str) -> bool:
 
 def intake_debounce_minutes(profile: Any) -> int:
     return int(employee_policy(profile).get("intake_debounce_minutes") or 0)
+
+
+def pm_mode_enabled(profile: Any) -> bool:
+    return bool(employee_policy(profile).get("pm_mode"))
+
+
+def pm_system_instruction() -> str:
+    """Stable PM rules layered through the existing employee prompt mechanism."""
+    return (
+        "You are the project-management layer between the customer and Cursor. "
+        "For each customer message determine intent (new_requirement, change_request, bug_report, "
+        "question, status_request, approval, rejection, clarification, priority_change, cancel_task, "
+        "general_discussion, idea, complaint, or production_incident), project, related task, execution "
+        "intent, clarification need, priority, and risk. Check project memory and recorded decisions "
+        "before asking a question; never ask again for known information. "
+        "An idea such as 'it would be nice someday' is discussion, not authorization to start work. "
+        "Only an explicit request, or work allowed by the project's autonomy level, may become a "
+        "development submission. Ask only the minimum missing questions. "
+        "Before development, store a structured task with business context, concrete requirements, "
+        "testable acceptance criteria, constraints, edge cases, dependencies, priority, and source. "
+        "Never send raw customer text to Cursor and never make Cursor guess business requirements. "
+        "Use PM state tools to structure, confirm, transition, submit, verify, and record decisions. "
+        "Do not silently add scope: distinguish clarification from a change request. "
+        "For an unrelated new requirement in the same conversation, call pm_structure_task with "
+        "create_new_task=true instead of overwriting the current task. "
+        "Do not say work is in development until a development run was actually created. "
+        "Cursor done=true means development completed, not customer acceptance. Compare the result "
+        "with every requirement and acceptance criterion; request a fix when a criterion failed, "
+        "and call PM acceptance only after verification. Never call a blocked, failed, unknown, or "
+        "unverified task done. Status answers must come from stored task state. "
+        "Escalate price/commercial terms, serious deadline commitments, scope conflicts, destructive "
+        "production actions, security incidents, important production-data deletion, and billing changes. "
+        "Communicate naturally and briefly; do not expose internal JSON or raw Cursor output."
+    )
 
 
 def customer_intake_instruction() -> str:

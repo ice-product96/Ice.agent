@@ -5,7 +5,8 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .config import Settings
@@ -85,6 +86,8 @@ from .employee_policy import (
     intake_debounce_minutes,
     manager_telegram_instruction,
     normalize_action_name,
+    pm_mode_enabled,
+    pm_system_instruction,
 )
 from .memory_scope import (
     bind_conversation_from_config,
@@ -721,9 +724,460 @@ class AgentRuntime:
             )
             registry.register(sip_hangup, "sip_hangup", "Hang up an active SIP call")
             registry.register(sip_status, "sip_status", "SIP registration and active call status")
+        if db is not None and (context or {}).get("_pm_mode"):
+            from .db import Consultation, CursorRun, DecisionRecord, WorkItem
+            from .pm_state import (
+                TaskContract,
+                apply_task_contract,
+                can_transition,
+                get_or_create_project_state,
+                is_task_ready,
+                readiness_issues,
+                record_decision,
+                record_scope_change,
+                transition_pm_phase,
+            )
+            from .work_items import (
+                add_event,
+                create_work_item,
+                get_work_item,
+                list_events,
+                work_item_json,
+            )
+
+            async def pm_structure_task(
+                project_id: str,
+                task_type: str,
+                title: str,
+                requirements: list[str],
+                acceptance_criteria: list[str],
+                context_json: dict[str, Any] | None = None,
+                constraints: list[str] | None = None,
+                edge_cases: list[str] | None = None,
+                dependencies: list[str] | None = None,
+                related_tasks: list[str] | None = None,
+                priority: str = "normal",
+                create_new_task: bool = False,
+            ) -> dict[str, Any]:
+                """Create or update the current deterministic PM task. Never call for an idea."""
+                source_message_id = str((context or {}).get("message_id") or "") or None
+                item = None
+                if source_message_id:
+                    item = await db.scalar(
+                        select(WorkItem).where(
+                            WorkItem.agent_id == agent.id,
+                            WorkItem.source == str((context or {}).get("source") or ""),
+                            WorkItem.chat_id == str((context or {}).get("chat_id") or ""),
+                            WorkItem.source_message_id == source_message_id,
+                        )
+                    )
+                    if item is not None:
+                        if context is not None:
+                            context["work_item_id"] = item.id
+                        return {
+                            "ok": True,
+                            "duplicate": True,
+                            "task": work_item_json(item),
+                        }
+                if not create_new_task:
+                    item = await get_work_item(
+                        db, (context or {}).get("work_item_id")
+                    )
+                if item is None:
+                    try:
+                        item = await create_work_item(
+                            db,
+                            agent,
+                            title=title,
+                            goal=str((context_json or {}).get("business_reason") or title),
+                            context=context,
+                            source=str((context or {}).get("source") or "manual"),
+                            commit=False,
+                        )
+                    except IntegrityError:
+                        await db.rollback()
+                        item = await db.scalar(
+                            select(WorkItem).where(
+                                WorkItem.agent_id == agent.id,
+                                WorkItem.source
+                                == str((context or {}).get("source") or ""),
+                                WorkItem.chat_id
+                                == str((context or {}).get("chat_id") or ""),
+                                WorkItem.source_message_id == source_message_id,
+                            )
+                        )
+                        if item is None:
+                            raise
+                        return {
+                            "ok": True,
+                            "duplicate": True,
+                            "task": work_item_json(item),
+                        }
+                    if context is not None:
+                        context["work_item_id"] = item.id
+                normalized_task_context = dict(context_json or {})
+                approval = (
+                    await db.get(
+                        Consultation,
+                        int((context or {}).get("consultation_id")),
+                    )
+                    if (context or {}).get("consultation_id")
+                    else None
+                )
+                owner_approval_verified = bool(
+                    approval is not None
+                    and approval.status == "approved"
+                    and approval.agent_id == agent.id
+                    and approval.work_item_id == item.id
+                    and approval.answered_by
+                    and approval.answered_by == (context or {}).get("approved_by")
+                )
+                normalized_task_context["owner_approved"] = bool(
+                    normalized_task_context.get("owner_approved")
+                    and owner_approval_verified
+                )
+                if normalized_task_context["owner_approved"]:
+                    normalized_task_context["owner_approval"] = {
+                        "consultation_id": (context or {}).get("consultation_id"),
+                        "approved_by": (context or {}).get("approved_by"),
+                    }
+                contract = TaskContract(
+                    task_id=str(item.id),
+                    project_id=project_id,
+                    type=task_type,
+                    title=title,
+                    context=normalized_task_context,
+                    requirements=requirements,
+                    acceptance_criteria=acceptance_criteria,
+                    constraints=constraints or [],
+                    edge_cases=edge_cases or [],
+                    dependencies=dependencies or [],
+                    related_tasks=related_tasks or [],
+                    priority=priority,
+                    source={
+                        "channel": (context or {}).get("source"),
+                        "conversation_id": (context or {}).get("chat_id"),
+                        "message_id": source_message_id,
+                        "client_id": (context or {}).get("client_id")
+                        or (context or {}).get("sender_id"),
+                    },
+                )
+                stored_pm = (
+                    (item.metadata_json or {}).get("pm")
+                    if isinstance((item.metadata_json or {}).get("pm"), dict)
+                    else {}
+                )
+                stored_source = (
+                    stored_pm.get("source")
+                    if isinstance(stored_pm.get("source"), dict)
+                    else {}
+                )
+                if (
+                    source_message_id
+                    and str(stored_source.get("message_id") or "") == source_message_id
+                ):
+                    return {
+                        "ok": True,
+                        "duplicate": True,
+                        "task": work_item_json(item),
+                    }
+                if item.pm_phase in {
+                    "IN_DEVELOPMENT",
+                    "DEV_COMPLETE",
+                    "QA",
+                    "CLIENT_REVIEW",
+                    "DONE",
+                    "CANCELLED",
+                }:
+                    event = await record_scope_change(
+                        db,
+                        item,
+                        detail=title,
+                        source_message_id=source_message_id,
+                    )
+                    await db.commit()
+                    return {
+                        "ok": False,
+                        "change_request": True,
+                        "event_id": event.id,
+                        "reason": (
+                            "The existing task is already in development or review. "
+                            "Its approved requirements were not changed."
+                        ),
+                        "task": work_item_json(item),
+                    }
+                apply_task_contract(item, contract)
+                await get_or_create_project_state(db, project_id)
+                await add_event(
+                    db,
+                    item,
+                    kind="requirements",
+                    title="Structured requirements saved",
+                    detail=f"{len(contract.requirements)} requirements, "
+                    f"{len(contract.acceptance_criteria)} acceptance criteria",
+                    payload={"source_message_id": source_message_id},
+                )
+                target = "REQUIREMENTS_READY" if is_task_ready(item) else "CLARIFICATION"
+                if item.pm_phase != target:
+                    if not can_transition(item.pm_phase, target) and item.pm_phase not in {
+                        "DISCUSSION",
+                        "CLARIFICATION",
+                        "CHANGES_REQUESTED",
+                    }:
+                        await record_scope_change(
+                            db,
+                            item,
+                            detail="Structured task changed after its requirements phase",
+                            source_message_id=source_message_id,
+                        )
+                        if item.pm_phase in {"DONE", "CANCELLED"}:
+                            raise ValueError(
+                                "Closed task cannot be changed; create a separate change request"
+                            )
+                        await transition_pm_phase(
+                            db,
+                            item,
+                            "CHANGES_REQUESTED",
+                            detail="Requirements changed",
+                        )
+                    await transition_pm_phase(
+                        db,
+                        item,
+                        target,
+                        detail="Structured requirements saved",
+                        payload={"source_message_id": source_message_id},
+                    )
+                await db.commit()
+                return {
+                    "ok": True,
+                    "duplicate": item.source_message_id == source_message_id
+                    and item.id != (context or {}).get("work_item_id"),
+                    "task": work_item_json(item),
+                }
+
+            async def pm_get_task(work_item_id: int = 0) -> dict[str, Any]:
+                """Read authoritative task, decision, run, and audit state."""
+                item = await get_work_item(
+                    db, work_item_id or (context or {}).get("work_item_id")
+                )
+                if item is None or item.agent_id != agent.id:
+                    raise ValueError("PM task not found")
+                events = list(
+                    reversed(await list_events(db, item.id, limit=120))
+                )
+                decisions = (
+                    await db.scalars(
+                        select(DecisionRecord)
+                        .where(DecisionRecord.work_item_id == item.id)
+                        .order_by(DecisionRecord.created_at)
+                    )
+                ).all()
+                runs = (
+                    await db.scalars(
+                        select(CursorRun)
+                        .where(CursorRun.work_item_id == item.id)
+                        .order_by(CursorRun.attempt)
+                    )
+                ).all()
+                return {
+                    "task": work_item_json(item, events=events),
+                    "decisions": [
+                        {
+                            "id": row.id,
+                            "topic": row.topic,
+                            "decision": row.decision,
+                            "confirmed_by": row.confirmed_by,
+                        }
+                        for row in decisions
+                    ],
+                    "cursor_runs": [
+                        {
+                            "id": row.id,
+                            "attempt": row.attempt,
+                            "status": row.status,
+                            "error": row.error,
+                        }
+                        for row in runs
+                    ],
+                }
+
+            async def pm_record_decision(
+                project_id: str,
+                topic: str,
+                decision: str,
+                confirmed_by: str = "",
+                work_item_id: int = 0,
+            ) -> dict[str, Any]:
+                """Persist a confirmed project decision idempotently."""
+                target_work_item_id = work_item_id or (context or {}).get("work_item_id")
+                target_item = await get_work_item(db, target_work_item_id)
+                if (
+                    target_item is None
+                    or target_item.agent_id != agent.id
+                    or str(target_item.project_id or "") != project_id
+                ):
+                    raise PermissionError(
+                        "Decision must reference this agent's task in the same project"
+                    )
+                row = await record_decision(
+                    db,
+                    project_id=project_id,
+                    topic=topic,
+                    decision=decision,
+                    confirmed_by=confirmed_by,
+                    source_message_id=str((context or {}).get("message_id") or "") or None,
+                    work_item_id=target_item.id,
+                )
+                if getattr(row, "_pm_created", False):
+                    await add_event(
+                        db,
+                        target_item,
+                        kind="decision",
+                        title=topic,
+                        detail=decision,
+                        payload={"decision_id": row.id},
+                    )
+                await db.commit()
+                return {"ok": True, "decision_id": row.id}
+
+            async def pm_transition_task(
+                to_phase: str,
+                detail: str = "",
+                work_item_id: int = 0,
+            ) -> dict[str, Any]:
+                """Apply an allowed PM lifecycle transition and append its audit event."""
+                item = await get_work_item(
+                    db, work_item_id or (context or {}).get("work_item_id")
+                )
+                if item is None or item.agent_id != agent.id:
+                    raise ValueError("PM task not found")
+                if to_phase in {"IN_DEVELOPMENT", "DEV_COMPLETE", "QA", "DONE"}:
+                    raise ValueError(
+                        f"{to_phase} is controlled by the development/QA adapter"
+                    )
+                transition_payload: dict[str, Any] = {}
+                if to_phase == "CLIENT_CONFIRMED":
+                    internal_sources = {
+                        "employee_tick",
+                        "employee_heartbeat",
+                        "scheduled",
+                        "consult_resolved",
+                        "intake_flush",
+                    }
+                    source = str((context or {}).get("source") or "")
+                    message_id = str((context or {}).get("message_id") or "")
+                    client_id = str(
+                        (context or {}).get("client_id")
+                        or (context or {}).get("sender_id")
+                        or ""
+                    )
+                    if (
+                        source in internal_sources
+                        or (context or {}).get("is_admin")
+                        or not message_id
+                        or not client_id
+                    ):
+                        raise PermissionError(
+                            "CLIENT_CONFIRMED requires an identifiable current client message"
+                        )
+                    transition_payload = {
+                        "confirmed_by": client_id,
+                        "source_message_id": message_id,
+                    }
+                if to_phase in {"REQUIREMENTS_READY", "CLIENT_CONFIRMED", "READY_FOR_DEV"}:
+                    issues = readiness_issues(item)
+                    if issues:
+                        raise ValueError("; ".join(issues))
+                if to_phase == "CANCELLED" and item.active_cursor_run_id:
+                    active_run = await db.get(CursorRun, item.active_cursor_run_id)
+                    if active_run is not None and active_run.status in {"pending", "running"}:
+                        raise PermissionError(
+                            "Cannot cancel while Cursor is active without confirmed "
+                            "remote termination"
+                        )
+                await transition_pm_phase(
+                    db,
+                    item,
+                    to_phase,
+                    detail=detail,
+                    payload=transition_payload,
+                )
+                if to_phase == "CANCELLED" and item.active_cursor_run_id:
+                    item.active_cursor_run_id = None
+                await db.commit()
+                return {"ok": True, "task": work_item_json(item)}
+
+            registry.register(
+                pm_structure_task,
+                "pm_structure_task",
+                "Create or update a validated structured development task; never use for an idea.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "task_type": {
+                            "type": "string",
+                            "enum": ["feature", "bug", "change", "technical"],
+                        },
+                        "title": {"type": "string"},
+                        "requirements": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "context_json": {"type": "object"},
+                        "constraints": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "edge_cases": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "dependencies": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "related_tasks": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["critical", "high", "normal", "low"],
+                        },
+                        "create_new_task": {
+                            "type": "boolean",
+                            "description": (
+                                "True only for a separate new requirement; false for "
+                                "clarification of the current task."
+                            ),
+                        },
+                    },
+                    "required": [
+                        "project_id",
+                        "task_type",
+                        "title",
+                        "requirements",
+                        "acceptance_criteria",
+                    ],
+                },
+            )
+            registry.register(pm_get_task, "pm_get_task")
+            registry.register(pm_record_decision, "pm_record_decision")
+            registry.register(pm_transition_task, "pm_transition_task")
         cursor_state = {"finished": False, "prompt_sent": False}
         if self.mcp and mcp_server_names:
             await self.mcp.register_tools(registry, mcp_server_names)
+            if (context or {}).get("_pm_mode"):
+                # PM agents use the structured adapter below, not arbitrary Cursor prompts.
+                for tool_name in list(registry.tools):
+                    lowered = tool_name.lower()
+                    if lowered in {"mcp_cursorremote_tools", "mcp_cursorremote_run"}:
+                        registry.tools.pop(tool_name, None)
             cursor_session = next(
                 (
                     session
@@ -814,32 +1268,375 @@ class AgentRuntime:
                         cursor_state["finished"] = True
                     return result
 
-                registry.register(
-                    cursorremote_do,
-                    "cursorremote_do",
-                    (
-                        "Give Cursor a NEW coding task only if this case has not already sent one. "
-                        "One case = one Cursor job. Never send a second prompt for the next bullet "
-                        "or because Cursor is searching. "
-                        "If the customer attached photos or files, the platform uploads them into "
-                        "the Cursor workspace via MCP (or provides signed download URLs for the Cursor PC). "
-                        "Still describe how to use them in the task. "
-                        "If the case is waiting on Cursor, the platform converts this to a check "
-                        "and will not send a duplicate prompt. Clicks Allow/Accept/Run itself. "
-                        "done=true only after Cursor finished. If done=false, schedule_self "
-                        "in ~2 minutes to cursorremote_check. Search/explore is not a stop."
-                    ),
-                )
-                registry.register(
-                    cursorremote_check,
-                    "cursorremote_check",
-                    (
-                        "Check an already running Cursor job. Clicks Allow/Accept. "
-                        "done=true means finished — write to the original Telegram chat, "
-                        "do not schedule_self. done=false means still working (including search) "
-                        "— schedule_self again. Never start a second job for the same case."
-                    ),
-                )
+                if (context or {}).get("_pm_mode") and db is not None:
+                    from .db import CursorRun
+                    from .pm_state import (
+                        get_or_create_cursor_run,
+                        get_or_create_project_state,
+                        is_task_ready,
+                        render_task_brief,
+                        submission_requires_approval,
+                        transition_pm_phase,
+                        update_cursor_run,
+                    )
+                    from .work_items import add_event, get_work_item, work_item_json
+
+                    async def _pm_cursor_result(
+                        item: Any,
+                        run: CursorRun,
+                        result: dict[str, Any],
+                    ) -> dict[str, Any]:
+                        if not result.get("done"):
+                            await update_cursor_run(db, run, status="running", result=result)
+                            await db.commit()
+                            return {
+                                "task_id": str(item.id),
+                                "run_id": run.id,
+                                "status": "in_progress",
+                                "done": False,
+                            }
+                        structured: dict[str, Any] | None = None
+                        candidates = [result.get("result"), result.get("summary")]
+                        candidates.extend(
+                            reversed(result.get("messages") or [])
+                            if isinstance(result.get("messages"), list)
+                            else []
+                        )
+                        from .pm_state import parse_cursor_result
+
+                        for candidate in candidates:
+                            if isinstance(candidate, dict):
+                                candidate = candidate.get("content") or candidate.get("text") or candidate
+                            try:
+                                structured = parse_cursor_result(candidate)
+                                break
+                            except (TypeError, ValueError):
+                                continue
+                        if structured is not None and str(
+                            structured.get("task_id") or ""
+                        ) != str(item.id):
+                            structured = None
+                        if structured is None:
+                            structured = {
+                                "status": "blocked",
+                                "implementation": {"summary": str(result.get("summary") or "")},
+                                "verification": {},
+                                "questions": [
+                                    "Cursor returned no valid structured completion payload."
+                                ],
+                                "risks": [],
+                                "limitations": [],
+                            }
+                        cursor_state["finished"] = True
+                        await update_cursor_run(
+                            db,
+                            run,
+                            status=structured["status"],
+                            result=structured,
+                            error=(
+                                "Invalid or blocked Cursor result"
+                                if structured["status"] != "completed"
+                                else None
+                            ),
+                        )
+                        if structured["status"] == "completed":
+                            await transition_pm_phase(
+                                db, item, "DEV_COMPLETE", detail="Cursor development complete"
+                            )
+                            await transition_pm_phase(
+                                db, item, "QA", detail="Result awaits acceptance checks"
+                            )
+                            item.status = "in_progress"
+                            item.wait_owner = "self"
+                            item.next_action = (
+                                "Verify acceptance criteria and explicitly accept QA"
+                            )
+                            item.last_error = None
+                        else:
+                            await transition_pm_phase(
+                                db,
+                                item,
+                                "BLOCKED",
+                                detail="Cursor result blocked or invalid",
+                            )
+                            item.status = "failed"
+                            item.wait_owner = "self"
+                            item.next_action = "Review Cursor result or request a fix"
+                            item.last_error = "Cursor result blocked, failed, or invalid"
+                        await db.commit()
+                        return {
+                            "task_id": str(item.id),
+                            "run_id": run.id,
+                            "status": structured["status"],
+                            "done": structured["status"] == "completed",
+                            "qa_required": structured["status"] == "completed",
+                            "result": structured,
+                        }
+
+                    async def _submit_pm_item(
+                        item: Any,
+                        *,
+                        fix_request: str = "",
+                    ) -> dict[str, Any]:
+                        if not is_task_ready(item):
+                            raise ValueError("Task requirements and acceptance criteria are incomplete")
+                        project = await get_or_create_project_state(
+                            db, item.project_id or f"agent-{agent.id}"
+                        )
+                        confirmed = item.pm_phase in {
+                            "CLIENT_CONFIRMED",
+                            "READY_FOR_DEV",
+                            "CHANGES_REQUESTED",
+                        }
+                        inside_scope = bool(
+                            (item.context_json or {}).get(
+                                "inside_agreed_scope",
+                                confirmed,
+                            )
+                        )
+                        small_fix = bool((item.context_json or {}).get("small_fix"))
+                        high_risk = bool((item.context_json or {}).get("high_risk"))
+                        owner_approved = bool(
+                            (item.context_json or {}).get("owner_approved")
+                        )
+                        if high_risk and not owner_approved:
+                            raise PermissionError(
+                                "High-risk development requires explicit owner approval"
+                            )
+                        if submission_requires_approval(
+                            project.autonomy_level,
+                            task_type=item.task_type,
+                            client_confirmed=confirmed,
+                            inside_agreed_scope=inside_scope,
+                            small_fix=small_fix,
+                            high_risk=False,
+                        ) and not confirmed:
+                            raise PermissionError(
+                                "Project autonomy requires client confirmation before development"
+                            )
+                        if item.pm_phase in {"REQUIREMENTS_READY", "CLIENT_CONFIRMED", "CHANGES_REQUESTED"}:
+                            await transition_pm_phase(
+                                db, item, "READY_FOR_DEV", detail="Development gate passed"
+                            )
+                        if item.pm_phase != "READY_FOR_DEV":
+                            raise ValueError(
+                                f"Task phase {item.pm_phase} cannot be submitted for development"
+                            )
+                        attempt = int(
+                            await db.scalar(
+                                select(func.count())
+                                .select_from(CursorRun)
+                                .where(CursorRun.work_item_id == item.id)
+                            )
+                            or 0
+                        ) + 1
+                        brief = render_task_brief(item)
+                        if fix_request:
+                            brief += f"\n## Required fix\n{fix_request}\n"
+                        brief += (
+                            "\nReturn a JSON object with task_id, status "
+                            "(completed|blocked|failed), implementation {summary, files_changed, tests}, "
+                            "verification {tests_passed, lint_passed, acceptance_criteria: "
+                            "[{criterion, passed, evidence}]}, questions, risks, and limitations. "
+                            "Include one evidence entry for every acceptance criterion exactly as written."
+                        )
+                        run, created = await get_or_create_cursor_run(
+                            db,
+                            item,
+                            attempt=attempt,
+                            request={"brief": brief, "fix_request": fix_request},
+                        )
+                        if not created:
+                            return {
+                                "task_id": str(item.id),
+                                "run_id": run.id,
+                                "status": run.status,
+                                "duplicate": True,
+                            }
+                        await transition_pm_phase(
+                            db, item, "IN_DEVELOPMENT", detail=f"Cursor run #{attempt} started"
+                        )
+                        await update_cursor_run(db, run, status="running")
+                        item.status = "waiting_external"
+                        item.wait_owner = "external"
+                        item.next_action = "Wait for structured Cursor result"
+                        await db.commit()
+                        try:
+                            result = await send_prompt_and_drive(
+                                cursor_session,
+                                brief,
+                                attachments=collect_images_for_cursor(context, item),
+                                work_item_id=item.id,
+                                public_base_url=self.settings.public_base_url,
+                                secret_key=self.settings.secret_key.get_secret_value(),
+                            )
+                        except Exception as exc:
+                            await update_cursor_run(
+                                db, run, status="failed", error=str(exc)[:2000]
+                            )
+                            await transition_pm_phase(
+                                db, item, "BLOCKED", detail="Cursor unavailable or timed out"
+                            )
+                            item.status = "failed"
+                            item.last_error = str(exc)[:2000]
+                            await db.commit()
+                            raise
+                        return await _pm_cursor_result(item, run, result)
+
+                    async def submit_development_task(
+                        work_item_id: int = 0,
+                    ) -> dict[str, Any]:
+                        """Submit only a ready stored task to Cursor using the structured contract."""
+                        item = await get_work_item(
+                            db, work_item_id or (context or {}).get("work_item_id")
+                        )
+                        if item is None or item.agent_id != agent.id:
+                            raise ValueError("PM task not found")
+                        return await _submit_pm_item(item)
+
+                    async def get_development_status(
+                        work_item_id: int = 0,
+                    ) -> dict[str, Any]:
+                        """Poll the single active Cursor run and persist its state."""
+                        item = await get_work_item(
+                            db, work_item_id or (context or {}).get("work_item_id")
+                        )
+                        if (
+                            item is None
+                            or item.agent_id != agent.id
+                            or not item.active_cursor_run_id
+                        ):
+                            raise ValueError("No active Cursor run")
+                        run = await db.get(CursorRun, item.active_cursor_run_id)
+                        if run is None:
+                            raise ValueError("Cursor run not found")
+                        if run.status in {"completed", "blocked", "failed", "cancelled"}:
+                            return {
+                                "task": work_item_json(item),
+                                "run_id": run.id,
+                                "status": run.status,
+                                "result": run.result_json,
+                            }
+                        return await _pm_cursor_result(
+                            item, run, await check_and_drive(cursor_session)
+                        )
+
+                    async def request_development_fix(
+                        fix_request: str,
+                        work_item_id: int = 0,
+                    ) -> dict[str, Any]:
+                        """Start a new attempt for failed acceptance criteria, not a duplicate task."""
+                        item = await get_work_item(
+                            db, work_item_id or (context or {}).get("work_item_id")
+                        )
+                        if item is None or item.agent_id != agent.id:
+                            raise ValueError("PM task not found")
+                        if item.pm_phase in {"QA", "CLIENT_REVIEW"}:
+                            await transition_pm_phase(
+                                db, item, "CHANGES_REQUESTED", detail=fix_request
+                            )
+                        elif item.pm_phase == "BLOCKED":
+                            await transition_pm_phase(
+                                db, item, "READY_FOR_DEV", detail=fix_request
+                            )
+                        return await _submit_pm_item(item, fix_request=fix_request)
+
+                    async def get_development_result(
+                        work_item_id: int = 0,
+                    ) -> dict[str, Any]:
+                        """Return the persisted structured Cursor result without changing state."""
+                        item = await get_work_item(
+                            db, work_item_id or (context or {}).get("work_item_id")
+                        )
+                        if (
+                            item is None
+                            or item.agent_id != agent.id
+                            or not item.active_cursor_run_id
+                        ):
+                            raise ValueError("No Cursor result for this task")
+                        run = await db.get(CursorRun, item.active_cursor_run_id)
+                        if run is None:
+                            raise ValueError("Cursor run not found")
+                        return {
+                            "task_id": str(item.id),
+                            "run_id": run.id,
+                            "status": run.status,
+                            "result": run.result_json,
+                            "error": run.error,
+                        }
+
+                    async def pm_accept_task(
+                        work_item_id: int = 0,
+                    ) -> dict[str, Any]:
+                        """Accept QA only when the latest structured verification passed."""
+                        item = await get_work_item(
+                            db, work_item_id or (context or {}).get("work_item_id")
+                        )
+                        if (
+                            item is None
+                            or item.agent_id != agent.id
+                            or item.pm_phase not in {"QA", "CLIENT_REVIEW"}
+                        ):
+                            raise ValueError("Task is not ready for QA acceptance")
+                        run = await db.get(CursorRun, item.active_cursor_run_id)
+                        verification = (run.result_json or {}).get("verification", {}) if run else {}
+                        evidence_rows = verification.get("acceptance_criteria", [])
+                        evidence = {
+                            str(row.get("criterion") or ""): row
+                            for row in evidence_rows
+                            if isinstance(row, dict)
+                        }
+                        criteria_passed = all(
+                            criterion in evidence
+                            and evidence[criterion].get("passed") is True
+                            and bool(str(evidence[criterion].get("evidence") or "").strip())
+                            for criterion in list(item.acceptance_criteria or [])
+                        )
+                        if (
+                            run is None
+                            or run.status != "completed"
+                            or verification.get("tests_passed") is not True
+                            or verification.get("lint_passed") is not True
+                            or not item.acceptance_criteria
+                            or not criteria_passed
+                        ):
+                            raise ValueError(
+                                "Latest Cursor run lacks passing evidence for every acceptance criterion"
+                            )
+                        await transition_pm_phase(db, item, "DONE", detail="QA accepted")
+                        item.status = "done"
+                        item.wait_owner = "none"
+                        item.next_action = ""
+                        await add_event(
+                            db,
+                            item,
+                            kind="accepted",
+                            title="QA accepted",
+                            detail="Acceptance criteria verified",
+                        )
+                        await db.commit()
+                        return {"ok": True, "task": work_item_json(item)}
+
+                    registry.register(submit_development_task)
+                    registry.register(get_development_status)
+                    registry.register(get_development_result)
+                    registry.register(request_development_fix)
+                    registry.register(pm_accept_task)
+                else:
+                    registry.register(
+                        cursorremote_do,
+                        "cursorremote_do",
+                        (
+                            "Give Cursor a NEW coding task only if this case has not already sent one. "
+                            "One case = one Cursor job. Never send a second prompt for the next bullet "
+                            "or because Cursor is searching. done=true only after Cursor finished."
+                        ),
+                    )
+                    registry.register(
+                        cursorremote_check,
+                        "cursorremote_check",
+                        "Check an already running Cursor job; never start a duplicate.",
+                    )
         if self.task_bus:
             async def agent_create_task(target_agent_id: int, message: str) -> dict[str, Any]:
                 task = await self.task_bus.delegate(
@@ -1139,7 +1936,15 @@ class AgentRuntime:
                 **{key: value for key, value in origin.items() if value not in (None, "")},
                 **{
                     key: extra[key]
-                    for key in ("work_item_id", "reply_chat_id", "reply_phone", "chat_id")
+                    for key in (
+                        "work_item_id",
+                        "reply_chat_id",
+                        "reply_phone",
+                        "chat_id",
+                        "consultation_id",
+                        "consultation_status",
+                        "approved_by",
+                    )
                     if extra.get(key) not in (None, "")
                 },
             }
@@ -1364,6 +2169,7 @@ class AgentRuntime:
             memory_context = format_memory_hits(memories)
             scope_line = memory_scope_prompt(memory_scope) if memory_scope else ""
             employee_profile = await get_or_create_profile(db, agent.id)
+            context["_pm_mode"] = pm_mode_enabled(employee_profile)
             work_item = await get_work_item(db, context.get("work_item_id"))
             debounce_minutes = intake_debounce_minutes(employee_profile)
             is_intake_flush = str(context.get("source") or "") == "intake_flush" or str(
@@ -1382,6 +2188,10 @@ class AgentRuntime:
                 duplicate_flush = intake_flush_already_started(work_item)
                 context["_intake_flush"] = True
                 context["_intake_collecting"] = False
+                if duplicate_flush:
+                    context["_duplicate_intake_flush"] = True
+                    context["_suppress_telegram_reply"] = True
+                    return NO_TELEGRAM_REPLY
                 compiled = compile_intake_brief(work_item)
                 if compiled:
                     message = compiled
@@ -1526,6 +2336,8 @@ class AgentRuntime:
                     "Never claim that an external action succeeded unless its tool call "
                     "returned successfully. Report tool errors truthfully and explicitly."
                 )
+            if pm_mode_enabled(employee_profile):
+                role_instruction = pm_system_instruction() + "\n\n" + role_instruction
             messages = [
                 {"role": "system", "content": system_prompt},
                 {
@@ -1746,6 +2558,13 @@ class AgentRuntime:
                 registry.audit,
                 cursor_was_in_flight=bool(context.get("_cursor_was_in_flight")),
             )
+            if context.get("_pm_mode"):
+                result_ready = any(
+                    isinstance(call, dict)
+                    and call.get("tool") == "pm_accept_task"
+                    and call.get("status") == "success"
+                    for call in registry.audit
+                )
             if result_ready and not suppressed:
                 context["_deliver_origin_reply"] = True
             elif (

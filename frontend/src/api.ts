@@ -2,7 +2,7 @@ import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
   Conversation, ConversationDetail, Consultation, EmployeePolicy, EmployeePolicyCatalog, EmployeeProfile, EmployeeRosterEntry, EmployeeState,
   LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
-  RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts,
+  PmProjectDetail, ProjectState, RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api/v1'
@@ -112,10 +112,22 @@ export const api = {
         `/agents/${id}/work-items/${workItemId}/intake-wait`,
         { method: 'POST', ...body({ minutes, note }) },
       ),
+    mcpServers: (id: string) =>
+      request<{ agent_id: number; server_ids: number[] }>(`/agents/${id}/mcp-servers`),
+    attachMcpServer: (id: string, serverId: string) =>
+      request<void>(`/agents/${id}/mcp-servers/${serverId}`, { method: 'PUT' }),
+    detachMcpServer: (id: string, serverId: string) =>
+      request<void>(`/agents/${id}/mcp-servers/${serverId}`, { method: 'DELETE' }),
   },
   employees: {
     list: () => request<{ items: EmployeeRosterEntry[]; open_consultations: number; paused_agents: number; autonomous_agents: number; failed_work_items?: number; waiting_manager?: number; actionable_work_items?: number }>('/employees'),
     policyCatalog: () => request<EmployeePolicyCatalog>('/employees/policy-catalog'),
+  },
+  pm: {
+    projects: () => request<ProjectState[]>('/pm/projects'),
+    project: (id: string) => request<PmProjectDetail>(`/pm/projects/${encodeURIComponent(id)}`),
+    updateProject: (id: string, data: Pick<ProjectState, 'autonomy_level'> & { config?: Record<string, unknown> }) =>
+      request<ProjectState>(`/pm/projects/${encodeURIComponent(id)}`, { method: 'PATCH', ...body(data) }),
   },
   consultations: {
     list: (agentId?: string, status = 'open') =>

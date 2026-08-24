@@ -240,6 +240,37 @@ class RunRequest(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
 
 
+class NormalizedInboundEvent(BaseModel):
+    """Channel-neutral message envelope consumed by the agent runtime."""
+
+    channel: str
+    conversation_id: str
+    message_id: str
+    client_id: str
+    project_id: str | None = None
+    text: str
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    timestamp: datetime | None = None
+    thread_id: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def runtime_context(self) -> dict[str, Any]:
+        return {
+            **self.metadata,
+            "source": self.channel,
+            "channel": self.channel,
+            "conversation_id": self.conversation_id,
+            "chat_id": self.conversation_id,
+            "message_id": self.message_id or None,
+            "sender_id": self.client_id,
+            "client_id": self.client_id,
+            "project_id": self.project_id,
+            "message_at": self.timestamp,
+            "thread_id": self.thread_id,
+            "attachments": self.attachments,
+        }
+
+
 class LlmProfileBody(BaseModel):
     name: str
     provider: Literal["openai", "deepseek", "custom-openai-compatible"]

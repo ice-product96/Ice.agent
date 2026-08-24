@@ -10,7 +10,7 @@ from sqlalchemy import inspect
 
 from app.db import create_schema, engine
 
-HEAD_REVISION = "b8c9d0e1f2a3"
+PRE_PM_REVISION = "c9d0e1f2a3b4"
 
 
 async def _table_exists(table: str) -> bool:
@@ -26,8 +26,16 @@ async def bootstrap() -> None:
 
     if await _table_exists("admin_settings"):
         # Legacy DB: tables were created by create_schema(), not Alembic.
-        await create_schema()
-        _run_alembic("stamp", HEAD_REVISION)
+        if not await _table_exists("work_items"):
+            # Very old legacy schema: current metadata can safely create the
+            # entirely missing work-items/PM tables before stamping head.
+            await create_schema()
+            _run_alembic("stamp", "head")
+            return
+        # Its pre-PM schema matches the former head. Stamp there and let the
+        # real migration add PM columns dialect-safely (including SQLite).
+        _run_alembic("stamp", PRE_PM_REVISION)
+        _run_alembic("upgrade", "head")
         return
 
     _run_alembic("upgrade", "head")

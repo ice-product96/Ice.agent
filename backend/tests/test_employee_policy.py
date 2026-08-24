@@ -5,6 +5,8 @@ from app.employee_policy import (
     approval_required_for_tool,
     employee_policy,
     normalize_action_name,
+    pm_mode_enabled,
+    pm_system_instruction,
 )
 
 
@@ -80,3 +82,14 @@ def test_customer_instruction_forbids_early_cursor_done() -> None:
     text = customer_telegram_instruction()
     assert "done=false" in text
     assert "schedule_self" in text
+
+
+def test_pm_mode_is_opt_in_and_has_structured_guards() -> None:
+    assert not pm_mode_enabled(SimpleNamespace(config_json={}))
+    profile = SimpleNamespace(config_json={"policy": {"pm_mode": True}})
+    assert pm_mode_enabled(profile)
+    text = pm_system_instruction()
+    assert "idea" in text
+    assert "acceptance criteria" in text
+    assert "never send raw customer text" in text.lower()
+    assert "done=true" in text

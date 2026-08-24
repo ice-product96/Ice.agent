@@ -18,6 +18,7 @@
 - **Браузер Playwright MCP** — локальный headless Chromium для открытия найденных ссылок, кликов и извлечения данных.
 - **Cron** — периодические задачи агентов (APScheduler).
 - **MCP** — подключение внешних MCP-серверов (stdio / SSE / streamable-http) как инструментов агента.
+- **Project Manager** — опциональный структурированный workflow задач, решений, автономии и CursorRun: [документация](docs/PROJECT_MANAGER.md).
 
 ## Быстрый старт (dev)
 

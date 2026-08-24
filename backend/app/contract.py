@@ -7,15 +7,15 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Settings, get_settings
 from .db import (
     AdminSettings, Agent, AgentLink, AgentTask, CronJob, LlmProfile, McpServer,
-    Consultation, ConversationState, EmployeeNeed, EmployeePlan, EmployeeProfile,
+    Consultation, ConversationState, CursorRun, DecisionRecord, EmployeeNeed, EmployeePlan, EmployeeProfile,
     MessageLog, PromptSection, RuntimeSettings, SipAccount, SipCall,
-    TelegramAccount, WorkItem, get_db,
+    ProjectState, TelegramAccount, WorkItem, agent_mcp_servers, get_db,
 )
 from .employee import (
     HEARTBEAT_JOB_PREFIX,
@@ -646,6 +646,107 @@ class WorkItemWaitBody(BaseModel):
     note: str = ""
 
 
+class ProjectStateBody(BaseModel):
+    autonomy_level: str = Field(pattern=r"^LEVEL_[0-3]$")
+    config: dict[str, Any] | None = None
+
+
+def project_state_json(state: ProjectState) -> dict[str, Any]:
+    return {
+        "project_id": state.project_id,
+        "autonomy_level": state.autonomy_level,
+        "config": state.config or {},
+        "created_at": state.created_at.isoformat() if state.created_at else None,
+        "updated_at": state.updated_at.isoformat() if state.updated_at else None,
+    }
+
+
+def decision_record_json(record: DecisionRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "project_id": record.project_id,
+        "work_item_id": record.work_item_id,
+        "topic": getattr(record, "topic", ""),
+        "decision": record.decision,
+        "rationale": record.rationale,
+        "confirmed_by": getattr(record, "confirmed_by", ""),
+        "source_message_id": getattr(record, "source_message_id", None),
+        "context": record.context_json or {},
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
+
+
+def cursor_run_json(run: CursorRun) -> dict[str, Any]:
+    return {
+        "id": run.id,
+        "work_item_id": run.work_item_id,
+        "project_id": run.project_id,
+        "attempt": run.attempt,
+        "status": run.status,
+        "request": run.request_json or {},
+        "result": run.result_json,
+        "error": run.error,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+    }
+
+
+@router.get("/pm/projects", dependencies=auth)
+async def list_pm_projects(db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
+    rows = (await db.scalars(select(ProjectState).order_by(ProjectState.project_id))).all()
+    return [project_state_json(row) for row in rows]
+
+
+@router.get("/pm/projects/{project_id}", dependencies=auth)
+async def get_pm_project(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    state = await db.get(ProjectState, project_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Project state not found")
+    decisions = (
+        await db.scalars(
+            select(DecisionRecord)
+            .where(DecisionRecord.project_id == project_id)
+            .order_by(DecisionRecord.created_at.desc())
+            .limit(200)
+        )
+    ).all()
+    tasks = (
+        await db.scalars(
+            select(WorkItem)
+            .where(WorkItem.project_id == project_id)
+            .order_by(WorkItem.updated_at.desc())
+            .limit(200)
+        )
+    ).all()
+    from .work_items import work_item_json
+
+    return {
+        **project_state_json(state),
+        "decisions": [decision_record_json(row) for row in decisions],
+        "tasks": [work_item_json(row) for row in tasks],
+    }
+
+
+@router.patch("/pm/projects/{project_id}", dependencies=auth)
+async def update_pm_project(
+    project_id: str,
+    payload: ProjectStateBody,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .pm_state import get_or_create_project_state, normalize_autonomy_level
+
+    state = await get_or_create_project_state(db, project_id)
+    state.autonomy_level = normalize_autonomy_level(payload.autonomy_level)
+    if payload.config is not None:
+        state.config = payload.config
+    await db.commit()
+    return project_state_json(state)
+
+
 @router.get("/agents/{agent_id}/employee", dependencies=auth)
 async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     agent = await one(db, Agent, agent_id)
@@ -712,7 +813,9 @@ async def patch_employee(
             setattr(profile, key, value)
     if policy_payload is not None:
         current = dict(profile.config_json or {})
-        current["policy"] = policy_payload
+        merged_policy = dict(current.get("policy") or {})
+        merged_policy.update(policy_payload)
+        current["policy"] = merged_policy
         profile.config_json = current
     if sections_payload:
         await ensure_prompt_sections(db, agent)
@@ -804,7 +907,28 @@ async def get_agent_work_item(
 
     _, item = await _agent_work_item(db, agent_id, work_item_id)
     events = list(reversed(await list_events(db, item.id, limit=120)))
-    return work_item_json(item, events=events)
+    decisions = (
+        await db.scalars(
+            select(DecisionRecord)
+            .where(DecisionRecord.work_item_id == item.id)
+            .order_by(DecisionRecord.created_at)
+        )
+    ).all()
+    runs = (
+        await db.scalars(
+            select(CursorRun)
+            .where(CursorRun.work_item_id == item.id)
+            .order_by(CursorRun.attempt)
+        )
+    ).all()
+    project = await db.get(ProjectState, item.project_id) if item.project_id else None
+    result = work_item_json(item, events=events)
+    result.update(
+        decisions=[decision_record_json(row) for row in decisions],
+        cursor_runs=[cursor_run_json(row) for row in runs],
+        project=project_state_json(project) if project else None,
+    )
+    return result
 
 
 @router.post("/agents/{agent_id}/work-items/{work_item_id}/resume", dependencies=auth)
@@ -862,6 +986,11 @@ async def close_agent_work_item(
     from .work_items import close_work_item, work_item_json
 
     _, item = await _agent_work_item(db, agent_id, work_item_id)
+    if item.pm_phase not in {"DISCUSSION", "DONE"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Structured PM task must pass pm_accept_task before closure",
+        )
     scheduler = getattr(request.app.state, "scheduler", None)
     await close_work_item(db, item, note=payload.note, scheduler=scheduler)
     return {"ok": True, "item": work_item_json(item)}
@@ -884,6 +1013,16 @@ async def abort_agent_work_item(
             "item": work_item_json(item),
             "message": "Кейс уже отменён.",
         }
+    if item.active_cursor_run_id:
+        active_run = await db.get(CursorRun, item.active_cursor_run_id)
+        if active_run is not None and active_run.status in {"pending", "running"}:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cursor run is still active; cancellation requires confirmed "
+                    "remote termination"
+                ),
+            )
     scheduler = getattr(request.app.state, "scheduler", None)
     await abort_work_item(db, item, note=payload.note, scheduler=scheduler)
     return {
@@ -903,6 +1042,13 @@ async def delete_agent_work_item(
     from .work_items import delete_work_item
 
     _, item = await _agent_work_item(db, agent_id, work_item_id)
+    if item.active_cursor_run_id:
+        active_run = await db.get(CursorRun, item.active_cursor_run_id)
+        if active_run is not None and active_run.status in {"pending", "running"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot delete a task while Cursor execution is active",
+            )
     scheduler = getattr(request.app.state, "scheduler", None)
     await delete_work_item(db, item, scheduler=scheduler)
     return {"ok": True, "deleted_id": work_item_id}
@@ -955,6 +1101,28 @@ async def reset_agent_work_item_cursor(
     if work_item_aborted(item):
         raise HTTPException(status_code=409, detail="work item aborted")
     note = (payload.note or "").strip() or "Сброс привязки case→Cursor по указанию руководителя."
+    if item.pm_phase in {"DONE", "CANCELLED"}:
+        raise HTTPException(status_code=409, detail="Closed PM task cannot reset Cursor")
+    if item.pm_phase != "DISCUSSION":
+        from .pm_state import transition_pm_phase
+
+        if item.active_cursor_run_id:
+            active_run = await db.get(CursorRun, item.active_cursor_run_id)
+            if active_run is not None and active_run.status in {"pending", "running"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Cursor run is still active; reset is unsafe until remote "
+                        "execution reaches a terminal state"
+                    ),
+                )
+            item.active_cursor_run_id = None
+        if item.pm_phase == "IN_DEVELOPMENT":
+            await transition_pm_phase(db, item, "BLOCKED", detail=note)
+        if item.pm_phase in {"DEV_COMPLETE", "QA", "CLIENT_REVIEW"}:
+            await transition_pm_phase(db, item, "CHANGES_REQUESTED", detail=note)
+        if item.pm_phase in {"BLOCKED", "CHANGES_REQUESTED"}:
+            await transition_pm_phase(db, item, "READY_FOR_DEV", detail=note)
     await reset_cursor_assignment(db, item, note=note)
     return {
         "ok": True,
@@ -1113,6 +1281,9 @@ async def resolve_consultation_api(
                 reason="consult_resolved",
                 extra={
                     "work_item_id": item.work_item_id,
+                    "consultation_id": item.id,
+                    "consultation_status": item.status,
+                    "approved_by": item.answered_by,
                     "instruction": (
                         f"Ответ руководителя на консультацию #{item.id}: {answer}. "
                         "Выполни указание. Не создавай новую consult_manager по этому же вопросу."
@@ -2018,6 +2189,72 @@ async def mcp_servers(request: Request, db: AsyncSession = Depends(get_db)) -> l
         )
         results.append(result)
     return results
+
+
+@router.get("/agents/{agent_id}/mcp-servers", dependencies=auth)
+async def agent_mcp_server_ids(
+    agent_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    agent = await one(db, Agent, agent_id)
+    ids = list(
+        await db.scalars(
+            select(agent_mcp_servers.c.mcp_server_id)
+            .where(agent_mcp_servers.c.agent_id == agent.id)
+            .order_by(agent_mcp_servers.c.mcp_server_id)
+        )
+    )
+    return {"agent_id": agent.id, "server_ids": ids}
+
+
+@router.put(
+    "/agents/{agent_id}/mcp-servers/{server_id}",
+    dependencies=auth,
+    status_code=204,
+)
+async def attach_agent_mcp_server(
+    agent_id: str,
+    server_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    agent = await one(db, Agent, agent_id)
+    server = await one(db, McpServer, server_id)
+    exists = await db.scalar(
+        select(agent_mcp_servers.c.agent_id).where(
+            agent_mcp_servers.c.agent_id == agent.id,
+            agent_mcp_servers.c.mcp_server_id == server.id,
+        )
+    )
+    if exists is None:
+        await db.execute(
+            insert(agent_mcp_servers).values(
+                agent_id=agent.id,
+                mcp_server_id=server.id,
+            )
+        )
+        await db.commit()
+    return Response(status_code=204)
+
+
+@router.delete(
+    "/agents/{agent_id}/mcp-servers/{server_id}",
+    dependencies=auth,
+    status_code=204,
+)
+async def detach_agent_mcp_server(
+    agent_id: str,
+    server_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    agent = await one(db, Agent, agent_id)
+    await db.execute(
+        delete(agent_mcp_servers).where(
+            agent_mcp_servers.c.agent_id == agent.id,
+            agent_mcp_servers.c.mcp_server_id == as_int(server_id, "server_id"),
+        )
+    )
+    await db.commit()
+    return Response(status_code=204)
 
 
 @router.post("/mcp/servers", dependencies=auth, status_code=201)

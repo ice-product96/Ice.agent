@@ -87,3 +87,57 @@ def test_v1_admin_settings_round_trip(client: TestClient) -> None:
     assert loaded.status_code == 200
     assert loaded.json()["escalation_enabled"] is True
     assert loaded.json()["escalation_chat_id"] == "-1001"
+
+
+def test_v1_pm_project_and_agent_mcp_attachment(client: TestClient) -> None:
+    headers = v1_headers(client)
+    project = client.patch(
+        "/api/v1/pm/projects/customer-portal",
+        headers=headers,
+        json={"autonomy_level": "LEVEL_2", "config": {"owner": "delivery"}},
+    )
+    assert project.status_code == 200
+    assert project.json()["autonomy_level"] == "LEVEL_2"
+    detail = client.get(
+        "/api/v1/pm/projects/customer-portal",
+        headers=headers,
+    )
+    assert detail.status_code == 200
+    assert detail.json()["decisions"] == []
+    assert detail.json()["tasks"] == []
+
+    agent = client.post(
+        "/api/v1/agents",
+        headers=headers,
+        json={"name": "pm-mcp-test", "model": "existing-model", "provider": "openai"},
+    )
+    server = client.post(
+        "/api/v1/mcp/servers",
+        headers=headers,
+        json={
+            "name": "pm-test-tools",
+            "transport": "stdio",
+            "command": "safe-test-command",
+            "args": [],
+            "enabled": False,
+        },
+    )
+    assert agent.status_code == 201
+    assert server.status_code == 201
+    agent_id = str(agent.json()["id"])
+    server_id = str(server.json()["id"])
+    assert client.put(
+        f"/api/v1/agents/{agent_id}/mcp-servers/{server_id}",
+        headers=headers,
+    ).status_code == 204
+    attached = client.get(
+        f"/api/v1/agents/{agent_id}/mcp-servers",
+        headers=headers,
+    )
+    assert int(server_id) in attached.json()["server_ids"]
+    assert client.delete(
+        f"/api/v1/agents/{agent_id}/mcp-servers/{server_id}",
+        headers=headers,
+    ).status_code == 204
+    assert client.delete(f"/api/v1/mcp/servers/{server_id}", headers=headers).status_code == 204
+    assert client.delete(f"/api/v1/agents/{agent_id}", headers=headers).status_code == 204

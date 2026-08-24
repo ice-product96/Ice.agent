@@ -9,6 +9,7 @@ from app.employee import EmployeeService, save_once_job
 from app.job_result import build_followup_payload
 from app.work_items import (
     MAX_RETRIES,
+    after_agent_run,
     bind_work_item,
     handle_run_failure,
     notify_channels,
@@ -95,6 +96,44 @@ async def test_heartbeat_without_id_does_not_create_case(tmp_path: Path) -> None
         assert item is None
         leftover = await db.scalar(select(func.count()).select_from(WorkItem))
         assert leftover == 0
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pm_cursor_done_requires_explicit_qa_acceptance(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-integrity.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="Structured task",
+            goal="Do the work",
+            status="waiting_external",
+            pm_phase="QA",
+            task_type="technical",
+            requirements=["Implement the change"],
+            acceptance_criteria=["Tests pass"],
+        )
+        db.add(item)
+        await db.commit()
+        await after_agent_run(
+            db,
+            agent,
+            {"work_item_id": item.id, "_pm_mode": True},
+            "Cursor says done",
+            [
+                {
+                    "tool": "cursorremote_do",
+                    "status": "success",
+                    "result": {"done": True, "summary": "implemented"},
+                }
+            ],
+        )
+        assert item.pm_phase == "QA"
+        assert item.status == "in_progress"
+        assert item.next_action.startswith("Verify acceptance")
     await engine.dispose()
 
 

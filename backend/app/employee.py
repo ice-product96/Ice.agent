@@ -489,6 +489,8 @@ async def schedule_immediate_tick(
     work_item_id: int | None = None,
     manager_answer: str = "",
     consultation_id: int | None = None,
+    consultation_status: str = "",
+    approved_by: str = "",
     force: bool = True,
 ) -> CronJob:
     profile = await get_or_create_profile(db, agent_id)
@@ -503,6 +505,9 @@ async def schedule_immediate_tick(
     }
     prefix_parts: list[str] = []
     if consultation_id is not None:
+        payload["consultation_id"] = consultation_id
+        payload["consultation_status"] = consultation_status
+        payload["approved_by"] = approved_by
         prefix_parts.append(f"Консультация #{consultation_id} закрыта руководителем.")
     answer = (manager_answer or "").strip()
     if answer:
@@ -712,6 +717,8 @@ class EmployeeService:
                 work_item_id=item.work_item_id,
                 manager_answer=item.answer_text or "",
                 consultation_id=item.id,
+                consultation_status=item.status,
+                approved_by=item.answered_by or "",
                 force=True,
             )
         if self.events:

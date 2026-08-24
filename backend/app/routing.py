@@ -10,6 +10,7 @@ from .db import Agent, Consultation, ConversationState, MessageLog, RuntimeSetti
 from .employee import CONSULT_CMD_RE
 from .events import EventHub
 from .runtime import AgentRuntime, NO_TELEGRAM_REPLY
+from .schemas import NormalizedInboundEvent
 from .telegram import TelegramGateway, attachment_label, public_attachment
 from .work_items import find_open_for_chat
 
@@ -288,27 +289,32 @@ class TelegramEventRouter:
                     )
                 except Exception:
                     history = []
-            context = {
-                "source": "telegram",
-                "phone": phone,
-                "sender_id": payload.get("sender_id"),
-                "sender_username": payload.get("sender_username"),
-                "sender_is_bot": payload.get("sender_is_bot", False),
-                "chat_id": payload.get("chat_id"),
-                "topic_id": payload.get("topic_id"),
-                "thread_id": (
+            event = NormalizedInboundEvent(
+                channel="telegram",
+                conversation_id=chat_id,
+                message_id=message_id,
+                client_id=str(payload.get("sender_id") or chat_id),
+                project_id=payload.get("project_id"),
+                text=text,
+                attachments=[public_attachment(item) for item in attachments],
+                timestamp=payload.get("date"),
+                thread_id=(
                     str(payload["topic_id"])
                     if payload.get("topic_id") is not None
                     else ""
                 ),
-                "message_id": payload.get("message_id"),
-                "message_at": payload.get("date"),
-                "is_admin": is_admin,
-                "admin_command": is_admin_command,
-                "telegram_history": history,
-                "attachments": [public_attachment(item) for item in attachments],
-                "_attachments": attachments,
-            }
+                metadata={
+                    "phone": phone,
+                    "sender_username": payload.get("sender_username"),
+                    "sender_is_bot": payload.get("sender_is_bot", False),
+                    "topic_id": payload.get("topic_id"),
+                    "is_admin": is_admin,
+                    "admin_command": is_admin_command,
+                    "telegram_history": history,
+                },
+            )
+            context = event.runtime_context()
+            context["_attachments"] = attachments
             logger.info(
                 "telegram.routing agent=%s phone=%s chat=%s admin=%s text=%r",
                 agent.id,

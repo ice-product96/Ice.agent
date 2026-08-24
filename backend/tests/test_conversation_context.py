@@ -16,7 +16,7 @@ from app.db import (
     RuntimeSettings,
     TelegramAccount,
 )
-from app.schemas import RuntimeSettingsBody
+from app.schemas import NormalizedInboundEvent, RuntimeSettingsBody
 from app.telegram import normalized_message
 from conftest import DB_PATH
 
@@ -206,6 +206,26 @@ def test_telegram_history_normalization_and_timezone_validation() -> None:
     }
     with pytest.raises(ValueError):
         RuntimeSettingsBody(timezone="Not/A_Real_Zone")
+
+
+def test_normalized_inbound_event_builds_runtime_context() -> None:
+    event = NormalizedInboundEvent(
+        channel="telegram",
+        conversation_id="chat-1",
+        message_id="message-2",
+        client_id="client-3",
+        project_id="project-4",
+        text="Добавьте отмену заказа",
+        attachments=[{"kind": "image", "filename": "flow.png"}],
+        timestamp="2026-08-24T08:00:00Z",
+        metadata={"phone": "+10000000000"},
+    )
+    context = event.runtime_context()
+    assert context["source"] == "telegram"
+    assert context["chat_id"] == "chat-1"
+    assert context["message_id"] == "message-2"
+    assert context["client_id"] == "client-3"
+    assert context["project_id"] == "project-4"
 
 
 def test_conversation_list_and_detail_api(

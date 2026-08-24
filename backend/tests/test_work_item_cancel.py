@@ -62,6 +62,28 @@ async def test_abort_work_item_marks_done_and_aborted(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_abort_structured_pm_task_transitions_to_cancelled(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "abort-pm.db")
+    async with sessions() as db:
+        agent = Agent(name="pm-structured")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="in development",
+            status="waiting_external",
+            pm_phase="IN_DEVELOPMENT",
+        )
+        db.add(item)
+        await db.commit()
+        aborted = await abort_work_item(db, item, note="stop", scheduler=None)
+        assert aborted.status == "done"
+        assert aborted.pm_phase == "CANCELLED"
+        assert work_item_aborted(aborted)
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_counts_exclude_waiting_external_and_aborted(tmp_path: Path) -> None:
     engine, sessions = await sessions_for(tmp_path / "counts.db")
     async with sessions() as db:

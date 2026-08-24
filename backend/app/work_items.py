@@ -91,6 +91,16 @@ def work_item_json(item: WorkItem, *, events: list[WorkItemEvent] | None = None)
         "last_error": item.last_error,
         "consultation_id": item.consultation_id,
         "cron_job_id": item.cron_job_id,
+        "task_type": item.task_type,
+        "context": item.context_json or {},
+        "requirements": item.requirements or [],
+        "acceptance_criteria": item.acceptance_criteria or [],
+        "constraints": item.constraints or [],
+        "edge_cases": item.edge_cases or [],
+        "priority": item.priority,
+        "pm_phase": item.pm_phase,
+        "source_message_id": item.source_message_id,
+        "active_cursor_run_id": item.active_cursor_run_id,
         "created_at": item.created_at.isoformat() if item.created_at else None,
         "updated_at": item.updated_at.isoformat() if item.updated_at else None,
         "intake": intake_json(item),
@@ -538,6 +548,8 @@ def apply_origin(item: WorkItem, context: dict[str, Any]) -> None:
         item.project_id = str(context["project_id"])
     if context.get("customer_id"):
         item.customer_id = str(context["customer_id"])
+    if context.get("message_id") not in (None, "") and not item.source_message_id:
+        item.source_message_id = str(context["message_id"])
 
 
 def _context_from_item(context: dict[str, Any], item: WorkItem) -> None:
@@ -560,6 +572,7 @@ async def create_work_item(
     goal: str = "",
     context: dict[str, Any] | None = None,
     source: str = "telegram",
+    commit: bool = True,
 ) -> WorkItem:
     context = context or {}
     item = WorkItem(
@@ -576,8 +589,9 @@ async def create_work_item(
     db.add(item)
     await db.flush()
     await add_event(db, item, kind="created", title="Кейс создан", detail=item.goal)
-    await db.commit()
-    await db.refresh(item)
+    if commit:
+        await db.commit()
+        await db.refresh(item)
     return item
 
 
@@ -730,10 +744,22 @@ async def after_agent_run(
         detail = ""
         if isinstance(payload, dict):
             detail = str(payload.get("summary") or payload.get("reason") or payload.get("error") or "")[:800]
-            if tool in {"cursorremote_check", "cursorremote_do"}:
-                cursor_busy = not bool(payload.get("done"))
+            if tool in {
+                "cursorremote_check",
+                "cursorremote_do",
+                "submit_development_task",
+                "get_development_status",
+                "request_development_fix",
+            }:
+                terminal = str(payload.get("status") or "") in {
+                    "completed",
+                    "blocked",
+                    "failed",
+                    "cancelled",
+                }
+                cursor_busy = not bool(payload.get("done")) and not terminal
                 meta = dict(item.metadata_json or {})
-                meta["cursor_in_flight"] = not bool(payload.get("done"))
+                meta["cursor_in_flight"] = cursor_busy
                 item.metadata_json = meta
             if tool == "schedule_self" and payload.get("run_at"):
                 try:
@@ -789,6 +815,44 @@ async def after_agent_run(
                 await db.commit()
         return item
 
+    if context.get("_pm_mode") and item.pm_phase == "DONE":
+        if item.status != "done":
+            await set_status(
+                db,
+                item,
+                "done",
+                next_action="",
+                wait_owner="none",
+                event_title="Кейс принят после QA",
+                event_detail=_clip(result, 700),
+            )
+        return item
+
+    if context.get("_pm_mode") and item.pm_phase == "BLOCKED":
+        await set_status(
+            db,
+            item,
+            "failed",
+            next_action="Review Cursor error or request a development fix",
+            wait_owner="self",
+            error=item.last_error,
+            event_title="Development blocked",
+            event_detail=_clip(result, 700),
+        )
+        return item
+
+    if context.get("_pm_mode") and item.pm_phase == "QA":
+        await set_status(
+            db,
+            item,
+            "in_progress",
+            next_action="Verify acceptance criteria and explicitly accept QA",
+            wait_owner="self",
+            event_title="QA required",
+            event_detail=_clip(result, 700),
+        )
+        return item
+
     if cursor_busy:
         await set_status(
             db,
@@ -806,7 +870,13 @@ async def after_agent_run(
     intake = meta.get("intake") if isinstance(meta.get("intake"), dict) else {}
     cursor_called = any(
         isinstance(call, dict)
-        and str(call.get("tool") or "") in {"cursorremote_check", "cursorremote_do"}
+        and str(call.get("tool") or "") in {
+            "cursorremote_check",
+            "cursorremote_do",
+            "submit_development_task",
+            "get_development_status",
+            "request_development_fix",
+        }
         for call in audit
     )
     if (
@@ -831,6 +901,17 @@ async def after_agent_run(
         meta = dict(item.metadata_json or {})
         meta["cursor_in_flight"] = False
         item.metadata_json = meta
+        if context.get("_pm_mode") and item.pm_phase != "DONE":
+            await set_status(
+                db,
+                item,
+                "in_progress",
+                next_action="Verify acceptance criteria and explicitly accept QA",
+                wait_owner="self",
+                event_title="Development complete; QA required",
+                event_detail=_clip(result, 700),
+            )
+            return item
         await set_status(
             db,
             item,
@@ -1119,6 +1200,28 @@ async def abort_work_item(
     note: str = "",
     scheduler: Any | None = None,
 ) -> WorkItem:
+    if item.pm_phase not in {"DISCUSSION", "DONE", "CANCELLED"}:
+        from .db import CursorRun
+        from .pm_state import can_transition, transition_pm_phase
+
+        active_run = (
+            await db.get(CursorRun, item.active_cursor_run_id)
+            if item.active_cursor_run_id
+            else None
+        )
+        if active_run is not None and active_run.status in {"pending", "running"}:
+            raise ValueError(
+                "Cannot abort while Cursor is active without confirmed remote termination"
+            )
+        if can_transition(item.pm_phase, "CANCELLED"):
+            await transition_pm_phase(
+                db,
+                item,
+                "CANCELLED",
+                detail=note or "Task cancelled",
+            )
+        if item.active_cursor_run_id:
+            item.active_cursor_run_id = None
     await cancel_work_item_schedules(db, item, scheduler)
     return await set_status(
         db,
@@ -1139,6 +1242,8 @@ async def close_work_item(
     status: str = "done",
     scheduler: Any | None = None,
 ) -> WorkItem:
+    if item.pm_phase not in {"DISCUSSION", "DONE"}:
+        raise ValueError("Structured PM task must pass QA acceptance before closure")
     if status not in {"done", "failed"}:
         status = "done"
     await cancel_work_item_schedules(db, item, scheduler, mark_aborted=False)
@@ -1208,6 +1313,10 @@ async def sync_cursor_work_items(
     updated: list[int] = []
     seen: set[int] = set()
     for item in items:
+        # Structured PM runs are polled by get_development_status so one global
+        # Cursor status can never be applied to several work items.
+        if item.active_cursor_run_id is not None:
+            continue
         if item.id in seen or not needs_cursor_poll(item):
             continue
         seen.add(item.id)
