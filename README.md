@@ -124,7 +124,7 @@ Playwright MCP поднимается вместе со стеком. Если �
 У агента:
 
 1. Включите инструмент **MCP**.
-2. **Явно приаттачьте** сервер `cursorremote` к агенту (`PUT /api/agents/{id}/mcp-servers/{server_id}` или UI attach). Без attach агент **не** получит CursorRemote даже если у него включён MCP (в отличие от Playwright).
+2. **В карточке агента** отметьте сервер `cursorremote` в блоке «MCP-серверы». Без этой отметки агент **не** получит CursorRemote даже если у него включён инструмент MCP (в отличие от Playwright).
 3. В `tool_permissions` можно добавить флаг `cursorremote` (выдаёт mutating-права); при attach это делается автоматически.
 4. В autonomy mutating-вызовы (`send_prompt`, `approve`, `click_action`, `new_chat`, `switch_window`) требуют `request_approval`.
 

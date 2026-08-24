@@ -1,4 +1,4 @@
-import { Dispatch, FormEvent, ReactNode, SetStateAction, useCallback, useEffect, useMemo, useState } from 'react'
+import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Activity, Bot, BrainCircuit, Briefcase, CalendarClock, CheckCircle2, ChevronRight, CircleAlert,
   Clock3, Database, FileText, Globe2, KeyRound, LayoutDashboard, Link2, LoaderCircle, LogOut, Menu,
@@ -45,7 +45,7 @@ const title: Record<Page, [string, string]> = {
   calls: ['Звонки', 'Активные и завершённые SIP-звонки через OpenAI Realtime'],
   conversations: ['Диалоги', 'Просмотр контекста агентов и транскриптов'],
   memory: ['Память', 'Просмотр и управление сохранённым контекстом агентов'],
-  mcp: ['MCP-серверы', 'Подключение агентов к внешним инструментам и ресурсам'],
+  mcp: ['MCP-серверы', 'URL и доступ к внешним инструментам. Кому они доступны — в карточке агента'],
   cron: ['Расписания', 'Запуск промптов агентов по расписанию'],
   settings: ['Настройки администратора', 'Контроль доступа и маршрутизация эскалации'],
   runtime: ['Настройки runtime', 'Поиск, память, набор текста и поведение воркеров'],
@@ -348,10 +348,11 @@ function AgentsScreen() {
   const profiles = useLoad(api.llmProfiles.list, [])
   const telegram = useLoad(api.telegram.list, [])
   const sip = useLoad(api.sip.list, [])
+  const mcp = useLoad(api.mcp.list, [])
   const [editing, setEditing] = useState<Partial<Agent> | null>(null)
   const [deleting, setDeleting] = useState<Agent | null>(null)
   const [clearing, setClearing] = useState<Agent | null>(null)
-  if (loading || profiles.loading || telegram.loading || sip.loading) return <Loading/>
+  if (loading || profiles.loading || telegram.loading || sip.loading || mcp.loading) return <Loading/>
   const profileName = (id?: string) => profiles.data?.find(p => String(p.id) === String(id))?.name || (id ? 'Неизвестный профиль LLM' : 'Без профиля LLM')
   const telegramName = (id?: string) => telegram.data?.find(a => String(a.id) === String(id))?.name || (id ? 'Неизвестный аккаунт Telegram' : 'Без аккаунта Telegram')
   const sipName = (id?: string) => sip.data?.find(a => String(a.id) === String(id))?.name || (id ? 'Неизвестный SIP' : 'Без SIP')
@@ -367,10 +368,12 @@ function AgentsScreen() {
         <div className="entity-meta"><span><Link2 size={14}/>{agent.links.length} связей</span><span>{agent.typing_enabled ? 'Индикатор набора вкл.' : 'Индикатор набора выкл.'}</span></div>
         <div className="card-actions"><button className="secondary" onClick={() => setEditing(agent)}>Настроить</button><button className="secondary" onClick={() => setClearing(agent)}>Удалить всё</button><button className="icon-button danger-ghost" onClick={() => setDeleting(agent)}><Trash2 size={17}/></button></div>
       </article>)}</div>}
-    {editing && <AgentForm value={editing} agents={data} profiles={profiles.data || []} telegram={telegram.data || []} sip={sip.data || []} onClose={() => setEditing(null)} onSave={async value => {
-      if (value.id) { const saved = await api.agents.update(value.id, value); setData(data.map(a => a.id === saved.id ? saved : a)) }
-      else { const saved = await api.agents.create(value as Omit<Agent, 'id'>); setData([...data, saved]) }
-      setEditing(null)
+    {editing && <AgentForm value={editing} agents={data} profiles={profiles.data || []} telegram={telegram.data || []} sip={sip.data || []} mcpServers={mcp.data || []} onClose={() => setEditing(null)} onSave={async value => {
+      const saved = value.id
+        ? await api.agents.update(value.id, value)
+        : await api.agents.create(value as Omit<Agent, 'id'>)
+      setData(value.id ? data.map(a => a.id === saved.id ? saved : a) : [...data, saved])
+      return saved
     }}/>}
     {deleting && <ConfirmDelete name={deleting.name} onClose={() => setDeleting(null)} onDelete={async () => { await api.agents.remove(deleting.id); setData(data.filter(a => a.id !== deleting.id)) }}/>}
     {clearing && <ConfirmClearJournals agentId={clearing.id} agentName={clearing.name} onClose={() => setClearing(null)} onCleared={() => undefined}/>}
@@ -378,14 +381,21 @@ function AgentsScreen() {
   </>
 }
 
-function AgentForm({ value, agents, profiles, telegram, sip, onClose, onSave }: {
-  value: Partial<Agent>; agents: Agent[]; profiles: LlmProfile[]; telegram: TelegramAccount[]; sip: SipAccount[];
-  onClose: () => void; onSave: (v: Partial<Agent>) => Promise<void>
+function AgentForm({ value, agents, profiles, telegram, sip, mcpServers, onClose, onSave }: {
+  value: Partial<Agent>; agents: Agent[]; profiles: LlmProfile[]; telegram: TelegramAccount[]; sip: SipAccount[]; mcpServers: McpServer[];
+  onClose: () => void; onSave: (v: Partial<Agent>) => Promise<Agent>
 }) {
   const [form, setForm] = useState(value)
+  const [mcpIds, setMcpIds] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [clearing, setClearing] = useState(false)
+  useEffect(() => {
+    if (!value.id) { setMcpIds([]); return }
+    void api.agents.mcpServers(String(value.id)).then(result => {
+      setMcpIds(result.server_ids.map(String))
+    }).catch(() => setMcpIds([]))
+  }, [value.id])
   const toolOptions = ['web_search', 'memory', 'code_execution', 'telegram', 'sip', 'filesystem', 'mcp', 'employee']
   const permissionOptions = [
     ['telegram_delete_dialog', 'Удалять диалоги Telegram'],
@@ -401,9 +411,22 @@ function AgentForm({ value, agents, profiles, telegram, sip, onClose, onSave }: 
   const modelPresets = agentModelPresets(provider)
   const modelPresetIds = modelPresets.map(item => item.id)
   const modelSelectValue = modelPresetIds.includes(form.model || '') ? form.model! : '__custom__'
+  async function syncMcpServers(agentId: string) {
+    const current = await api.agents.mcpServers(agentId)
+    const previous = new Set(current.server_ids.map(String))
+    const next = new Set(mcpIds)
+    await Promise.all([
+      ...[...next].filter(id => !previous.has(id)).map(id => api.agents.attachMcpServer(agentId, id)),
+      ...[...previous].filter(id => !next.has(id)).map(id => api.agents.detachMcpServer(agentId, id)),
+    ])
+  }
   async function submit(e: FormEvent) {
     e.preventDefault(); setBusy(true); setError('')
-    try { await onSave(form) } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить агента'); setBusy(false) }
+    try {
+      const saved = await onSave(form)
+      await syncMcpServers(String(saved.id))
+      onClose()
+    } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось сохранить агента'); setBusy(false) }
   }
   return <Modal title={form.id ? 'Настройка агента' : 'Создание агента'} subtitle="Задайте личность, runtime и взаимодействие." onClose={onClose}>
     <form onSubmit={submit}>
@@ -445,6 +468,14 @@ function AgentForm({ value, agents, profiles, telegram, sip, onClose, onSave }: 
         <Field label="Приветствие на входящем" hint="Агент говорит первым после ответа. Пусто — «Ало! Чем могу помочь?»." wide><textarea rows={3} value={form.inbound_greeting || ''} onChange={e => patch({ inbound_greeting: e.target.value })} placeholder="Ало! Меня зовут … Чем могу помочь?"/></Field>
         <Field label="Системный промпт" wide><textarea required rows={7} value={form.prompt || ''} onChange={e => patch({ prompt: e.target.value })} placeholder="Вы полезный агент…"/></Field>
         <Field label="Инструменты" wide><div className="check-grid">{toolOptions.map(tool => <label className="check" key={tool}><input type="checkbox" checked={(form.tools || []).includes(tool)} onChange={() => patch({ tools: (form.tools || []).includes(tool) ? form.tools!.filter(t => t !== tool) : [...(form.tools || []), tool] })}/><span>{toolDisplayName(tool)}</span></label>)}</div></Field>
+        <Field label="MCP-серверы" hint="CursorRemote нужно отметить явно — иначе агент не сможет ставить задачи в Cursor. Остальные серверы подхватываются сами, если включён инструмент MCP." wide>
+          {mcpServers.length === 0 ? <small>Сначала добавьте сервер на странице MCP.</small> :
+          <div className="check-grid">{mcpServers.map(server => {
+            const id = String(server.id)
+            const cursor = server.name.toLowerCase() === 'cursorremote'
+            return <label className="check" key={server.id}><input type="checkbox" checked={mcpIds.includes(id)} onChange={() => setMcpIds(current => current.includes(id) ? current.filter(item => item !== id) : [...current, id])}/><span>{server.name}{cursor ? ' · IDE' : ''}</span></label>
+          })}</div>}
+        </Field>
         <Field label="Опасные действия" hint="Отправка сообщений и вступление в каналы уже входят в инструмент Telegram. Здесь — только необратимые операции." wide><div className="check-grid">{permissionOptions.map(([permission, label]) => <label className="check" key={permission}><input type="checkbox" checked={(form.tool_permissions || []).includes(permission)} onChange={() => patch({ tool_permissions: (form.tool_permissions || []).includes(permission) ? form.tool_permissions!.filter(item => item !== permission) : [...(form.tool_permissions || []), permission] })}/><span>{label}</span></label>)}</div></Field>
         <Field label="Связи с агентами" hint="Разрешить делегирование работы" wide><div className="check-grid">{agents.filter(a => String(a.id) !== String(form.id)).map(a => <label className="check" key={a.id}><input type="checkbox" checked={linked(a.id)} onChange={() => patch({ links: linked(a.id) ? (form.links || []).filter(link => linkTarget(link) !== String(a.id)) : [...(form.links || []), a.id] })}/><span>{a.name}</span></label>)}</div></Field>
         <div className="toggle-box"><Toggle label="Показывать индикатор набора" checked={form.typing_enabled ?? true} onChange={v => patch({ typing_enabled: v })}/></div>
@@ -1648,7 +1679,6 @@ function McpScreen() {
   const agentsLoaded = useLoad(api.agents.list, [])
   const [attached, setAttached] = useState<Record<string, string[]>>({})
   const [editing, setEditing] = useState<Partial<McpServer> | null>(null); const [deleting, setDeleting] = useState<McpServer | null>(null)
-  const [attaching, setAttaching] = useState<McpServer | null>(null)
   useEffect(() => {
     const agents = agentsLoaded.data || []
     if (!agents.length) return
@@ -1659,12 +1689,12 @@ function McpScreen() {
   }, [agentsLoaded.data])
   if (loaded.loading) return <Loading/>
   return <>
-    {loaded.error && <Alert message={loaded.error}/>}<SectionHead title={`${data.length} серверов инструментов`} text="Подключения Model Context Protocol" action={<button className="primary" onClick={() => setEditing(emptyMcp)}><Plus size={17}/>Добавить сервер</button>}/>
+    {loaded.error && <Alert message={loaded.error}/>}<SectionHead title={`${data.length} серверов инструментов`} text="URL, токен и транспорт. Кому сервер доступен — в карточке агента." action={<button className="primary" onClick={() => setEditing(emptyMcp)}><Plus size={17}/>Добавить сервер</button>}/>
     {data.length === 0 ? <Empty icon={ServerCog} title="Нет MCP-серверов" text="Подключите удалённый SSE/HTTP-сервер или локальный stdio-процесс."/> :
     <div className="list-panel">{data.map(server => {
       const serverId = String(server.id)
       const agentNames = (agentsLoaded.data || []).filter(agent => (attached[String(agent.id)] || []).includes(serverId)).map(agent => agent.name)
-      return <div className="server-row" key={server.id}><span className="entity-avatar"><ServerCog/></span><div className="grow"><strong>{server.name}</strong><small>{server.transport === 'stdio' ? server.command : server.url}{server.connection_error ? ` · ${server.connection_error}` : ''}{` · агенты: ${agentNames.join(', ') || 'не привязан'}`}</small></div><span className="chip">{server.transport}</span><StatusDot status={server.connection_status === 'connected' ? 'online' : server.connection_status === 'error' ? 'error' : server.enabled ? 'pending' : 'paused'}/><button className="secondary compact" onClick={() => setAttaching(server)}>Агенты</button><button className="secondary compact" onClick={() => setEditing(server)}>Изменить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(server)}><Trash2 size={17}/></button></div>
+      return <div className="server-row" key={server.id}><span className="entity-avatar"><ServerCog/></span><div className="grow"><strong>{server.name}</strong><small>{server.transport === 'stdio' ? server.command : server.url}{server.connection_error ? ` · ${server.connection_error}` : ''}{` · агенты: ${agentNames.join(', ') || 'назначаются в карточке агента'}`}</small></div><span className="chip">{server.transport}</span><StatusDot status={server.connection_status === 'connected' ? 'online' : server.connection_status === 'error' ? 'error' : server.enabled ? 'pending' : 'paused'}/><button className="secondary compact" onClick={() => setEditing(server)}>Изменить</button><button className="icon-button danger-ghost" onClick={() => setDeleting(server)}><Trash2 size={17}/></button></div>
     })}</div>}
     {editing && <McpForm value={editing} onClose={() => setEditing(null)} onSave={async v => {
       const payload = {
@@ -1679,40 +1709,8 @@ function McpScreen() {
       const saved = v.id ? await api.mcp.update(v.id, payload) : await api.mcp.create(payload as Omit<McpServer, 'id'>)
       loaded.setData(v.id ? data.map(s => s.id === saved.id ? saved : s) : [...data, saved]); setEditing(null)
     }}/>}
-    {attaching && <McpAttachForm server={attaching} agents={agentsLoaded.data || []} attached={attached} setAttached={setAttached} onClose={() => setAttaching(null)}/>}
     {deleting && <ConfirmDelete name={deleting.name} onClose={() => setDeleting(null)} onDelete={async () => { await api.mcp.remove(deleting.id); loaded.setData(data.filter(s => s.id !== deleting.id)) }}/>}
   </>
-}
-function McpAttachForm({ server, agents, attached, setAttached, onClose }: { server: McpServer; agents: Agent[]; attached: Record<string, string[]>; setAttached: Dispatch<SetStateAction<Record<string, string[]>>>; onClose: () => void }) {
-  const [busy, setBusy] = useState('')
-  const [error, setError] = useState('')
-  async function toggle(agent: Agent, enabled: boolean) {
-    const agentId = String(agent.id)
-    const serverId = String(server.id)
-    setBusy(agentId); setError('')
-    try {
-      if (enabled) await api.agents.attachMcpServer(agentId, serverId)
-      else await api.agents.detachMcpServer(agentId, serverId)
-      setAttached(current => ({
-        ...current,
-        [agentId]: enabled
-          ? Array.from(new Set([...(current[agentId] || []), serverId]))
-          : (current[agentId] || []).filter(id => id !== serverId),
-      }))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Не удалось изменить привязку')
-    } finally {
-      setBusy('')
-    }
-  }
-  return <Modal title={`Агенты · ${server.name}`} subtitle="CursorRemote должен быть явно привязан к PM-агенту." onClose={onClose}>
-    {error && <Alert message={error}/>}
-    <div className="list-panel">{agents.map(agent => {
-      const agentId = String(agent.id); const serverId = String(server.id); const enabled = (attached[agentId] || []).includes(serverId)
-      return <div className="server-row" key={agent.id}><div className="grow"><strong>{agent.name}</strong><small>{agent.description || 'Без описания'}</small></div><Toggle label={enabled ? 'Подключён' : 'Не подключён'} checked={enabled} onChange={value => void toggle(agent, value)}/>{busy === agentId && <LoaderCircle className="spin" size={17}/>}</div>
-    })}</div>
-    <div className="modal-actions"><button className="primary" onClick={onClose}>Готово</button></div>
-  </Modal>
 }
 function McpForm({ value, onClose, onSave }: { value: Partial<McpServer>; onClose: () => void; onSave: (v: Partial<McpServer>) => Promise<void> }) {
   const [form, setForm] = useState<Partial<McpServer>>({ ...value, env: {} }); const [error, setError] = useState(''); const [busy, setBusy] = useState(false)
