@@ -205,6 +205,47 @@ def requires_approval(level: str | int, action: str) -> bool:
     return not autonomy_gate(level, action)
 
 
+MANAGER_CONFIRMERS = ("manager", "owner", "admin", "руководитель", "владелец")
+
+
+def is_client_confirmer(
+    confirmed_by: str,
+    *,
+    source_message_id: str | None = None,
+) -> bool:
+    """True when a stored decision came from the customer, not the human manager."""
+    value = (confirmed_by or "").strip().lower()
+    if any(marker in value for marker in MANAGER_CONFIRMERS):
+        return False
+    if value:
+        return True
+    return bool(str(source_message_id or "").strip())
+
+
+def development_is_client_confirmed(
+    item: WorkItem,
+    *,
+    has_client_decision: bool = False,
+) -> bool:
+    if item.pm_phase in {"CLIENT_CONFIRMED", "READY_FOR_DEV", "CHANGES_REQUESTED"}:
+        return True
+    return has_client_decision
+
+
+async def item_has_client_confirmation(db: AsyncSession, item: WorkItem) -> bool:
+    if development_is_client_confirmed(item, has_client_decision=False):
+        return True
+    rows = list(
+        await db.scalars(
+            select(DecisionRecord).where(DecisionRecord.work_item_id == item.id)
+        )
+    )
+    return any(
+        is_client_confirmer(row.confirmed_by, source_message_id=row.source_message_id)
+        for row in rows
+    )
+
+
 def submission_requires_approval(
     level: str | int,
     *,

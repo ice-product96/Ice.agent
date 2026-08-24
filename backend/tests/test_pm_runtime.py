@@ -166,6 +166,103 @@ async def test_pm_registry_hides_raw_cursor_and_blocks_incomplete_task(
 
 
 @pytest.mark.asyncio
+async def test_customer_decision_unlocks_development_without_manager(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def fake_send(*args, **kwargs):
+        return {"done": False, "prompt_sent": True, "status": "working"}
+
+    monkeypatch.setattr("app.cursorremote_drive.send_prompt_and_drive", fake_send)
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'pm-customer-confirm.db').as_posix()}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    mcp = McpManager()
+    mcp.sessions = {"cursorremote": FakeCursorSession()}
+    runtime = AgentRuntime(
+        Settings(mem0_enabled=False),
+        SimpleNamespace(),
+        FakeSearch(),
+        FakeEvents(),
+        mcp=mcp,
+    )
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="Carousel",
+            goal="Fix carousel",
+            project_id="lavve",
+            task_type="feature",
+            requirements=["Carousel scrolls"],
+            acceptance_criteria=["Slides change on swipe"],
+            pm_phase="DISCUSSION",
+        )
+        db.add(item)
+        await db.commit()
+        runtime_context = {
+            "_pm_mode": True,
+            "work_item_id": item.id,
+            "source": "telegram",
+            "chat_id": "customer-1",
+            "client_id": "customer-1",
+            "message_id": "m-1",
+        }
+        registry = await runtime.registry(
+            agent,
+            mcp_server_names={"cursorremote"},
+            memory_enabled=False,
+            db=db,
+            context=runtime_context,
+        )
+        stored = await registry.call(
+            "pm_structure_task",
+            {
+                "project_id": "lavve",
+                "task_type": "feature",
+                "title": "Fix carousel",
+                "requirements": ["Carousel scrolls"],
+                "acceptance_criteria": ["Slides change on swipe"],
+            },
+        )
+        assert stored["task"]["pm_phase"] == "REQUIREMENTS_READY"
+        runtime_context["source"] = "scheduled"
+        runtime_context.pop("message_id", None)
+        runtime_context.pop("client_id", None)
+        with pytest.raises(PermissionError, match="customer confirmation"):
+            await registry.call("submit_development_task", {})
+        with pytest.raises(PermissionError, match="customer's confirmation"):
+            await registry.call(
+                "pm_transition_task",
+                {"to_phase": "CLIENT_CONFIRMED", "detail": "tick"},
+            )
+        runtime_context["source"] = "telegram"
+        runtime_context["client_id"] = "customer-1"
+        runtime_context["message_id"] = "m-confirm"
+        recorded = await registry.call(
+            "pm_record_decision",
+            {
+                "project_id": "lavve",
+                "topic": "Start development",
+                "decision": "Customer asked to ship the carousel fix",
+                "confirmed_by": "заказчик",
+            },
+        )
+        assert recorded["task"]["pm_phase"] == "CLIENT_CONFIRMED"
+        runtime_context["source"] = "scheduled"
+        submitted = await registry.call("submit_development_task", {})
+        assert submitted["status"] in {"in_progress", "running"} or submitted.get("done") is False
+        await db.refresh(item)
+        assert item.pm_phase == "IN_DEVELOPMENT"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_structured_cursor_result_requires_and_then_passes_qa(
     tmp_path: Path,
     monkeypatch,

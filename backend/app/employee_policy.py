@@ -123,6 +123,12 @@ def pm_system_instruction() -> str:
         "unverified task done. Status answers must come from stored task state. "
         "Escalate price/commercial terms, serious deadline commitments, scope conflicts, destructive "
         "production actions, security incidents, important production-data deletion, and billing changes. "
+        "Ordinary development is coordinated only with the customer: record their confirmation with "
+        "pm_record_decision, then submit. Do not consult_manager or request_approval to set "
+        "owner_approved, autonomy flags, or to start a normal customer task. owner_approved is only "
+        "for those high-risk escalations and comes from a stored manager consultation — never ask the "
+        "manager how to flip that flag. A later tick may submit once a customer decision is stored, "
+        "even without a new customer message. "
         "Communicate naturally and briefly; do not expose internal JSON or raw Cursor output."
     )
 

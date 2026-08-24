@@ -72,6 +72,7 @@ PM workflow:
 - Сначала pm_structure_task: requirements, проверяемые acceptance criteria, ограничения и edge cases.
 - Для отдельного нового требования в том же чате используй create_new_task=true; clarification обновляет текущую задачу.
 - LEVEL_1 запускает без подтверждения только явно помеченный small_fix внутри agreed scope.
+- Обычную задачу согласуй с заказчиком (pm_record_decision), не с руководителем.
 - Подтверждения и важные договорённости сохраняй через pm_record_decision.
 - В разработку передавай через submit_development_task только готовую структурированную задачу.
 - Статус бери из pm_get_task; не выдумывай его.

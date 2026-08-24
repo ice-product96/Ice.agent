@@ -731,7 +731,9 @@ class AgentRuntime:
                 apply_task_contract,
                 can_transition,
                 get_or_create_project_state,
+                is_client_confirmer,
                 is_task_ready,
+                item_has_client_confirmation,
                 readiness_issues,
                 record_decision,
                 record_scope_change,
@@ -1037,8 +1039,27 @@ class AgentRuntime:
                         detail=decision,
                         payload={"decision_id": row.id},
                     )
+                if (
+                    is_client_confirmer(
+                        confirmed_by,
+                        source_message_id=row.source_message_id,
+                    )
+                    and target_item.pm_phase == "REQUIREMENTS_READY"
+                    and is_task_ready(target_item)
+                ):
+                    await transition_pm_phase(
+                        db,
+                        target_item,
+                        "CLIENT_CONFIRMED",
+                        detail=decision or topic,
+                        payload={
+                            "confirmed_by": confirmed_by or "customer",
+                            "source_message_id": row.source_message_id,
+                            "decision_id": row.id,
+                        },
+                    )
                 await db.commit()
-                return {"ok": True, "decision_id": row.id}
+                return {"ok": True, "decision_id": row.id, "task": work_item_json(target_item)}
 
             async def pm_transition_task(
                 to_phase: str,
@@ -1071,18 +1092,22 @@ class AgentRuntime:
                         or (context or {}).get("sender_id")
                         or ""
                     )
-                    if (
-                        source in internal_sources
-                        or (context or {}).get("is_admin")
-                        or not message_id
-                        or not client_id
-                    ):
+                    live_client_message = (
+                        source not in internal_sources
+                        and not (context or {}).get("is_admin")
+                        and bool(message_id)
+                        and bool(client_id)
+                    )
+                    stored_client = await item_has_client_confirmation(db, item)
+                    if not live_client_message and not stored_client:
                         raise PermissionError(
-                            "CLIENT_CONFIRMED requires an identifiable current client message"
+                            "CLIENT_CONFIRMED requires the customer's confirmation "
+                            "(current client message or a stored pm_record_decision). "
+                            "Do not ask the manager to confirm ordinary development."
                         )
                     transition_payload = {
-                        "confirmed_by": client_id,
-                        "source_message_id": message_id,
+                        "confirmed_by": client_id or "customer",
+                        "source_message_id": message_id or None,
                     }
                 if to_phase in {"REQUIREMENTS_READY", "CLIENT_CONFIRMED", "READY_FOR_DEV"}:
                     issues = readiness_issues(item)
@@ -1270,6 +1295,7 @@ class AgentRuntime:
                         get_or_create_cursor_run,
                         get_or_create_project_state,
                         is_task_ready,
+                        item_has_client_confirmation,
                         render_task_brief,
                         submission_requires_approval,
                         transition_pm_phase,
@@ -1379,11 +1405,7 @@ class AgentRuntime:
                         project = await get_or_create_project_state(
                             db, item.project_id or f"agent-{agent.id}"
                         )
-                        confirmed = item.pm_phase in {
-                            "CLIENT_CONFIRMED",
-                            "READY_FOR_DEV",
-                            "CHANGES_REQUESTED",
-                        }
+                        confirmed = await item_has_client_confirmation(db, item)
                         inside_scope = bool(
                             (item.context_json or {}).get(
                                 "inside_agreed_scope",
@@ -1408,7 +1430,9 @@ class AgentRuntime:
                             high_risk=False,
                         ) and not confirmed:
                             raise PermissionError(
-                                "Project autonomy requires client confirmation before development"
+                                "Project autonomy requires customer confirmation before development. "
+                                "Record it with pm_record_decision, then retry. "
+                                "Do not consult the manager for ordinary development."
                             )
                         if item.pm_phase in {"REQUIREMENTS_READY", "CLIENT_CONFIRMED", "CHANGES_REQUESTED"}:
                             await transition_pm_phase(

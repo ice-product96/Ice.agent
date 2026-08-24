@@ -9,9 +9,12 @@ from app.db import Agent, Base, CursorRun, DecisionRecord, WorkItem, WorkItemEve
 from app.pm_state import (
     InvalidPhaseTransition,
     autonomy_gate,
+    development_is_client_confirmed,
     get_or_create_cursor_run,
     get_or_create_project_state,
+    is_client_confirmer,
     is_task_ready,
+    item_has_client_confirmation,
     parse_cursor_result,
     readiness_issues,
     record_decision,
@@ -125,6 +128,48 @@ def test_project_autonomy_submission_rules() -> None:
         small_fix=False,
     )
     assert submission_requires_approval("LEVEL_3", high_risk=True, **common)
+
+
+def test_client_confirmation_is_not_manager_approval() -> None:
+    assert is_client_confirmer("заказчик")
+    assert is_client_confirmer("7868511513")
+    assert is_client_confirmer("", source_message_id="tg-88")
+    assert not is_client_confirmer("")
+    assert not is_client_confirmer("manager")
+    assert not is_client_confirmer("руководитель")
+    item = WorkItem(agent_id=1, title="x", pm_phase="REQUIREMENTS_READY")
+    assert not development_is_client_confirmed(item)
+    assert development_is_client_confirmed(item, has_client_decision=True)
+    item.pm_phase = "CLIENT_CONFIRMED"
+    assert development_is_client_confirmed(item)
+
+
+@pytest.mark.asyncio
+async def test_stored_customer_decision_counts_as_confirmation(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "client-confirm.db")
+    async with sessions() as db:
+        item = await make_item(
+            db,
+            project_id="lavve",
+            task_type="feature",
+            pm_phase="REQUIREMENTS_READY",
+            goal="Fix carousel",
+            requirements=["Carousel scrolls"],
+            acceptance_criteria=["Slides change on swipe"],
+        )
+        assert not await item_has_client_confirmation(db, item)
+        await record_decision(
+            db,
+            project_id="lavve",
+            topic="Start the carousel fix",
+            decision="Customer asked to ship it",
+            confirmed_by="заказчик",
+            source_message_id="m-1",
+            work_item_id=item.id,
+        )
+        await db.commit()
+        assert await item_has_client_confirmation(db, item)
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

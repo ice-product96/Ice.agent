@@ -93,3 +93,5 @@ def test_pm_mode_is_opt_in_and_has_structured_guards() -> None:
     assert "acceptance criteria" in text
     assert "never send raw customer text" in text.lower()
     assert "done=true" in text
+    assert "do not consult_manager" in text.lower()
+    assert "ordinary development is coordinated only with the customer" in text.lower()
