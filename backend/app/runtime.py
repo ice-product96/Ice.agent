@@ -1,7 +1,7 @@
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -761,6 +761,7 @@ class AgentRuntime:
                 related_tasks: list[str] | None = None,
                 priority: str = "normal",
                 create_new_task: bool = False,
+                estimated_duration_minutes: int = 0,
             ) -> dict[str, Any]:
                 """Create or update the current deterministic PM task. Never call for an idea."""
                 source_message_id = str((context or {}).get("message_id") or "") or None
@@ -955,7 +956,30 @@ class AgentRuntime:
                         "task": work_item_json(item),
                     }
                 apply_task_contract(item, contract)
-                await get_or_create_project_state(db, project_id)
+                project_state = await get_or_create_project_state(db, contract.project_id)
+                from .employee import get_or_create_profile
+                from .project_schedule import apply_task_estimate, project_commerce_settings
+
+                profile = await get_or_create_profile(db, agent.id)
+                commerce_settings = project_commerce_settings(
+                    project_state, profile=profile
+                )
+                estimate_minutes = estimated_duration_minutes
+                if not estimate_minutes:
+                    estimate_minutes = int(
+                        (normalized_task_context or {}).get("estimated_duration_minutes")
+                        or 0
+                    )
+                if estimate_minutes:
+                    apply_task_estimate(
+                        item,
+                        estimated_duration_minutes=estimate_minutes,
+                        hourly_rate=float(commerce_settings["hourly_rate"] or 0),
+                        min_execution_ratio=float(
+                            commerce_settings["min_execution_ratio"] or 1
+                        ),
+                        currency=str(commerce_settings["currency"]),
+                    )
                 await add_event(
                     db,
                     item,
@@ -1104,6 +1128,21 @@ class AgentRuntime:
                             "decision_id": row.id,
                         },
                     )
+                from .project_schedule import mark_cost_approved, topic_is_cost_approval
+
+                if topic_is_cost_approval(topic, decision) and is_client_confirmer(
+                    confirmed_by,
+                    source_message_id=row.source_message_id,
+                ):
+                    mark_cost_approved(target_item, decision_id=row.id)
+                    await add_event(
+                        db,
+                        target_item,
+                        kind="cost",
+                        title="Стоимость согласована",
+                        detail=decision or topic,
+                        payload={"decision_id": row.id},
+                    )
                 await db.commit()
                 return {"ok": True, "decision_id": row.id, "task": work_item_json(target_item)}
 
@@ -1227,6 +1266,13 @@ class AgentRuntime:
                                 "clarification of the current task."
                             ),
                         },
+                        "estimated_duration_minutes": {
+                            "type": "integer",
+                            "description": (
+                                "Estimated development minutes; drives cost and minimum "
+                                "Cursor execution time"
+                            ),
+                        },
                     },
                     "required": [
                         "project_id",
@@ -1236,6 +1282,66 @@ class AgentRuntime:
                         "acceptance_criteria",
                     ],
                 },
+            )
+
+            async def pm_estimate_task(
+                estimated_duration_minutes: int,
+                work_item_id: int = 0,
+                note: str = "",
+            ) -> dict[str, Any]:
+                """Set duration estimate and derived cost from the project hourly rate."""
+                item = await get_work_item(
+                    db, work_item_id or (context or {}).get("work_item_id")
+                )
+                if item is None or item.agent_id != agent.id:
+                    raise ValueError("PM task not found")
+                if estimated_duration_minutes <= 0:
+                    raise ValueError("estimated_duration_minutes must be > 0")
+                from .employee import get_or_create_profile
+                from .project_schedule import apply_task_estimate, project_commerce_settings
+
+                project = await get_or_create_project_state(
+                    db, item.project_id or f"agent-{agent.id}"
+                )
+                profile = await get_or_create_profile(db, agent.id)
+                settings = project_commerce_settings(project, profile=profile)
+                snap = apply_task_estimate(
+                    item,
+                    estimated_duration_minutes=estimated_duration_minutes,
+                    hourly_rate=float(settings["hourly_rate"] or 0),
+                    min_execution_ratio=float(settings["min_execution_ratio"] or 1),
+                    currency=str(settings["currency"]),
+                )
+                await add_event(
+                    db,
+                    item,
+                    kind="estimate",
+                    title="Оценка длительности",
+                    detail=(
+                        f"{estimated_duration_minutes} мин"
+                        + (
+                            f" · ~{snap.get('estimated_cost')} {snap.get('currency')}"
+                            if snap.get("estimated_cost") is not None
+                            else ""
+                        )
+                        + (f" · {note}" if note else "")
+                    ),
+                    payload=snap,
+                )
+                await db.commit()
+                return {
+                    "ok": True,
+                    "commerce": snap,
+                    "cost_requires_customer_approval": settings[
+                        "cost_requires_customer_approval"
+                    ],
+                    "task": work_item_json(item),
+                }
+
+            registry.register(
+                pm_estimate_task,
+                "pm_estimate_task",
+                "Estimate task duration in minutes; computes cost from project hourly_rate.",
             )
             registry.register(pm_get_task, "pm_get_task")
             registry.register(pm_record_decision, "pm_record_decision")
@@ -1536,6 +1642,95 @@ class AgentRuntime:
                         project = await get_or_create_project_state(
                             db, item.project_id or f"agent-{agent.id}"
                         )
+                        from .employee import get_or_create_profile
+                        from .project_schedule import (
+                            is_within_project_workday,
+                            next_workday_open,
+                            project_commerce_settings,
+                            schedule_snapshot,
+                            task_commerce_snapshot,
+                        )
+
+                        profile = await get_or_create_profile(db, agent.id)
+                        commerce_settings = project_commerce_settings(
+                            project, profile=profile
+                        )
+                        commerce = task_commerce_snapshot(
+                            item,
+                            hourly_rate=float(commerce_settings["hourly_rate"] or 0),
+                            currency=str(commerce_settings["currency"]),
+                        )
+                        if commerce_settings["cost_requires_customer_approval"] and not commerce[
+                            "cost_approved"
+                        ]:
+                            raise PermissionError(
+                                "Project requires customer cost approval before Cursor. "
+                                "Estimate duration/cost, agree with the customer, then "
+                                "pm_record_decision(topic='стоимость'/'cost', …) and retry."
+                            )
+                        if not is_within_project_workday(commerce_settings):
+                            open_at = next_workday_open(commerce_settings)
+                            schedule = schedule_snapshot(commerce_settings)
+                            ctx = dict(item.context_json or {})
+                            ctx["scheduled_cursor_at"] = open_at.isoformat()
+                            item.context_json = ctx
+                            item.status = "in_progress"
+                            item.wait_owner = "self"
+                            item.wait_until = open_at
+                            item.next_action = (
+                                "Запуск Cursor в рабочие часы "
+                                f"({schedule.get('next_cursor_window_local') or open_at.isoformat()})"
+                            )
+                            if self.scheduler is not None:
+                                from .job_result import build_followup_payload
+
+                                payload = build_followup_payload(
+                                    message=(
+                                        f"Рабочие часы проекта {item.project_id} начались. "
+                                        f"Вызови submit_development_task для кейса #{item.id} "
+                                        "и продолжи разработку в Cursor."
+                                    ),
+                                    run_at_iso=open_at.isoformat(),
+                                    timezone=str(commerce_settings["timezone"]),
+                                    context=context,
+                                    account_phone=phone,
+                                )
+                                payload["work_item_id"] = item.id
+                                job = await save_once_job(
+                                    db,
+                                    self.scheduler,
+                                    agent_id=agent.id,
+                                    name=f"case{item.id}-cursor-workday",
+                                    payload=payload,
+                                    current_job_id=item.cron_job_id,
+                                )
+                                item.cron_job_id = job.id
+                            await add_event(
+                                db,
+                                item,
+                                kind="schedule",
+                                title="Cursor отложен до рабочих часов",
+                                detail=item.next_action,
+                                payload={
+                                    "scheduled_cursor_at": open_at.isoformat(),
+                                    "timezone": commerce_settings["timezone"],
+                                },
+                            )
+                            await db.commit()
+                            return {
+                                "task_id": str(item.id),
+                                "status": "deferred_off_hours",
+                                "done": False,
+                                "deferred": True,
+                                "scheduled_at": open_at.isoformat(),
+                                "schedule": schedule,
+                                "reason": (
+                                    "Outside project working hours. Discuss/intake with the "
+                                    "customer is allowed; Cursor starts at scheduled_at. "
+                                    "Do not consult the manager."
+                                ),
+                                "task": work_item_json(item),
+                            }
                         confirmed = await item_has_client_confirmation(db, item)
                         inside_scope = bool(
                             (item.context_json or {}).get(
@@ -1611,6 +1806,12 @@ class AgentRuntime:
                         item.status = "waiting_external"
                         item.wait_owner = "external"
                         item.next_action = "Wait for structured Cursor result"
+                        min_minutes = commerce.get("min_execution_minutes")
+                        if min_minutes:
+                            item.next_action = (
+                                f"Wait for structured Cursor result "
+                                f"(min {min_minutes} min by estimate)"
+                            )
                         await db.commit()
                         try:
                             result = await send_prompt_and_drive(
@@ -1753,6 +1954,53 @@ class AgentRuntime:
                         ):
                             raise ValueError(
                                 "Latest Cursor run lacks passing evidence for every acceptance criterion"
+                            )
+                        from .project_schedule import min_execution_remaining_minutes
+
+                        all_runs = list(
+                            await db.scalars(
+                                select(CursorRun)
+                                .where(CursorRun.work_item_id == item.id)
+                                .order_by(CursorRun.attempt)
+                            )
+                        )
+                        remaining = min_execution_remaining_minutes(item, all_runs)
+                        if remaining > 0:
+                            wait_until = utcnow() + timedelta(minutes=max(1, int(remaining)))
+                            item.wait_until = wait_until
+                            item.wait_owner = "self"
+                            item.next_action = (
+                                f"Минимальное время по оценке ещё ~{int(remaining)} мин — "
+                                "не закрывай раньше; проверь результат и дождись окна"
+                            )
+                            if self.scheduler is not None:
+                                from .job_result import build_followup_payload
+
+                                payload = build_followup_payload(
+                                    message=(
+                                        f"Минимальное время по оценке для кейса #{item.id} истекло. "
+                                        "Проверь результат и при готовности вызови pm_accept_task."
+                                    ),
+                                    run_at_iso=wait_until.isoformat(),
+                                    timezone="UTC",
+                                    context=context,
+                                    account_phone=phone,
+                                )
+                                payload["work_item_id"] = item.id
+                                job = await save_once_job(
+                                    db,
+                                    self.scheduler,
+                                    agent_id=agent.id,
+                                    name=f"case{item.id}-min-duration",
+                                    payload=payload,
+                                    current_job_id=item.cron_job_id,
+                                )
+                                item.cron_job_id = job.id
+                            await db.commit()
+                            raise PermissionError(
+                                f"Estimated minimum execution time not reached "
+                                f"(~{int(remaining)} minutes left). "
+                                "Do not mark done yet; wait and re-check."
                             )
                         await transition_pm_phase(db, item, "DONE", detail="QA accepted")
                         item.status = "done"

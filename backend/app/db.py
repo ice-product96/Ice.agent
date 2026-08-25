@@ -191,7 +191,7 @@ class RuntimeSettings(TimestampMixin, Base):
     typing_presence: Mapped[bool] = mapped_column(Boolean, default=False)
     task_workers: Mapped[int] = mapped_column(Integer, default=1)
     max_tool_rounds: Mapped[int] = mapped_column(Integer, default=8)
-    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Yekaterinburg")
     telegram_history_limit: Mapped[int] = mapped_column(Integer, default=100)
     recent_context_messages: Mapped[int] = mapped_column(Integer, default=30)
     context_max_chars: Mapped[int] = mapped_column(Integer, default=30000)
@@ -289,7 +289,7 @@ class EmployeeProfile(TimestampMixin, Base):
     heartbeat_minutes: Mapped[int] = mapped_column(Integer, default=15)
     workday_start: Mapped[str] = mapped_column(String(8), default="09:00")
     workday_end: Mapped[str] = mapped_column(String(8), default="18:00")
-    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Yekaterinburg")
     budget_ticks_per_day: Mapped[int] = mapped_column(Integer, default=48)
     ticks_used_today: Mapped[int] = mapped_column(Integer, default=0)
     ticks_day: Mapped[str | None] = mapped_column(String(16))  # YYYY-MM-DD in employee tz

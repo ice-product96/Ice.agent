@@ -1484,6 +1484,45 @@ function EmployeeScreen() {
         {selected.pm_phase && <div className="intake-box">
           <strong>PM state · {selected.pm_phase}</strong>
           <small>{selected.task_type || 'task'} · приоритет {selected.priority || 'normal'} · проект {selected.project_id || 'не указан'}</small>
+          {(selected.next_event?.at || selected.wait_until) && (
+            <p>
+              <strong>Дальше:</strong>{' '}
+              {selected.next_event?.action || selected.next_action || 'ожидание'}
+              {' · '}
+              {new Date(selected.next_event?.at || selected.wait_until || '').toLocaleString('ru-RU', { timeZone: 'Asia/Yekaterinburg' })}
+              {selected.next_event?.owner ? ` · ждёт ${selected.next_event.owner}` : selected.wait_owner ? ` · ждёт ${selected.wait_owner}` : ''}
+            </p>
+          )}
+          {(selected.schedule || selected.commerce) && (
+            <div style={{ marginTop: 8 }}>
+              <strong>Расписание и стоимость</strong>
+              <small style={{ display: 'block' }}>
+                Часы: {selected.schedule?.workday_start || '09:00'}–{selected.schedule?.workday_end || '18:00'}{' '}
+                {selected.schedule?.timezone || 'Asia/Yekaterinburg'}
+                {selected.schedule?.within_workday === false
+                  ? ` · вне рабочих (Cursor с ${selected.schedule?.next_cursor_window_local || '…'})`
+                  : ' · рабочие часы сейчас'}
+              </small>
+              <small style={{ display: 'block' }}>
+                Оценка: {selected.commerce?.estimated_duration_minutes != null ? `${selected.commerce.estimated_duration_minutes} мин` : '—'}
+                {selected.commerce?.estimated_cost != null
+                  ? ` · ~${selected.commerce.estimated_cost} ${selected.commerce.currency || 'RUB'}`
+                  : ''}
+                {selected.commerce?.cost_requires_customer_approval
+                  ? (selected.commerce.cost_approved ? ' · стоимость согласована' : ' · нужно согласовать стоимость')
+                  : ''}
+              </small>
+              {selected.commerce?.min_execution_minutes != null && (
+                <small style={{ display: 'block' }}>
+                  Мин. время Cursor: {selected.commerce.min_execution_minutes} мин
+                  {selected.commerce.elapsed_cursor_minutes != null ? ` · прошло ${selected.commerce.elapsed_cursor_minutes}` : ''}
+                  {(selected.commerce.min_execution_remaining_minutes || 0) > 0
+                    ? ` · осталось ~${selected.commerce.min_execution_remaining_minutes}`
+                    : ' · можно принимать QA'}
+                </small>
+              )}
+            </div>
+          )}
           {selected.project && <Field label="Автономия проекта" hint="LEVEL_1 — только небольшие однозначные bug fixes без подтверждения.">
             <select value={selected.project.autonomy_level} onChange={async event => {
               const autonomy_level = event.target.value as 'LEVEL_0' | 'LEVEL_1' | 'LEVEL_2' | 'LEVEL_3'
@@ -1496,6 +1535,79 @@ function EmployeeScreen() {
               <option value="LEVEL_3">LEVEL_3 · обычная разработка автономно</option>
             </select>
           </Field>}
+          {selected.project && (
+            <div className="grid-2" style={{ marginTop: 8, gap: 8 }}>
+              <Field label="Часовой пояс проекта" hint="Для рабочих часов Cursor. UTC+5 = Asia/Yekaterinburg.">
+                <input
+                  defaultValue={String(selected.project.config?.timezone || selected.schedule?.timezone || 'Asia/Yekaterinburg')}
+                  onBlur={async event => {
+                    const timezone = event.target.value.trim() || 'Asia/Yekaterinburg'
+                    await api.pm.updateProject(selected.project!.project_id, {
+                      autonomy_level: selected.project!.autonomy_level,
+                      config: { timezone },
+                    })
+                    setSelected(await api.agents.workItem(agentId, selected.id))
+                  }}
+                />
+              </Field>
+              <Field label="Рабочий день" hint="HH:MM–HH:MM">
+                <div className="head-actions">
+                  <input
+                    style={{ width: 80 }}
+                    defaultValue={String(selected.project.config?.workday_start || selected.schedule?.workday_start || '09:00')}
+                    onBlur={async event => {
+                      await api.pm.updateProject(selected.project!.project_id, {
+                        autonomy_level: selected.project!.autonomy_level,
+                        config: { workday_start: event.target.value.trim() || '09:00' },
+                      })
+                      setSelected(await api.agents.workItem(agentId, selected.id))
+                    }}
+                  />
+                  <span>—</span>
+                  <input
+                    style={{ width: 80 }}
+                    defaultValue={String(selected.project.config?.workday_end || selected.schedule?.workday_end || '18:00')}
+                    onBlur={async event => {
+                      await api.pm.updateProject(selected.project!.project_id, {
+                        autonomy_level: selected.project!.autonomy_level,
+                        config: { workday_end: event.target.value.trim() || '18:00' },
+                      })
+                      setSelected(await api.agents.workItem(agentId, selected.id))
+                    }}
+                  />
+                </div>
+              </Field>
+              <Field label="Ставка ₽/час" hint="Для расчёта стоимости по оценке длительности.">
+                <input
+                  type="number"
+                  defaultValue={String(selected.project.config?.hourly_rate ?? selected.commerce?.hourly_rate ?? '')}
+                  onBlur={async event => {
+                    const raw = event.target.value.trim()
+                    await api.pm.updateProject(selected.project!.project_id, {
+                      autonomy_level: selected.project!.autonomy_level,
+                      config: { hourly_rate: raw === '' ? null : Number(raw) },
+                    })
+                    setSelected(await api.agents.workItem(agentId, selected.id))
+                  }}
+                />
+              </Field>
+              <Field label="Согласовывать стоимость с заказчиком" hint="Если да — до Cursor нужно pm_record_decision по стоимости.">
+                <select
+                  value={String(Boolean(selected.project.config?.cost_requires_customer_approval ?? selected.commerce?.cost_requires_customer_approval))}
+                  onChange={async event => {
+                    await api.pm.updateProject(selected.project!.project_id, {
+                      autonomy_level: selected.project!.autonomy_level,
+                      config: { cost_requires_customer_approval: event.target.value === 'true' },
+                    })
+                    setSelected(await api.agents.workItem(agentId, selected.id))
+                  }}
+                >
+                  <option value="false">Нет</option>
+                  <option value="true">Да</option>
+                </select>
+              </Field>
+            </div>
+          )}
           {(selected.requirements || []).length > 0 && <p><strong>Требования:</strong> {(selected.requirements || []).join(' · ')}</p>}
           {(selected.acceptance_criteria || []).length > 0 && <p><strong>Acceptance criteria:</strong> {(selected.acceptance_criteria || []).join(' · ')}</p>}
           {(selected.decisions || []).length > 0 && <div><strong>Решения</strong>{(selected.decisions || []).map(decision => <p key={decision.id}>{decision.topic ? `${decision.topic}: ` : ''}{decision.decision}</p>)}</div>}

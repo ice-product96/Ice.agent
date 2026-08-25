@@ -412,10 +412,43 @@ export interface CursorRun {
   created_at?: string | null
 }
 
+export interface ProjectSchedule {
+  timezone?: string
+  workday_start?: string
+  workday_end?: string
+  workdays?: number[]
+  within_workday?: boolean
+  next_cursor_window_at?: string | null
+  next_cursor_window_local?: string | null
+  hourly_rate?: number
+  currency?: string
+  cost_requires_customer_approval?: boolean
+  min_execution_ratio?: number
+  now_local?: string
+}
+
+export interface ProjectCommerce {
+  hourly_rate?: number | null
+  currency?: string
+  cost_requires_customer_approval?: boolean
+  min_execution_ratio?: number
+  estimated_duration_minutes?: number | null
+  min_execution_minutes?: number | null
+  estimated_cost?: number | null
+  cost_approved?: boolean
+  cost_decision_id?: number | null
+  scheduled_cursor_at?: string | null
+  elapsed_cursor_minutes?: number
+  min_execution_remaining_minutes?: number
+  can_accept_qa?: boolean
+}
+
 export interface ProjectState {
   project_id: string
   autonomy_level: 'LEVEL_0' | 'LEVEL_1' | 'LEVEL_2' | 'LEVEL_3'
   config?: Record<string, unknown>
+  schedule?: ProjectSchedule
+  commerce?: ProjectCommerce
   created_at?: string | null
   updated_at?: string | null
 }
@@ -471,6 +504,9 @@ export interface WorkItem {
     flush_job_id?: number | null
     messages?: Array<{ at?: string | null; text?: string; attachments?: Array<{ kind?: string; filename?: string }> }>
   }
+  schedule?: ProjectSchedule
+  commerce?: ProjectCommerce
+  next_event?: { at?: string | null; action?: string; owner?: string } | null
 }
 
 export interface WorkItemCounts {

@@ -135,7 +135,7 @@ export const api = {
   pm: {
     projects: () => request<ProjectState[]>('/pm/projects'),
     project: (id: string) => request<PmProjectDetail>(`/pm/projects/${encodeURIComponent(id)}`),
-    updateProject: (id: string, data: Pick<ProjectState, 'autonomy_level'> & { config?: Record<string, unknown> }) =>
+    updateProject: (id: string, data: { autonomy_level?: ProjectState['autonomy_level']; config?: Record<string, unknown> }) =>
       request<ProjectState>(`/pm/projects/${encodeURIComponent(id)}`, { method: 'PATCH', ...body(data) }),
   },
   customers: {

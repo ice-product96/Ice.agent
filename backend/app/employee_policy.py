@@ -133,6 +133,13 @@ def pm_system_instruction() -> str:
         "for those high-risk escalations and comes from a stored manager consultation — never ask the "
         "manager how to flip that flag. A later tick may submit once a customer decision is stored, "
         "even without a new customer message. "
+        "Working hours are per project (timezone often UTC+5 / Asia/Yekaterinburg). Outside hours you "
+        "may discuss, clarify, estimate, and agree cost with the customer — but do NOT call "
+        "submit_development_task / Cursor until working hours (platform defers automatically). "
+        "Always pm_estimate_task (or pass estimated_duration_minutes in pm_structure_task) before "
+        "development. If the project requires cost approval, agree the amount with the customer and "
+        "pm_record_decision with topic about стоимость/cost before Cursor. Do not accept QA before "
+        "the estimated minimum execution time has elapsed. "
         "Communicate naturally and briefly; do not expose internal JSON or raw Cursor output."
     )
 

@@ -651,18 +651,22 @@ class WorkItemWaitBody(BaseModel):
 
 
 class ProjectStateBody(BaseModel):
-    autonomy_level: str = Field(pattern=r"^LEVEL_[0-3]$")
+    autonomy_level: str | None = Field(default=None, pattern=r"^LEVEL_[0-3]$")
     config: dict[str, Any] | None = None
 
 
 def project_state_json(state: ProjectState) -> dict[str, Any]:
-    return {
+    from .project_schedule import enrich_project_state_payload
+
+    payload = {
         "project_id": state.project_id,
         "autonomy_level": state.autonomy_level,
         "config": state.config or {},
         "created_at": state.created_at.isoformat() if state.created_at else None,
         "updated_at": state.updated_at.isoformat() if state.updated_at else None,
     }
+    payload.update(enrich_project_state_payload(state))
+    return payload
 
 
 def decision_record_json(record: DecisionRecord) -> dict[str, Any]:
@@ -744,9 +748,16 @@ async def update_pm_project(
     from .pm_state import get_or_create_project_state, normalize_autonomy_level
 
     state = await get_or_create_project_state(db, project_id)
-    state.autonomy_level = normalize_autonomy_level(payload.autonomy_level)
+    if payload.autonomy_level is not None:
+        state.autonomy_level = normalize_autonomy_level(payload.autonomy_level)
     if payload.config is not None:
-        state.config = payload.config
+        merged = dict(state.config or {})
+        for key, value in dict(payload.config).items():
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+        state.config = merged
     await db.commit()
     return project_state_json(state)
 
@@ -1151,6 +1162,13 @@ async def get_agent_work_item(
         decisions=[decision_record_json(row) for row in decisions],
         cursor_runs=[cursor_run_json(row) for row in runs],
         project=project_state_json(project) if project else None,
+    )
+    from .employee import get_or_create_profile
+    from .project_schedule import enrich_work_item_commerce
+
+    profile = await get_or_create_profile(db, item.agent_id)
+    result.update(
+        enrich_work_item_commerce(item, project, list(runs), profile=profile)
     )
     return result
 
