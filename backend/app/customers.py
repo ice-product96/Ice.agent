@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .cursorremote_drive import mcp_call, parse_mcp_payload
-from .db import Agent, Customer, McpServer, ProjectState
+from .db import Agent, Customer, McpServer, ProjectState, WorkItem
 from .secrets import SecretStore
 
 
@@ -243,9 +243,21 @@ async def resolve_customer(
         row = await db.get(Customer, cid)
         if row is not None:
             return row
+        row = await db.scalar(
+            select(Customer).where(Customer.id.ilike(cid)).limit(1)
+        )
+        if row is not None:
+            return row
     pid = str(project_id or "").strip()
     if pid:
-        row = await db.scalar(select(Customer).where(Customer.project_id == pid).limit(1))
+        row = await db.scalar(
+            select(Customer).where(Customer.project_id == pid).limit(1)
+        )
+        if row is not None:
+            return row
+        row = await db.scalar(
+            select(Customer).where(Customer.project_id.ilike(pid)).limit(1)
+        )
         if row is not None:
             return row
     if agent is None:
@@ -255,6 +267,92 @@ async def resolve_customer(
         .where(Customer.agent_id == agent.id, Customer.is_default.is_(True))
         .limit(1)
     )
+
+
+def _normalize_match_text(value: str) -> str:
+    text = str(value or "").casefold()
+    text = re.sub(r"[\s_\-./\\]+", "", text)
+    return text
+
+
+def _match_variants(value: str) -> set[str]:
+    raw = _normalize_match_text(value)
+    if not raw:
+        return set()
+    variants = {raw}
+    slug = slugify(value, fallback="")
+    if slug:
+        variants.add(_normalize_match_text(slug))
+    return {v for v in variants if len(v) >= 3}
+
+
+def _token_matches(needle: str, hay: str) -> bool:
+    if needle in hay or hay in needle:
+        return True
+    # Near-translit brands: УралТрейд ↔ uraltrade share prefix uraltr.
+    shared = 0
+    for left, right in zip(needle, hay):
+        if left != right:
+            break
+        shared += 1
+    return shared >= 5
+
+
+async def match_customer_from_text(
+    db: AsyncSession,
+    agent: Agent | None,
+    text: str,
+) -> Customer | None:
+    """Find a customer mentioned in free text (title, intake, chat)."""
+    hay_variants = _match_variants(text)
+    if not hay_variants:
+        return None
+    stmt = select(Customer)
+    if agent is not None:
+        stmt = stmt.where(
+            (Customer.agent_id == agent.id) | (Customer.agent_id.is_(None))
+        )
+    rows = list(await db.scalars(stmt))
+    best: Customer | None = None
+    best_score = 0
+    for row in rows:
+        needles = [
+            row.id,
+            row.project_id,
+            row.name,
+            Path(row.cursor_workspace or "").name if row.cursor_workspace else "",
+        ]
+        for raw in needles:
+            for needle in _match_variants(raw):
+                if any(_token_matches(needle, hay) for hay in hay_variants):
+                    score = len(needle)
+                    if score > best_score:
+                        best = row
+                        best_score = score
+    return best
+
+
+async def bind_customer_to_work_item(
+    db: AsyncSession,
+    item: WorkItem,
+    customer: Customer | None,
+    *,
+    context: dict[str, Any] | None = None,
+) -> Customer | None:
+    if customer is None:
+        return None
+    if not (item.customer_id or "").strip():
+        item.customer_id = customer.id
+    if not (item.project_id or "").strip() and (customer.project_id or "").strip():
+        item.project_id = customer.project_id.strip()
+    ctx = context if isinstance(context, dict) else None
+    if ctx is not None:
+        ctx["customer_id"] = customer.id
+        if customer.project_id:
+            ctx["project_id"] = customer.project_id
+        if customer.cursor_workspace:
+            ctx.setdefault("cursor_workspace", customer.cursor_workspace)
+    return customer
 
 
 async def sync_agent_memory_defaults(db: AsyncSession, customer: Customer) -> None:

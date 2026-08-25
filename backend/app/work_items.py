@@ -605,6 +605,20 @@ async def create_work_item(
         paused=False,
     )
     apply_origin(item, context)
+    from .customers import bind_customer_to_work_item, match_customer_from_text, resolve_customer
+
+    customer = await resolve_customer(
+        db,
+        agent,
+        customer_id=str(context.get("customer_id") or "") or None,
+        project_id=str(context.get("project_id") or "") or None,
+    )
+    if customer is None:
+        customer = await match_customer_from_text(
+            db, agent, f"{title}\n{goal}\n{context.get('message') or ''}"
+        )
+    if customer is not None:
+        await bind_customer_to_work_item(db, item, customer, context=context)
     db.add(item)
     await db.flush()
     await add_event(db, item, kind="created", title="Кейс создан", detail=item.goal)
@@ -621,6 +635,26 @@ async def bind_work_item(
     message: str,
 ) -> WorkItem | None:
     """Attach or create a work item for this run. Heartbeat without id stays a watchdog."""
+    from .customers import bind_customer_to_work_item, match_customer_from_text, resolve_customer
+
+    async def _ensure_customer(item: WorkItem) -> None:
+        if (item.project_id or "").strip() and (
+            context.get("customer_id") or context.get("project_id")
+        ):
+            return
+        customer = await resolve_customer(
+            db,
+            agent,
+            customer_id=str(context.get("customer_id") or "") or None,
+            project_id=str(context.get("project_id") or item.project_id or "") or None,
+        )
+        if customer is None:
+            customer = await match_customer_from_text(
+                db, agent, f"{item.title}\n{item.goal}\n{message}"
+            )
+        if customer is not None:
+            await bind_customer_to_work_item(db, item, customer, context=context)
+
     existing = await get_work_item(db, context.get("work_item_id"))
     if existing is not None and existing.agent_id == agent.id:
         context["work_item_id"] = existing.id
@@ -629,6 +663,7 @@ async def bind_work_item(
             existing.status = "in_progress"
             existing.paused = False
             existing.wait_owner = "self"
+        await _ensure_customer(existing)
         await add_event(
             db,
             existing,
@@ -660,6 +695,7 @@ async def bind_work_item(
                 found.status = "in_progress"
                 found.paused = False
                 found.wait_owner = "self"
+            await _ensure_customer(found)
             await add_event(
                 db,
                 found,

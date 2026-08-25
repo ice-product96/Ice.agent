@@ -2242,7 +2242,7 @@ class AgentRuntime:
                 )
                 bind_conversation_from_config(state, agent.config, context)
                 if not (state.customer_id or "").strip() or not (state.project_id or "").strip():
-                    from .customers import resolve_customer
+                    from .customers import match_customer_from_text, resolve_customer
 
                     customer = await resolve_customer(
                         db,
@@ -2250,6 +2250,12 @@ class AgentRuntime:
                         customer_id=state.customer_id,
                         project_id=state.project_id,
                     )
+                    if customer is None:
+                        customer = await match_customer_from_text(
+                            db,
+                            agent,
+                            str(message or ""),
+                        )
                     if customer is not None:
                         if not (state.customer_id or "").strip():
                             state.customer_id = customer.id
@@ -2360,6 +2366,38 @@ class AgentRuntime:
                     from .cursor_assets import persist_customer_images
 
                     persist_customer_images(work_item, attachments)
+                    await db.commit()
+            if work_item is not None and (
+                not (work_item.project_id or "").strip()
+                or not (work_item.customer_id or "").strip()
+            ):
+                from .customers import (
+                    bind_customer_to_work_item,
+                    match_customer_from_text,
+                    resolve_customer,
+                )
+
+                customer = await resolve_customer(
+                    db,
+                    agent,
+                    customer_id=str(context.get("customer_id") or "") or None,
+                    project_id=str(context.get("project_id") or "") or None,
+                )
+                if customer is None:
+                    customer = await match_customer_from_text(
+                        db,
+                        agent,
+                        f"{work_item.title}\n{work_item.goal}\n{message}",
+                    )
+                if customer is not None:
+                    await bind_customer_to_work_item(
+                        db, work_item, customer, context=context
+                    )
+                    if state is not None:
+                        if not (state.customer_id or "").strip():
+                            state.customer_id = customer.id
+                        if not (state.project_id or "").strip() and customer.project_id:
+                            state.project_id = customer.project_id
                     await db.commit()
             system_prompt = await assemble_system_prompt(
                 db,

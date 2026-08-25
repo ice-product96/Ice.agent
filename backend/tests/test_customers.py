@@ -4,9 +4,13 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.customers import (
+    _match_variants,
+    _token_matches,
     allowed_workspaces_from_env,
     customer_prompt_block,
     extract_cursor_projects,
+    match_customer_from_text,
+    resolve_customer,
     slugify,
 )
 from app.db import Agent, Base, Customer
@@ -16,6 +20,15 @@ from app.employee import assemble_system_prompt, ensure_prompt_sections
 def test_slugify_transliterates_russian() -> None:
     assert slugify("Типография LAVVE") == "tipografiya-lavve"
     assert slugify("  Acme Site  ") == "acme-site"
+    assert slugify("УралТрейд") == "uraltreyd"
+
+
+def test_match_variants_cover_cyrillic_and_latin() -> None:
+    variants = _match_variants("УралТрейд")
+    assert "уралтрейд" in variants
+    assert "uraltreyd" in variants
+    assert _token_matches("uraltreyd", "uraltrade")
+    assert _token_matches("uraltrade", "uraltreyd")
 
 
 def test_allowed_workspaces_from_env_splits_paths() -> None:
@@ -87,4 +100,64 @@ async def test_assemble_system_prompt_injects_customer_assignment(tmp_path: Path
         assert "## Заказчик и проект" in prompt
         assert "LAVVE" in prompt
         assert "Проект разработки: lavve" in prompt
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_customer_is_case_insensitive(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'resolve.db').as_posix()}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessions() as db:
+        agent = Agent(name="pm-agent", prompt="")
+        db.add(agent)
+        await db.flush()
+        db.add(
+            Customer(
+                id="uraltrade",
+                name="УралТрейд",
+                agent_id=agent.id,
+                project_id="uraltrade",
+                cursor_workspace=r"D:\projects\uraltrade",
+            )
+        )
+        await db.commit()
+        found = await resolve_customer(db, agent, customer_id="UralTrade")
+        assert found is not None
+        assert found.id == "uraltrade"
+        found_pid = await resolve_customer(db, agent, project_id="UralTrade")
+        assert found_pid is not None
+        assert found_pid.id == "uraltrade"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_match_customer_from_cyrillic_brand(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'match.db').as_posix()}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessions() as db:
+        agent = Agent(name="pm-agent", prompt="")
+        db.add(agent)
+        await db.flush()
+        db.add(
+            Customer(
+                id="uraltrade",
+                name="УралТрейд",
+                agent_id=agent.id,
+                project_id="uraltrade",
+                cursor_workspace=r"D:\projects\uraltrade",
+                notes="Telegram: @ptitsyns",
+            )
+        )
+        await db.commit()
+        found = await match_customer_from_text(
+            db,
+            agent,
+            "у проекта УралТрейд проверь трекер согласуй все изменения",
+        )
+        assert found is not None
+        assert found.id == "uraltrade"
     await engine.dispose()

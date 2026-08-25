@@ -1469,7 +1469,17 @@ function EmployeeScreen() {
       {selected && <section className="panel work-card">
         <SectionHead title={`Кейс #${selected.id}`} text={`${selected.status_label || selected.status} · ждёт ${selected.wait_owner || '—'}${selected.wait_until ? ` с ${new Date(selected.wait_until).toLocaleString('ru-RU')}` : ''}`}/>
         <p className="work-goal">{selected.goal || selected.title}</p>
-        <small>Клиент {selected.chat_id || '—'}{selected.sender_username ? ` · @${selected.sender_username}` : ''}{selected.reply_phone ? ` · ${selected.reply_phone}` : ''}</small>
+        <small>
+          Источник {selected.chat_id || '—'}
+          {selected.sender_username ? ` · @${selected.sender_username}` : ''}
+          {selected.reply_phone ? ` · ${selected.reply_phone}` : ''}
+        </small>
+        {(selected.customer_id || selected.project_id) && (
+          <small>
+            Заказчик {selected.customer_id || '—'}
+            {selected.project_id ? ` · проект ${selected.project_id}` : ''}
+          </small>
+        )}
         {selected.last_error && <Alert message={selected.last_error}/>}
         {selected.pm_phase && <div className="intake-box">
           <strong>PM state · {selected.pm_phase}</strong>
