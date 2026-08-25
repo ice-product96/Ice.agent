@@ -783,7 +783,37 @@ async def list_cursor_projects(
 ) -> list[dict[str, Any]]:
     from .customers import collect_cursor_projects
 
-    return await collect_cursor_projects(db, getattr(request.app.state, "mcp", None))
+    mcp = getattr(request.app.state, "mcp", None)
+    # Refresh must reattach after CursorRemote restarts — otherwise the UI keeps
+    # only stale saved customers and never sees the live allowlist.
+    if mcp is not None:
+        servers = (
+            await db.scalars(select(McpServer).where(McpServer.enabled.is_(True)))
+        ).all()
+        for server in servers:
+            if "cursorremote" not in (server.name or "").lower():
+                continue
+            if mcp.sessions.get(server.name) is not None:
+                continue
+            try:
+                await mcp.hot_reload(
+                    server.name,
+                    {
+                        "transport": server.transport,
+                        "command": server.command,
+                        "args": server.args or [],
+                        "url": server.url,
+                        "env": decrypt_mcp_env(server),
+                    },
+                )
+            except BaseException:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "CursorRemote reconnect failed while listing projects",
+                    exc_info=True,
+                )
+    return await collect_cursor_projects(db, mcp)
 
 
 @router.post("/customers", dependencies=auth, status_code=201)
