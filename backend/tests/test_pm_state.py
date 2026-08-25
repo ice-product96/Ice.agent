@@ -326,6 +326,30 @@ def test_brief_and_result_parsing_are_canonical() -> None:
     assert "# Task: PM persistence" in brief
     assert "## Acceptance criteria" in brief
     assert '"branch": "main"' in brief
+    assert "task_id:** 7" in brief
+    assert "ice_tracker separately" in brief
+
+    trackerish = WorkItem(
+        id=24,
+        agent_id=1,
+        title="UI fix",
+        goal="Align blocks",
+        project_id="d82c8c0d-c1af-4c06-a141-9b56505ff6a4",
+        task_type="change",
+        priority="normal",
+        requirements=["Align homepage blocks."],
+        acceptance_criteria=["Blocks aligned."],
+        context_json={
+            "branch": "main",
+            "tracker_project_id": "d82c8c0d-c1af-4c06-a141-9b56505ff6a4",
+            "board_id": "board-1",
+        },
+    )
+    tracker_brief = render_task_brief(trackerish)
+    assert "**Project:** unspecified" in tracker_brief
+    assert "tracker_project_id" not in tracker_brief
+    assert "board_id" not in tracker_brief
+    assert '"branch": "main"' in tracker_brief
 
     parsed = parse_cursor_result(
         """```json

@@ -60,6 +60,7 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
             "CHANGES_REQUESTED",
             "READY_FOR_DEV",
             "IN_DEVELOPMENT",
+            "DEV_COMPLETE",
             "CANCELLED",
         }
     ),
@@ -295,11 +296,20 @@ def render_task_brief(item: WorkItem) -> str:
     title = str(item.title or "").strip() or f"Work item {item.id}"
     task_type = str(item.task_type or "task")
     priority = str(item.priority or "normal")
+    project_label = str(item.project_id or "").strip() or "unspecified"
+    # Tracker board UUIDs belong in ice_tracker, not in the Cursor brief.
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        project_label,
+        flags=re.IGNORECASE,
+    ):
+        project_label = "unspecified"
     sections = [
         f"# Task: {title}",
         f"**Type:** {task_type}",
         f"**Priority:** {priority}",
-        f"**Project:** {item.project_id or 'unspecified'}",
+        f"**Project:** {project_label}",
+        f"**task_id:** {item.id}",
         f"## Goal\n{str(item.goal or '').strip()}",
         f"## Requirements\n{_lines(list(item.requirements or []))}",
         f"## Acceptance criteria\n{_lines(list(item.acceptance_criteria or []))}",
@@ -310,9 +320,31 @@ def render_task_brief(item: WorkItem) -> str:
         sections.append(f"## Constraints\n{constraints}")
     if edge_cases:
         sections.append(f"## Edge cases\n{edge_cases}")
-    if item.context_json:
-        context = json.dumps(item.context_json, ensure_ascii=False, sort_keys=True, indent=2)
-        sections.append(f"## Context\n```json\n{context}\n```")
+    context = dict(item.context_json or {}) if isinstance(item.context_json, dict) else {}
+    # Keep only engineering context for Cursor — drop tracker/board/card noise.
+    drop_keys = {
+        "tracker",
+        "tracker_project_id",
+        "tracker_task_ids",
+        "board_id",
+        "card_id",
+        "card_ids",
+        "section_id",
+        "ice_tracker",
+        "related_tracker_tasks",
+    }
+    clean_context = {
+        key: value
+        for key, value in context.items()
+        if key not in drop_keys and not str(key).lower().startswith("tracker_")
+    }
+    if clean_context:
+        payload = json.dumps(clean_context, ensure_ascii=False, sort_keys=True, indent=2)
+        sections.append(f"## Context\n```json\n{payload}\n```")
+    sections.append(
+        "Work only on this engineering brief. Do not update trackers, boards, or cards — "
+        "the project manager handles ice_tracker separately."
+    )
     return "\n\n".join(sections).strip() + "\n"
 
 
