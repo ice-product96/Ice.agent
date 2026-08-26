@@ -2006,7 +2006,7 @@ function CustomersScreen() {
           <span><Briefcase size={13}/>{agentName(item.agent_id)}</span>
           <span><ServerCog size={13}/>{item.project_id || '—'}</span>
         </div>
-        <div className="entity-meta"><span>{item.cursor_workspace || 'Cursor workspace не задан'}</span><span>id={item.id}</span></div>
+        <div className="entity-meta"><span>{item.cursor_workspace || 'Cursor workspace не задан'}</span><span>id={item.id}</span><span>Ставка и согласование — в карточке</span></div>
         {item.prompt_block && <pre className="customer-prompt-inline">{item.prompt_block}</pre>}
         <div className="card-actions">
           <button className="secondary" onClick={() => setEditing(item)}>Изменить</button>
