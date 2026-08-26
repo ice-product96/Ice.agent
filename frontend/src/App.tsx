@@ -1481,6 +1481,83 @@ function EmployeeScreen() {
           </small>
         )}
         {selected.last_error && <Alert message={selected.last_error}/>}
+        {(selected.project_id || selected.project) && (() => {
+          const projectId = selected.project?.project_id || selected.project_id || ''
+          const autonomy = selected.project?.autonomy_level || 'LEVEL_0'
+          const refresh = async () => setSelected(await api.agents.workItem(agentId, selected.id))
+          const patchProject = async (config: Record<string, unknown>, level = autonomy) => {
+            await api.pm.updateProject(projectId, { autonomy_level: level, config })
+            await refresh()
+          }
+          return <div className="intake-box" style={{ marginTop: 8 }}>
+            <div className="head-actions" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
+              <strong>Настройки проекта · {projectId}</strong>
+              <button className="secondary compact" type="button" onClick={() => window.dispatchEvent(new CustomEvent('ice:goto', { detail: 'customers' }))}>В «Заказчики»</button>
+            </div>
+            {selected.project && <Field label="Автономия проекта" hint="LEVEL_1 — только небольшие однозначные bug fixes без подтверждения.">
+              <select value={selected.project.autonomy_level} onChange={async event => {
+                const autonomy_level = event.target.value as 'LEVEL_0' | 'LEVEL_1' | 'LEVEL_2' | 'LEVEL_3'
+                await api.pm.updateProject(projectId, { autonomy_level })
+                await refresh()
+              }}>
+                <option value="LEVEL_0">LEVEL_0 · всё с подтверждением</option>
+                <option value="LEVEL_1">LEVEL_1 · только малые bug fixes</option>
+                <option value="LEVEL_2">LEVEL_2 · согласованный scope</option>
+                <option value="LEVEL_3">LEVEL_3 · обычная разработка автономно</option>
+              </select>
+            </Field>}
+            <div className="grid-2" style={{ marginTop: 8, gap: 8 }}>
+              <Field label="Часовой пояс проекта" hint="UTC+5 = Asia/Yekaterinburg">
+                <input
+                  defaultValue={String(selected.project?.config?.timezone || selected.schedule?.timezone || 'Asia/Yekaterinburg')}
+                  onBlur={async event => {
+                    await patchProject({ timezone: event.target.value.trim() || 'Asia/Yekaterinburg' })
+                  }}
+                />
+              </Field>
+              <Field label="Рабочий день" hint="HH:MM–HH:MM">
+                <div className="head-actions">
+                  <input
+                    style={{ width: 80 }}
+                    defaultValue={String(selected.project?.config?.workday_start || selected.schedule?.workday_start || '09:00')}
+                    onBlur={async event => {
+                      await patchProject({ workday_start: event.target.value.trim() || '09:00' })
+                    }}
+                  />
+                  <span>—</span>
+                  <input
+                    style={{ width: 80 }}
+                    defaultValue={String(selected.project?.config?.workday_end || selected.schedule?.workday_end || '18:00')}
+                    onBlur={async event => {
+                      await patchProject({ workday_end: event.target.value.trim() || '18:00' })
+                    }}
+                  />
+                </div>
+              </Field>
+              <Field label="Ставка ₽/час" hint="Для расчёта стоимости по оценке длительности">
+                <input
+                  type="number"
+                  key={`rate-${projectId}-${selected.project?.config?.hourly_rate ?? selected.commerce?.hourly_rate ?? ''}`}
+                  defaultValue={String(selected.project?.config?.hourly_rate ?? selected.commerce?.hourly_rate ?? '')}
+                  placeholder="2500"
+                  onBlur={async event => {
+                    const raw = event.target.value.trim()
+                    await patchProject({ hourly_rate: raw === '' ? null : Number(raw) })
+                  }}
+                />
+              </Field>
+              <div className="toggle-box" style={{ gridColumn: '1 / -1' }}>
+                <Toggle
+                  label="Согласовывать стоимость с заказчиком перед Cursor"
+                  checked={Boolean(selected.project?.config?.cost_requires_customer_approval ?? selected.commerce?.cost_requires_customer_approval ?? selected.schedule?.cost_requires_customer_approval)}
+                  onChange={async checked => {
+                    await patchProject({ cost_requires_customer_approval: checked })
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        })()}
         {selected.pm_phase && <div className="intake-box">
           <strong>PM state · {selected.pm_phase}</strong>
           <small>{selected.task_type || 'task'} · приоритет {selected.priority || 'normal'} · проект {selected.project_id || 'не указан'}</small>
@@ -1521,89 +1598,6 @@ function EmployeeScreen() {
                     : ' · можно принимать QA'}
                 </small>
               )}
-            </div>
-          )}
-          {selected.project && <Field label="Автономия проекта" hint="LEVEL_1 — только небольшие однозначные bug fixes без подтверждения.">
-            <select value={selected.project.autonomy_level} onChange={async event => {
-              const autonomy_level = event.target.value as 'LEVEL_0' | 'LEVEL_1' | 'LEVEL_2' | 'LEVEL_3'
-              await api.pm.updateProject(selected.project!.project_id, { autonomy_level })
-              setSelected(await api.agents.workItem(agentId, selected.id))
-            }}>
-              <option value="LEVEL_0">LEVEL_0 · всё с подтверждением</option>
-              <option value="LEVEL_1">LEVEL_1 · только малые bug fixes</option>
-              <option value="LEVEL_2">LEVEL_2 · согласованный scope</option>
-              <option value="LEVEL_3">LEVEL_3 · обычная разработка автономно</option>
-            </select>
-          </Field>}
-          {selected.project && (
-            <div className="grid-2" style={{ marginTop: 8, gap: 8 }}>
-              <Field label="Часовой пояс проекта" hint="Для рабочих часов Cursor. UTC+5 = Asia/Yekaterinburg.">
-                <input
-                  defaultValue={String(selected.project.config?.timezone || selected.schedule?.timezone || 'Asia/Yekaterinburg')}
-                  onBlur={async event => {
-                    const timezone = event.target.value.trim() || 'Asia/Yekaterinburg'
-                    await api.pm.updateProject(selected.project!.project_id, {
-                      autonomy_level: selected.project!.autonomy_level,
-                      config: { timezone },
-                    })
-                    setSelected(await api.agents.workItem(agentId, selected.id))
-                  }}
-                />
-              </Field>
-              <Field label="Рабочий день" hint="HH:MM–HH:MM">
-                <div className="head-actions">
-                  <input
-                    style={{ width: 80 }}
-                    defaultValue={String(selected.project.config?.workday_start || selected.schedule?.workday_start || '09:00')}
-                    onBlur={async event => {
-                      await api.pm.updateProject(selected.project!.project_id, {
-                        autonomy_level: selected.project!.autonomy_level,
-                        config: { workday_start: event.target.value.trim() || '09:00' },
-                      })
-                      setSelected(await api.agents.workItem(agentId, selected.id))
-                    }}
-                  />
-                  <span>—</span>
-                  <input
-                    style={{ width: 80 }}
-                    defaultValue={String(selected.project.config?.workday_end || selected.schedule?.workday_end || '18:00')}
-                    onBlur={async event => {
-                      await api.pm.updateProject(selected.project!.project_id, {
-                        autonomy_level: selected.project!.autonomy_level,
-                        config: { workday_end: event.target.value.trim() || '18:00' },
-                      })
-                      setSelected(await api.agents.workItem(agentId, selected.id))
-                    }}
-                  />
-                </div>
-              </Field>
-              <Field label="Ставка ₽/час" hint="Для расчёта стоимости по оценке длительности.">
-                <input
-                  type="number"
-                  defaultValue={String(selected.project.config?.hourly_rate ?? selected.commerce?.hourly_rate ?? '')}
-                  onBlur={async event => {
-                    const raw = event.target.value.trim()
-                    await api.pm.updateProject(selected.project!.project_id, {
-                      autonomy_level: selected.project!.autonomy_level,
-                      config: { hourly_rate: raw === '' ? null : Number(raw) },
-                    })
-                    setSelected(await api.agents.workItem(agentId, selected.id))
-                  }}
-                />
-              </Field>
-              <div className="toggle-box" style={{ gridColumn: '1 / -1' }}>
-                <Toggle
-                  label="Согласовывать стоимость с заказчиком перед Cursor"
-                  checked={Boolean(selected.project.config?.cost_requires_customer_approval ?? selected.commerce?.cost_requires_customer_approval)}
-                  onChange={async checked => {
-                    await api.pm.updateProject(selected.project!.project_id, {
-                      autonomy_level: selected.project!.autonomy_level,
-                      config: { cost_requires_customer_approval: checked },
-                    })
-                    setSelected(await api.agents.workItem(agentId, selected.id))
-                  }}
-                />
-              </div>
             </div>
           )}
           {(selected.requirements || []).length > 0 && <p><strong>Требования:</strong> {(selected.requirements || []).join(' · ')}</p>}
@@ -1925,16 +1919,19 @@ function CustomerForm({
           <input style={{ marginTop: 8 }} value={form.cursor_workspace || ''} onChange={e => patch({ cursor_workspace: e.target.value })} placeholder="Или путь вручную: D:\projects\…"/>
         </Field>
         <Field label="Project ID" hint="Slug для PM / memory"><input value={form.project_id || ''} onChange={e => patch({ project_id: e.target.value })} placeholder="lavve"/></Field>
-        <Field label="Заметки" wide><textarea rows={3} value={form.notes || ''} onChange={e => patch({ notes: e.target.value })} placeholder="Контакты, договорённости, нюансы"/></Field>
 
-        <Field label="Ставка ₽/час" hint={loadingProject ? 'Загрузка настроек проекта…' : 'Для расчёта стоимости по оценке длительности'}>
+        <div className="form-section wide">
+          <strong>Стоимость и рабочие часы</strong>
+          <small>Ставка для расчёта по оценке длительности; переключатель — нужно ли согласовывать цену с заказчиком перед Cursor.</small>
+        </div>
+        <Field label="Ставка ₽/час" hint={loadingProject ? 'Загрузка настроек проекта…' : 'Например 2500'}>
           <input
             type="number"
             min={0}
             step={1}
             value={hourlyRate}
             onChange={e => setHourlyRate(e.target.value)}
-            placeholder="например 2500"
+            placeholder="2500"
           />
         </Field>
         <Field label="Часовой пояс" hint="UTC+5 = Asia/Yekaterinburg">
@@ -1954,6 +1951,8 @@ function CustomerForm({
           />
         </div>
         <div className="toggle-box wide"><Toggle label="Заказчик по умолчанию для выбранного сотрудника" checked={Boolean(form.is_default)} onChange={v => patch({ is_default: v })}/></div>
+
+        <Field label="Заметки" wide><textarea rows={3} value={form.notes || ''} onChange={e => patch({ notes: e.target.value })} placeholder="Контакты, договорённости, нюансы"/></Field>
       </div>
       {(form.name || form.project_id || form.cursor_workspace) && (
         <section className="customer-prompt-preview">

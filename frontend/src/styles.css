@@ -228,6 +228,9 @@ select { color-scheme: dark; }
 option { background: #111620; color: #e7eaf2; }
 .field { display: block; color: #b7becd; font-size: 11px; font-weight: 600; }.field > span { display: block; margin-bottom: 7px; }.field small { display: block; color: #687185; margin-top: 5px; font-size: 9px; font-weight: 400; }.field.wide, .wide { grid-column: 1 / -1; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.form-section { grid-column: 1 / -1; padding: 12px 0 4px; border-top: 1px solid #222835; }
+.form-section strong { display: block; color: #e8ebf0; font-size: 12px; margin-bottom: 4px; }
+.form-section small { display: block; color: #687185; font-size: 10px; line-height: 1.45; }
 .check-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }.check { height: 36px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid #282e3c; border-radius: 7px; background: #121720; color: #9fa7b7; font-size: 10px; text-transform: capitalize; }.check input { width: 14px; height: 14px; accent-color: var(--accent); }
 .toggle-box { min-height: 48px; display: flex; align-items: center; padding: 0 13px; background: #111620; border: 1px solid #282e3b; border-radius: 8px; }.toggle-row { width: 100%; display: flex; align-items: center; justify-content: space-between; color: #b6bdcb; font-size: 11px; }
 .toggle { width: 35px; height: 20px; padding: 2px; border: 0; border-radius: 99px; background: #303746; transition: .2s; }.toggle i { display: block; width: 16px; height: 16px; background: #a2a9b8; border-radius: 50%; transition: .2s; }.toggle.on { background: var(--accent-2); }.toggle.on i { transform: translateX(15px); background: white; }
