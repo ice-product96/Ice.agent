@@ -1591,21 +1591,19 @@ function EmployeeScreen() {
                   }}
                 />
               </Field>
-              <Field label="Согласовывать стоимость с заказчиком" hint="Если да — до Cursor нужно pm_record_decision по стоимости.">
-                <select
-                  value={String(Boolean(selected.project.config?.cost_requires_customer_approval ?? selected.commerce?.cost_requires_customer_approval))}
-                  onChange={async event => {
+              <div className="toggle-box" style={{ gridColumn: '1 / -1' }}>
+                <Toggle
+                  label="Согласовывать стоимость с заказчиком перед Cursor"
+                  checked={Boolean(selected.project.config?.cost_requires_customer_approval ?? selected.commerce?.cost_requires_customer_approval)}
+                  onChange={async checked => {
                     await api.pm.updateProject(selected.project!.project_id, {
                       autonomy_level: selected.project!.autonomy_level,
-                      config: { cost_requires_customer_approval: event.target.value === 'true' },
+                      config: { cost_requires_customer_approval: checked },
                     })
                     setSelected(await api.agents.workItem(agentId, selected.id))
                   }}
-                >
-                  <option value="false">Нет</option>
-                  <option value="true">Да</option>
-                </select>
-              </Field>
+                />
+              </div>
             </div>
           )}
           {(selected.requirements || []).length > 0 && <p><strong>Требования:</strong> {(selected.requirements || []).join(' · ')}</p>}
@@ -1820,20 +1818,61 @@ function CustomerForm({
   agents: Agent[]
   projects: CursorProjectOption[]
   onClose: () => void
-  onSave: (value: Partial<Customer>) => Promise<void>
+  onSave: (value: Partial<Customer> & {
+    hourly_rate?: number | null
+    cost_requires_customer_approval?: boolean
+    timezone?: string
+    workday_start?: string
+    workday_end?: string
+  }) => Promise<void>
   refreshingProjects?: boolean
   onRefreshProjects?: () => void
 }) {
   const [form, setForm] = useState<Partial<Customer>>(value)
+  const [hourlyRate, setHourlyRate] = useState('')
+  const [costApproval, setCostApproval] = useState(true)
+  const [timezone, setTimezone] = useState('Asia/Yekaterinburg')
+  const [workdayStart, setWorkdayStart] = useState('09:00')
+  const [workdayEnd, setWorkdayEnd] = useState('18:00')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [loadingProject, setLoadingProject] = useState(false)
   const patch = (next: Partial<Customer>) => setForm(current => ({ ...current, ...next }))
   const selectedWorkspace = form.cursor_workspace || ''
-  return <Modal title={form.id ? 'Заказчик' : 'Новый заказчик'} subtitle="Имя заказчика и проект Cursor MCP. Из этой карточки собирается блок промпта." onClose={onClose}>
+
+  useEffect(() => {
+    const projectId = (form.project_id || '').trim()
+    if (!projectId) return
+    let cancelled = false
+    setLoadingProject(true)
+    void api.pm.project(projectId).then(project => {
+      if (cancelled) return
+      const cfg = project.config || {}
+      setHourlyRate(cfg.hourly_rate != null && cfg.hourly_rate !== '' ? String(cfg.hourly_rate) : '')
+      setCostApproval(Boolean(cfg.cost_requires_customer_approval ?? project.commerce?.cost_requires_customer_approval ?? true))
+      setTimezone(String(cfg.timezone || project.schedule?.timezone || 'Asia/Yekaterinburg'))
+      setWorkdayStart(String(cfg.workday_start || project.schedule?.workday_start || '09:00'))
+      setWorkdayEnd(String(cfg.workday_end || project.schedule?.workday_end || '18:00'))
+    }).catch(() => {
+      /* new project — keep defaults */
+    }).finally(() => {
+      if (!cancelled) setLoadingProject(false)
+    })
+    return () => { cancelled = true }
+  }, [form.project_id])
+
+  return <Modal title={form.id ? 'Заказчик' : 'Новый заказчик'} subtitle="Имя заказчика, проект Cursor MCP, ставка и согласование стоимости." onClose={onClose}>
     <form onSubmit={async event => {
       event.preventDefault(); setBusy(true); setError('')
       try {
-        await onSave(form)
+        await onSave({
+          ...form,
+          hourly_rate: hourlyRate.trim() === '' ? null : Number(hourlyRate),
+          cost_requires_customer_approval: costApproval,
+          timezone,
+          workday_start: workdayStart,
+          workday_end: workdayEnd,
+        })
         onClose()
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Не удалось сохранить')
@@ -1887,6 +1926,33 @@ function CustomerForm({
         </Field>
         <Field label="Project ID" hint="Slug для PM / memory"><input value={form.project_id || ''} onChange={e => patch({ project_id: e.target.value })} placeholder="lavve"/></Field>
         <Field label="Заметки" wide><textarea rows={3} value={form.notes || ''} onChange={e => patch({ notes: e.target.value })} placeholder="Контакты, договорённости, нюансы"/></Field>
+
+        <Field label="Ставка ₽/час" hint={loadingProject ? 'Загрузка настроек проекта…' : 'Для расчёта стоимости по оценке длительности'}>
+          <input
+            type="number"
+            min={0}
+            step={1}
+            value={hourlyRate}
+            onChange={e => setHourlyRate(e.target.value)}
+            placeholder="например 2500"
+          />
+        </Field>
+        <Field label="Часовой пояс" hint="UTC+5 = Asia/Yekaterinburg">
+          <input value={timezone} onChange={e => setTimezone(e.target.value)} placeholder="Asia/Yekaterinburg"/>
+        </Field>
+        <Field label="Рабочий день с" hint="HH:MM">
+          <input value={workdayStart} onChange={e => setWorkdayStart(e.target.value)} placeholder="09:00"/>
+        </Field>
+        <Field label="Рабочий день до" hint="HH:MM">
+          <input value={workdayEnd} onChange={e => setWorkdayEnd(e.target.value)} placeholder="18:00"/>
+        </Field>
+        <div className="toggle-box wide">
+          <Toggle
+            label="Согласовывать стоимость с заказчиком перед Cursor"
+            checked={costApproval}
+            onChange={setCostApproval}
+          />
+        </div>
         <div className="toggle-box wide"><Toggle label="Заказчик по умолчанию для выбранного сотрудника" checked={Boolean(form.is_default)} onChange={v => patch({ is_default: v })}/></div>
       </div>
       {(form.name || form.project_id || form.cursor_workspace) && (
@@ -1897,6 +1963,8 @@ function CustomerForm({
             `Заказчик: ${form.name || '—'} (id=${form.id || '…'}).`,
             form.project_id ? `Проект разработки: ${form.project_id}.` : null,
             form.cursor_workspace ? `Проект Cursor MCP: ${form.cursor_workspace}.` : null,
+            hourlyRate ? `Ставка: ${hourlyRate} ₽/час.` : null,
+            costApproval ? 'Стоимость работ согласовывать с заказчиком.' : 'Стоимость можно не согласовывать с заказчиком.',
             'Представляйся и веди работу от имени этого заказчика и этого проекта.',
           ].filter(Boolean).join('\n')}</pre>
         </section>
@@ -1919,7 +1987,7 @@ function CustomersScreen() {
     {(loaded.error || agents.error || projects.error) && <Alert message={loaded.error || agents.error || projects.error || ''}/>}
     <SectionHead
       title={`${items.length} заказчиков`}
-      text="Укажите заказчика и выберите доступный проект Cursor MCP. Промпт сотрудника подставит их сам."
+      text="Укажите заказчика, проект Cursor, ставку ₽/час и нужно ли согласовывать стоимость."
       action={<button className="primary" onClick={() => setEditing({ name: '', id: '', notes: '', project_id: '', cursor_workspace: '', is_default: true, agent_id: filterAgent || undefined })}><Plus size={17}/>Новый заказчик</button>}
     />
     <form className="filter-bar" onSubmit={e => e.preventDefault()}>
@@ -1967,6 +2035,19 @@ function CustomersScreen() {
           await api.customers.update(String(editing.id), payload)
         } else {
           await api.customers.create(payload)
+        }
+        const projectId = (value.project_id || value.id || '').trim()
+        if (projectId) {
+          await api.pm.updateProject(projectId, {
+            config: {
+              hourly_rate: value.hourly_rate ?? null,
+              cost_requires_customer_approval: Boolean(value.cost_requires_customer_approval),
+              timezone: value.timezone || 'Asia/Yekaterinburg',
+              workday_start: value.workday_start || '09:00',
+              workday_end: value.workday_end || '18:00',
+              currency: 'RUB',
+            },
+          })
         }
         await loaded.refresh()
       }}
