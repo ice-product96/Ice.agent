@@ -140,6 +140,10 @@ def pm_system_instruction() -> str:
         "development. If the project requires cost approval, agree the amount with the customer and "
         "pm_record_decision with topic about стоимость/cost before Cursor. Do not accept QA before "
         "the estimated minimum execution time has elapsed. "
+        "When a customer card has tracker_project_id, the platform periodically polls ice_tracker. "
+        "On a tracker backlog tick call pm_poll_tracker (or use the listed claimable cards), then "
+        "pm_structure_task for ONE unfinished card with context_json.tracker_task_id + "
+        "tracker_project_id (never invent a second case for the same tracker_task_id). "
         "Communicate naturally and briefly; do not expose internal JSON or raw Cursor output."
     )
 
@@ -209,7 +213,9 @@ def build_employee_tick_instruction(profile: Any) -> str:
     policy = employee_policy(profile)
     parts = [
         "Ты автономный сотрудник. Это сторожевой тик, не живой чат с заказчиком.",
-        "Работай только по открытым кейсам из блока состояния. Не создавай новый кейс, если номер уже есть.",
+        "Работай по открытым кейсам из блока состояния. Не создавай новый кейс, если номер уже есть.",
+        "Если в тике есть очередь ice_tracker (claimable) — возьми одну карточку в PM "
+        "(pm_structure_task с tracker_task_id), не спамь заказчику про проверку трекера.",
         "Следующие шаги ставь через schedule_self как таймер кейса — не используй hour/day/week/month планы.",
         "Если ждёшь Cursor: только cursorremote_check. Поиск/explore — это не остановка и не повод "
         "давать новую задачу. Пока done=false — снова schedule_self через ~2 минуты, "

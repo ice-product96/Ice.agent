@@ -787,6 +787,28 @@ class AgentRuntime:
                     item = await get_work_item(
                         db, (context or {}).get("work_item_id")
                     )
+                # Deduplicate by ice_tracker card id when reclaiming from backlog.
+                tracker_task_id = str(
+                    (context_json or {}).get("tracker_task_id")
+                    or (context_json or {}).get("card_id")
+                    or ""
+                ).strip()
+                if item is None and tracker_task_id:
+                    from .tracker_poll import find_work_item_for_tracker_task
+
+                    existing_tracker = await find_work_item_for_tracker_task(
+                        db, agent.id, tracker_task_id
+                    )
+                    if existing_tracker is not None:
+                        item = existing_tracker
+                        if context is not None:
+                            context["work_item_id"] = item.id
+                        return {
+                            "ok": True,
+                            "duplicate": True,
+                            "tracker_task_id": tracker_task_id,
+                            "task": work_item_json(item),
+                        }
                 if item is None:
                     try:
                         item = await create_work_item(
@@ -888,6 +910,23 @@ class AgentRuntime:
                     meta = dict(item.metadata_json or {})
                     pm_meta = dict(meta.get("pm") or {})
                     pm_meta["tracker_project_id"] = tracker_project_id
+                    meta["pm"] = pm_meta
+                    item.metadata_json = meta
+                # Persist ice_tracker card linkage for periodic poll dedupe.
+                ctx_tracker_task = str(
+                    normalized_task_context.get("tracker_task_id")
+                    or normalized_task_context.get("card_id")
+                    or ""
+                ).strip()
+                if ctx_tracker_task:
+                    normalized_task_context["tracker_task_id"] = ctx_tracker_task
+                    meta = dict(item.metadata_json or {})
+                    pm_meta = dict(meta.get("pm") or {})
+                    pm_meta["tracker_task_id"] = ctx_tracker_task
+                    if normalized_task_context.get("tracker_project_id"):
+                        pm_meta["tracker_project_id"] = normalized_task_context[
+                            "tracker_project_id"
+                        ]
                     meta["pm"] = pm_meta
                     item.metadata_json = meta
                 contract = TaskContract(
@@ -1346,6 +1385,18 @@ class AgentRuntime:
             registry.register(pm_get_task, "pm_get_task")
             registry.register(pm_record_decision, "pm_record_decision")
             registry.register(pm_transition_task, "pm_transition_task")
+
+            async def pm_poll_tracker() -> dict[str, Any]:
+                """Poll ice_tracker for unfinished cards not yet bound to a WorkItem."""
+                from .tracker_poll import poll_tracker_backlog
+
+                return await poll_tracker_backlog(db, self.mcp, agent.id)
+
+            registry.register(
+                pm_poll_tracker,
+                "pm_poll_tracker",
+                "List unfinished ice_tracker cards for bound projects vs existing PM cases.",
+            )
         cursor_state = {"finished": False, "prompt_sent": False}
         if self.mcp and mcp_server_names:
             await self.mcp.register_tools(registry, mcp_server_names)
@@ -2543,12 +2594,34 @@ class AgentRuntime:
             extra = extra or {}
             pending = await watchdog_items(db, agent.id)
             watchdog_reason = reason in {"heartbeat", "employee_heartbeat"}
-            if not extra.get("work_item_id") and not pending and not force and watchdog_reason:
+            tracker_backlog: dict[str, Any] | None = None
+            if watchdog_reason or force:
+                from .employee_policy import pm_mode_enabled
+                from .tracker_poll import list_tracker_bindings, poll_tracker_backlog
+
+                if pm_mode_enabled(profile):
+                    bindings = await list_tracker_bindings(db, agent.id)
+                    if bindings:
+                        tracker_backlog = await poll_tracker_backlog(
+                            db, self.mcp, agent.id
+                        )
+            claimable_count = int((tracker_backlog or {}).get("count_claimable") or 0)
+            if (
+                not extra.get("work_item_id")
+                and not pending
+                and not force
+                and watchdog_reason
+                and claimable_count <= 0
+            ):
                 return {
                     "ok": True,
                     "skipped": True,
                     "reason": "no_open_work",
                     "watchdog": {"count": 0, "ids": []},
+                    "tracker": {
+                        "enabled": bool((tracker_backlog or {}).get("enabled")),
+                        "claimable": 0,
+                    },
                 }
             await self.employee.mark_tick(db, profile)
             origin = collect_origin_from_jobs(
@@ -2602,6 +2675,12 @@ class AgentRuntime:
                 message = build_watchdog_instruction(pending)
             else:
                 message = build_employee_tick_instruction(profile)
+            if tracker_backlog and int(tracker_backlog.get("count_claimable") or 0) > 0:
+                from .tracker_poll import build_tracker_poll_instruction
+
+                tracker_msg = build_tracker_poll_instruction(tracker_backlog)
+                if tracker_msg:
+                    message = f"{tracker_msg}\n\n{message}"
             focus = await get_work_item(db, context.get("work_item_id"))
             if focus is not None and focus.status == "collecting" and focus.wait_until:
                 from .work_items import _as_aware
@@ -2639,6 +2718,13 @@ class AgentRuntime:
                 "reply_phone": context.get("reply_phone") or context.get("phone"),
                 "reply_chat_id": origin_chat_id(context),
                 "watchdog": {"count": len(pending), "ids": [item.id for item in pending]},
+                "tracker": {
+                    "enabled": bool((tracker_backlog or {}).get("enabled")),
+                    "claimable": int((tracker_backlog or {}).get("count_claimable") or 0),
+                    "already_tracked": int(
+                        (tracker_backlog or {}).get("count_already_tracked") or 0
+                    ),
+                },
             }
 
     async def run(

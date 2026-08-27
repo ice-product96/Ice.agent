@@ -70,7 +70,7 @@ def slugify(value: str, *, fallback: str = "customer") -> str:
     return (mapped or fallback)[:120]
 
 
-def customer_prompt_block(customer: Customer | None) -> str:
+def customer_prompt_block(customer: Customer | None, *, tracker: dict[str, Any] | None = None) -> str:
     if customer is None:
         return ""
     lines = [
@@ -81,6 +81,15 @@ def customer_prompt_block(customer: Customer | None) -> str:
         lines.append(f"Проект разработки: {customer.project_id.strip()}.")
     if (customer.cursor_workspace or "").strip():
         lines.append(f"Проект Cursor MCP: {customer.cursor_workspace.strip()}.")
+    tracker = tracker or {}
+    tracker_id = str(tracker.get("tracker_project_id") or "").strip()
+    if tracker_id:
+        lines.append(f"ice_tracker project_id: {tracker_id}.")
+        if tracker.get("tracker_poll_enabled", True):
+            lines.append(
+                "Периодически проверяй незакрытые задачи этого трекера (pm_poll_tracker) "
+                "и бери новые в работу через pm_structure_task с tracker_task_id."
+            )
     notes = (customer.notes or "").strip()
     if notes:
         lines.append("Контакты и договорённости заказчика:")
@@ -94,7 +103,14 @@ def customer_prompt_block(customer: Customer | None) -> str:
     return "\n".join(lines)
 
 
-def customer_json(customer: Customer) -> dict[str, Any]:
+async def customer_json(customer: Customer, db: AsyncSession | None = None) -> dict[str, Any]:
+    tracker = {"tracker_project_id": "", "tracker_poll_enabled": False}
+    if db is not None and (customer.project_id or "").strip():
+        from .tracker_poll import tracker_settings
+
+        state = await db.get(ProjectState, customer.project_id.strip())
+        if state is not None:
+            tracker = tracker_settings(state.config)
     return {
         "id": customer.id,
         "name": customer.name,
@@ -104,7 +120,9 @@ def customer_json(customer: Customer) -> dict[str, Any]:
         "cursor_workspace": customer.cursor_workspace or "",
         "cursor_window_id": customer.cursor_window_id,
         "is_default": bool(customer.is_default),
-        "prompt_block": customer_prompt_block(customer),
+        "tracker_project_id": tracker.get("tracker_project_id") or "",
+        "tracker_poll_enabled": bool(tracker.get("tracker_poll_enabled")),
+        "prompt_block": customer_prompt_block(customer, tracker=tracker),
         "created_at": customer.created_at.isoformat() if customer.created_at else None,
         "updated_at": customer.updated_at.isoformat() if customer.updated_at else None,
     }
@@ -382,6 +400,8 @@ async def apply_customer_defaults(
     customer: Customer,
     *,
     make_default: bool,
+    tracker_project_id: str | None = None,
+    tracker_poll_enabled: bool | None = None,
 ) -> None:
     if customer.agent_id is not None and make_default:
         await db.execute(
@@ -397,6 +417,7 @@ async def apply_customer_defaults(
     await sync_agent_memory_defaults(db, customer)
     if customer.project_id:
         from .pm_state import get_or_create_project_state
+        from .tracker_poll import UUID_RE
 
         state = await get_or_create_project_state(db, customer.project_id)
         config = dict(state.config or {})
@@ -408,6 +429,14 @@ async def apply_customer_defaults(
                 "cursor_window_id": customer.cursor_window_id,
             }
         )
+        if tracker_project_id is not None:
+            tid = str(tracker_project_id or "").strip()
+            if tid and UUID_RE.match(tid):
+                config["tracker_project_id"] = tid
+            elif tid == "":
+                config.pop("tracker_project_id", None)
+        if tracker_poll_enabled is not None:
+            config["tracker_poll_enabled"] = bool(tracker_poll_enabled)
         state.config = config
 
 

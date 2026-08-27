@@ -154,6 +154,8 @@ export const api = {
       cursor_workspace?: string
       cursor_window_id?: string | null
       is_default?: boolean
+      tracker_project_id?: string | null
+      tracker_poll_enabled?: boolean | null
     }) => request<Customer>('/customers', { method: 'POST', ...body(data) }),
     update: (id: string, data: {
       id?: string
@@ -164,6 +166,8 @@ export const api = {
       cursor_workspace?: string
       cursor_window_id?: string | null
       is_default?: boolean
+      tracker_project_id?: string | null
+      tracker_poll_enabled?: boolean | null
     }) => request<Customer>(`/customers/${encodeURIComponent(id)}`, { method: 'PATCH', ...body(data) }),
     remove: (id: string) => request<void>(`/customers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   },

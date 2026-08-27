@@ -574,6 +574,8 @@ export interface Customer {
   cursor_workspace?: string
   cursor_window_id?: string | null
   is_default?: boolean
+  tracker_project_id?: string
+  tracker_poll_enabled?: boolean
   prompt_block?: string
   created_at?: string | null
   updated_at?: string | null

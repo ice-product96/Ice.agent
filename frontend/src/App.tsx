@@ -65,6 +65,8 @@ const PM_SKILLS_TEMPLATE = `Память (Mem0):
 ice_tracker (MCP):
 - Карточки, статусы, дедлайны — только через ice_tracker
 - create_task принимает name, а не title.
+- Если у заказчика задан tracker_project_id — на heartbeat платформа сама смотрит незакрытые карточки.
+- Новую карточку без кейса бери через pm_structure_task с context_json.tracker_task_id (+ tracker_project_id).
 - Не дублируй задачи в память, если они уже в трекере
 
 playwright (MCP):
@@ -1942,6 +1944,8 @@ function CustomerForm({
     timezone?: string
     workday_start?: string
     workday_end?: string
+    tracker_project_id?: string
+    tracker_poll_enabled?: boolean
   }) => Promise<void>
   refreshingProjects?: boolean
   onRefreshProjects?: () => void
@@ -1952,6 +1956,8 @@ function CustomerForm({
   const [timezone, setTimezone] = useState('Asia/Yekaterinburg')
   const [workdayStart, setWorkdayStart] = useState('09:00')
   const [workdayEnd, setWorkdayEnd] = useState('18:00')
+  const [trackerProjectId, setTrackerProjectId] = useState('')
+  const [trackerPollEnabled, setTrackerPollEnabled] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [loadingProject, setLoadingProject] = useState(false)
@@ -1971,15 +1977,23 @@ function CustomerForm({
       setTimezone(String(cfg.timezone || project.schedule?.timezone || 'Asia/Yekaterinburg'))
       setWorkdayStart(String(cfg.workday_start || project.schedule?.workday_start || '09:00'))
       setWorkdayEnd(String(cfg.workday_end || project.schedule?.workday_end || '18:00'))
+      setTrackerProjectId(String(cfg.tracker_project_id || value.tracker_project_id || ''))
+      setTrackerPollEnabled(
+        cfg.tracker_poll_enabled === undefined || cfg.tracker_poll_enabled === null
+          ? Boolean(cfg.tracker_project_id || value.tracker_project_id)
+          : Boolean(cfg.tracker_poll_enabled),
+      )
     }).catch(() => {
       /* new project — keep defaults */
+      setTrackerProjectId(String(value.tracker_project_id || ''))
+      setTrackerPollEnabled(value.tracker_poll_enabled !== false)
     }).finally(() => {
       if (!cancelled) setLoadingProject(false)
     })
     return () => { cancelled = true }
   }, [form.project_id])
 
-  return <Modal title={form.id ? 'Заказчик' : 'Новый заказчик'} subtitle="Имя заказчика, проект Cursor MCP, ставка и согласование стоимости." onClose={onClose}>
+  return <Modal title={form.id ? 'Заказчик' : 'Новый заказчик'} subtitle="Имя заказчика, проект Cursor MCP, ice_tracker и ставка." onClose={onClose}>
     <form onSubmit={async event => {
       event.preventDefault(); setBusy(true); setError('')
       try {
@@ -1990,6 +2004,8 @@ function CustomerForm({
           timezone,
           workday_start: workdayStart,
           workday_end: workdayEnd,
+          tracker_project_id: trackerProjectId.trim(),
+          tracker_poll_enabled: trackerPollEnabled,
         })
         onClose()
       } catch (err) {
@@ -2043,6 +2059,20 @@ function CustomerForm({
           <input style={{ marginTop: 8 }} value={form.cursor_workspace || ''} onChange={e => patch({ cursor_workspace: e.target.value })} placeholder="Или путь вручную: D:\projects\…"/>
         </Field>
         <Field label="Project ID" hint="Slug для PM / memory"><input value={form.project_id || ''} onChange={e => patch({ project_id: e.target.value })} placeholder="lavve"/></Field>
+        <Field label="ice_tracker project_id" hint="UUID проекта в ice_tracker (не slug). Пусто = не опрашивать.">
+          <input
+            value={trackerProjectId}
+            onChange={e => setTrackerProjectId(e.target.value)}
+            placeholder="a61ed32a-1846-4ff1-97d9-9c0864c2a32d"
+          />
+        </Field>
+        <div className="toggle-box wide">
+          <Toggle
+            label="Периодически проверять незакрытые задачи трекера и брать в работу"
+            checked={trackerPollEnabled}
+            onChange={setTrackerPollEnabled}
+          />
+        </div>
 
         <div className="form-section wide">
           <strong>Стоимость и рабочие часы</strong>
@@ -2086,6 +2116,10 @@ function CustomerForm({
             `Заказчик: ${form.name || '—'} (id=${form.id || '…'}).`,
             form.project_id ? `Проект разработки: ${form.project_id}.` : null,
             form.cursor_workspace ? `Проект Cursor MCP: ${form.cursor_workspace}.` : null,
+            trackerProjectId ? `ice_tracker project_id: ${trackerProjectId}.` : null,
+            trackerProjectId && trackerPollEnabled
+              ? 'Периодически проверяй незакрытые задачи этого трекера и бери новые в работу.'
+              : null,
             hourlyRate ? `Ставка: ${hourlyRate} ₽/час.` : null,
             costApproval ? 'Стоимость работ согласовывать с заказчиком.' : 'Стоимость можно не согласовывать с заказчиком.',
             'Представляйся и веди работу от имени этого заказчика и этого проекта.',
@@ -2129,7 +2163,7 @@ function CustomersScreen() {
           <span><Briefcase size={13}/>{agentName(item.agent_id)}</span>
           <span><ServerCog size={13}/>{item.project_id || '—'}</span>
         </div>
-        <div className="entity-meta"><span>{item.cursor_workspace || 'Cursor workspace не задан'}</span><span>id={item.id}</span><span>Ставка и согласование — в карточке</span></div>
+        <div className="entity-meta"><span>{item.cursor_workspace || 'Cursor workspace не задан'}</span><span>id={item.id}</span><span>{item.tracker_project_id ? (item.tracker_poll_enabled === false ? 'трекер выкл.' : 'трекер опрос') : 'без трекера'}</span></div>
         {item.prompt_block && <pre className="customer-prompt-inline">{item.prompt_block}</pre>}
         <div className="card-actions">
           <button className="secondary" onClick={() => setEditing(item)}>Изменить</button>
@@ -2153,6 +2187,8 @@ function CustomersScreen() {
           cursor_workspace: value.cursor_workspace || '',
           cursor_window_id: value.cursor_window_id || null,
           is_default: Boolean(value.is_default),
+          tracker_project_id: value.tracker_project_id || '',
+          tracker_poll_enabled: value.tracker_poll_enabled !== false,
         }
         if (editing.id && (loaded.data || []).some(item => item.id === editing.id)) {
           await api.customers.update(String(editing.id), payload)
@@ -2169,6 +2205,8 @@ function CustomersScreen() {
               workday_start: value.workday_start || '09:00',
               workday_end: value.workday_end || '18:00',
               currency: 'RUB',
+              tracker_project_id: value.tracker_project_id || '',
+              tracker_poll_enabled: value.tracker_poll_enabled !== false,
             },
           })
         }

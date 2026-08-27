@@ -771,6 +771,8 @@ class CustomerBody(BaseModel):
     cursor_workspace: str = ""
     cursor_window_id: str | None = None
     is_default: bool = False
+    tracker_project_id: str | None = None
+    tracker_poll_enabled: bool | None = None
 
 
 @router.get("/customers", dependencies=auth)
@@ -784,7 +786,7 @@ async def list_customers(
     if agent_id is not None:
         query = query.where(Customer.agent_id == agent_id)
     rows = (await db.scalars(query)).all()
-    return [customer_json(row) for row in rows]
+    return [await customer_json(row, db) for row in rows]
 
 
 @router.get("/cursor/projects", dependencies=auth)
@@ -865,10 +867,16 @@ async def create_customer(
             .where(Customer.agent_id == agent_id, Customer.id != customer.id)
         )
         make_default = int(others or 0) == 0
-    await apply_customer_defaults(db, customer, make_default=make_default)
+    await apply_customer_defaults(
+        db,
+        customer,
+        make_default=make_default,
+        tracker_project_id=payload.tracker_project_id,
+        tracker_poll_enabled=payload.tracker_poll_enabled,
+    )
     await db.commit()
     await db.refresh(customer)
-    return customer_json(customer)
+    return await customer_json(customer, db)
 
 
 @router.patch("/customers/{customer_id}", dependencies=auth)
@@ -895,10 +903,16 @@ async def update_customer(
     customer.project_id = (payload.project_id or "").strip() or customer.id
     customer.cursor_workspace = (payload.cursor_workspace or "").strip()
     customer.cursor_window_id = payload.cursor_window_id or None
-    await apply_customer_defaults(db, customer, make_default=payload.is_default)
+    await apply_customer_defaults(
+        db,
+        customer,
+        make_default=payload.is_default,
+        tracker_project_id=payload.tracker_project_id,
+        tracker_poll_enabled=payload.tracker_poll_enabled,
+    )
     await db.commit()
     await db.refresh(customer)
-    return customer_json(customer)
+    return await customer_json(customer, db)
 
 
 @router.delete("/customers/{customer_id}", dependencies=auth, status_code=204)
@@ -974,7 +988,7 @@ async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depen
         "consultations": [consultation_json(c) for c in consults],
         "work_items": [work_item_json(item) for item in work_items],
         "work_item_counts": await counts_for_agent(db, agent.id),
-        "customers": [customer_json(row) for row in customers],
+        "customers": [await customer_json(row, db) for row in customers],
     }
 
 
