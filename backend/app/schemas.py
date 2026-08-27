@@ -300,7 +300,7 @@ class RuntimeSettingsBody(BaseModel):
     typing_chunk_size: int = Field(3800, ge=256, le=4096)
     typing_presence: bool = False
     task_workers: int = Field(1, ge=0, le=64)
-    max_tool_rounds: int = Field(8, ge=1, le=100)
+    max_tool_rounds: int = Field(8, ge=1, le=200)
     timezone: str = "UTC"
     telegram_history_limit: int = Field(100, ge=1, le=500)
     recent_context_messages: int = Field(30, ge=1, le=500)

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2907,12 +2907,15 @@ async def update_runtime_configuration(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     settings = await get_runtime_settings(db)
-    payload = RuntimeSettingsBody.model_validate(
-        {
-            **runtime_json(settings, memory_error=request.app.state.memory.last_error),
-            **await request.json(),
-        }
-    )
+    try:
+        payload = RuntimeSettingsBody.model_validate(
+            {
+                **runtime_json(settings, memory_error=request.app.state.memory.last_error),
+                **await request.json(),
+            }
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
     if payload.typing_min_seconds > payload.typing_max_seconds:
         raise HTTPException(
             status_code=422,
