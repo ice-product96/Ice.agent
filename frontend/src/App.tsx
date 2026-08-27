@@ -39,7 +39,7 @@ const nav: { id: Page; label: string; icon: Icon; group?: string }[] = [
 const title: Record<Page, [string, string]> = {
   dashboard: ['Центр управления', 'Статус рабочей области Ice.agent в реальном времени'],
   agents: ['Агенты', 'Настройка интеллекта, подключений и возможностей'],
-  employee: ['Сотрудники', 'Несколько автономных агентов — каждый со своим inbox и политикой'],
+  employee: ['Сотрудники', 'Работа и настройки раздельно: inbox/кейсы отдельно от профиля и политики'],
   customers: ['Заказчики', 'Карточка заказчика, Cursor-проект, ставка и согласование стоимости'],
   connections: ['Подключения и провайдеры', 'Управление учётными данными LLM и эндпоинтами моделей'],
   telegram: ['Аккаунты Telegram', 'Управление подключёнными пользовательскими и бот-сессиями'],
@@ -1111,6 +1111,8 @@ function EmployeeScreen() {
   const [needsLoading, setNeedsLoading] = useState(false)
   const [needsVersion, setNeedsVersion] = useState(0)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [employeeTab, setEmployeeTab] = useState<'work' | 'settings'>('work')
+  const [caseTab, setCaseTab] = useState<'overview' | 'feed' | 'project'>('overview')
   const [sections, setSections] = useState<Record<string, string>>({})
   const [historyKey, setHistoryKey] = useState('')
   const [historyItems, setHistoryItems] = useState<PromptSectionRevision[]>([])
@@ -1225,11 +1227,19 @@ function EmployeeScreen() {
     setEventsPage(1)
     setEventsFeed(null)
     setSelectedError('')
+    setCaseTab('overview')
+  }, [selectedId])
+
+  useEffect(() => {
+    if (selectedId) setEmployeeTab('work')
   }, [selectedId])
 
   useEffect(() => {
     setNeedsPage(1)
     setNeedsFeed(null)
+    setEmployeeTab('work')
+    setSelectedId('')
+    setSelected(null)
   }, [agentId])
 
   const refreshSelected = useCallback(async (id = selectedId) => {
@@ -1495,33 +1505,36 @@ function EmployeeScreen() {
       loading && !state ? <Loading/> :
       !state ? <div className="panel"><p className="transcript-empty">{error || 'Не удалось загрузить сотрудника.'}</p><button className="secondary" onClick={() => void load(agentId)}><RefreshCw size={15}/>Повторить</button></div> :
       state && <>
-      <section className="panel">
-        <SectionHead
-          title="Заказчик и проект Cursor"
-          text="Промпт сотрудника подставляет заказчика и проект из этой карточки. Список проектов — из MCP cursorremote."
-          action={<button className="secondary compact" type="button" onClick={() => window.dispatchEvent(new CustomEvent('ice:goto', { detail: 'customers' }))}>Открыть заказчиков</button>}
-        />
-        {(state.customers || []).length === 0 ? (
-          <p className="transcript-empty">Пока нет карточек. Создайте заказчика в разделе «Заказчики» и отметьте его по умолчанию для этого сотрудника.</p>
-        ) : (
-          <div className="list-panel">
-            {(state.customers || []).map(item => (
-              <div className="server-row" key={item.id}>
-                <span className="chip">{item.is_default ? 'default' : 'customer'}</span>
-                <div className="grow">
-                  <strong>{item.name}</strong>
-                  <small>{item.project_id || 'без project_id'}{item.cursor_workspace ? ` · ${item.cursor_workspace}` : ''}</small>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-        {(state.customers || []).find(item => item.is_default)?.prompt_block && (
-          <pre className="customer-prompt-inline">{(state.customers || []).find(item => item.is_default)?.prompt_block}</pre>
-        )}
-      </section>
+      <div className="employee-shell">
+        <div className="employee-tabs" role="tablist" aria-label="Разделы сотрудника">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={employeeTab === 'work'}
+            className={`employee-tab ${employeeTab === 'work' ? 'active' : ''}`}
+            onClick={() => setEmployeeTab('work')}
+          >
+            <Inbox size={15}/>
+            <span>Работа</span>
+            {(counts.actionable || 0) + openConsults.length > 0 && (
+              <span className="nav-badge">{(counts.actionable || 0) + openConsults.length}</span>
+            )}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={employeeTab === 'settings'}
+            className={`employee-tab ${employeeTab === 'settings' ? 'active' : ''}`}
+            onClick={() => setEmployeeTab('settings')}
+          >
+            <Settings size={15}/>
+            <span>Настройки</span>
+          </button>
+        </div>
+
+        {employeeTab === 'work' && <>
       <section className="panel work-inbox">
-        <SectionHead title={`Inbox · ${selectedRoster?.agent_name || state.agent_name || ''}`} text="Единица работы — кейс, не строка cron. Сторож смотрит открытые, а не пишет журнал тика."
+        <SectionHead title={`Inbox · ${selectedRoster?.agent_name || state.agent_name || ''}`} text="Единица работы — кейс. Здесь только выполнение: очередь, кейс и консультации."
           action={<div className="head-actions">
             <button className="secondary" disabled={!!busy} onClick={async () => {
               setBusy('pause')
@@ -1574,6 +1587,17 @@ function EmployeeScreen() {
           <button className="secondary compact" type="button" onClick={() => void refreshSelected()}><RefreshCw size={15}/>Повторить</button>
         </> : selected ? <>
         <SectionHead title={`Кейс #${selected.id}`} text={`${selected.status_label || selected.status} · ждёт ${selected.wait_owner || '—'}${selected.wait_until ? ` с ${new Date(selected.wait_until).toLocaleString('ru-RU')}` : ''}`}/>
+        <div className="case-tabs" role="tablist" aria-label="Разделы кейса">
+          <button type="button" role="tab" aria-selected={caseTab === 'overview'} className={`case-tab ${caseTab === 'overview' ? 'active' : ''}`} onClick={() => setCaseTab('overview')}>Обзор</button>
+          <button type="button" role="tab" aria-selected={caseTab === 'feed'} className={`case-tab ${caseTab === 'feed' ? 'active' : ''}`} onClick={() => setCaseTab('feed')}>
+            Лента{(eventsFeed?.total || selected.events?.length) ? ` · ${eventsFeed?.total || selected.events?.length}` : ''}
+          </button>
+          {(selected.project_id || selected.project) && (
+            <button type="button" role="tab" aria-selected={caseTab === 'project'} className={`case-tab ${caseTab === 'project' ? 'active' : ''}`} onClick={() => setCaseTab('project')}>Проект</button>
+          )}
+        </div>
+
+        {caseTab === 'overview' && <>
         <p className="work-goal">{selected.goal || selected.title}</p>
         <small>
           Источник {selected.chat_id || '—'}
@@ -1587,83 +1611,6 @@ function EmployeeScreen() {
           </small>
         )}
         {selected.last_error && <Alert message={selected.last_error}/>}
-        {(selected.project_id || selected.project) && (() => {
-          const projectId = selected.project?.project_id || selected.project_id || ''
-          const autonomy = selected.project?.autonomy_level || 'LEVEL_0'
-          const refresh = async () => { await refreshSelected(String(selected.id)) }
-          const patchProject = async (config: Record<string, unknown>, level = autonomy) => {
-            await api.pm.updateProject(projectId, { autonomy_level: level, config })
-            await refresh()
-          }
-          return <div className="intake-box" style={{ marginTop: 8 }}>
-            <div className="head-actions" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
-              <strong>Настройки проекта · {projectId}</strong>
-              <button className="secondary compact" type="button" onClick={() => window.dispatchEvent(new CustomEvent('ice:goto', { detail: 'customers' }))}>В «Заказчики»</button>
-            </div>
-            {selected.project && <Field label="Автономия проекта" hint="LEVEL_1 — только небольшие однозначные bug fixes без подтверждения.">
-              <select value={selected.project.autonomy_level} onChange={async event => {
-                const autonomy_level = event.target.value as 'LEVEL_0' | 'LEVEL_1' | 'LEVEL_2' | 'LEVEL_3'
-                await api.pm.updateProject(projectId, { autonomy_level })
-                await refresh()
-              }}>
-                <option value="LEVEL_0">LEVEL_0 · всё с подтверждением</option>
-                <option value="LEVEL_1">LEVEL_1 · только малые bug fixes</option>
-                <option value="LEVEL_2">LEVEL_2 · согласованный scope</option>
-                <option value="LEVEL_3">LEVEL_3 · обычная разработка автономно</option>
-              </select>
-            </Field>}
-            <div className="grid-2" style={{ marginTop: 8, gap: 8 }}>
-              <Field label="Часовой пояс проекта" hint="UTC+5 = Asia/Yekaterinburg">
-                <input
-                  defaultValue={String(selected.project?.config?.timezone || selected.schedule?.timezone || 'Asia/Yekaterinburg')}
-                  onBlur={async event => {
-                    await patchProject({ timezone: event.target.value.trim() || 'Asia/Yekaterinburg' })
-                  }}
-                />
-              </Field>
-              <Field label="Рабочий день" hint="HH:MM–HH:MM">
-                <div className="head-actions">
-                  <input
-                    style={{ width: 80 }}
-                    defaultValue={String(selected.project?.config?.workday_start || selected.schedule?.workday_start || '09:00')}
-                    onBlur={async event => {
-                      await patchProject({ workday_start: event.target.value.trim() || '09:00' })
-                    }}
-                  />
-                  <span>—</span>
-                  <input
-                    style={{ width: 80 }}
-                    defaultValue={String(selected.project?.config?.workday_end || selected.schedule?.workday_end || '18:00')}
-                    onBlur={async event => {
-                      await patchProject({ workday_end: event.target.value.trim() || '18:00' })
-                    }}
-                  />
-                </div>
-              </Field>
-              <Field label="Ставка ₽/час" hint="Для расчёта стоимости по оценке длительности">
-                <input
-                  type="number"
-                  key={`rate-${projectId}-${selected.project?.config?.hourly_rate ?? selected.commerce?.hourly_rate ?? ''}`}
-                  defaultValue={String(selected.project?.config?.hourly_rate ?? selected.commerce?.hourly_rate ?? '')}
-                  placeholder="2500"
-                  onBlur={async event => {
-                    const raw = event.target.value.trim()
-                    await patchProject({ hourly_rate: raw === '' ? null : Number(raw) })
-                  }}
-                />
-              </Field>
-              <div className="toggle-box" style={{ gridColumn: '1 / -1' }}>
-                <Toggle
-                  label="Согласовывать стоимость с заказчиком перед Cursor"
-                  checked={Boolean(selected.project?.config?.cost_requires_customer_approval ?? selected.commerce?.cost_requires_customer_approval ?? selected.schedule?.cost_requires_customer_approval)}
-                  onChange={async checked => {
-                    await patchProject({ cost_requires_customer_approval: checked })
-                  }}
-                />
-              </div>
-            </div>
-          </div>
-        })()}
         {selected.pm_phase && <div className="intake-box">
           <strong>PM state · {selected.pm_phase}</strong>
           <small>{selected.task_type || 'task'} · приоритет {selected.priority || 'normal'} · проект {selected.project_id || 'не указан'}</small>
@@ -1749,6 +1696,9 @@ function EmployeeScreen() {
           </button>
           {confirmDelete && <button type="button" className="secondary compact" disabled={!!busy} onClick={() => setConfirmDelete(false)}>Не удалять</button>}
         </div>
+        </>}
+
+        {caseTab === 'feed' && <>
         <h3 className="work-timeline-title">Лента действий</h3>
         <div className="work-timeline">
           {eventsLoading && !eventsFeed ? <p className="transcript-empty">Загрузка событий…</p> :
@@ -1770,8 +1720,141 @@ function EmployeeScreen() {
           onNext={() => setEventsPage(p => p + 1)}
           unit="соб."
         />
+        </>}
+
+        {caseTab === 'project' && (selected.project_id || selected.project) && (() => {
+          const projectId = selected.project?.project_id || selected.project_id || ''
+          const autonomy = selected.project?.autonomy_level || 'LEVEL_0'
+          const refresh = async () => { await refreshSelected(String(selected.id)) }
+          const patchProject = async (config: Record<string, unknown>, level = autonomy) => {
+            await api.pm.updateProject(projectId, { autonomy_level: level, config })
+            await refresh()
+          }
+          return <div className="intake-box" style={{ marginTop: 8 }}>
+            <div className="head-actions" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
+              <strong>Настройки проекта · {projectId}</strong>
+              <button className="secondary compact" type="button" onClick={() => window.dispatchEvent(new CustomEvent('ice:goto', { detail: 'customers' }))}>В «Заказчики»</button>
+            </div>
+            {selected.project && <Field label="Автономия проекта" hint="LEVEL_1 — только небольшие однозначные bug fixes без подтверждения.">
+              <select value={selected.project.autonomy_level} onChange={async event => {
+                const autonomy_level = event.target.value as 'LEVEL_0' | 'LEVEL_1' | 'LEVEL_2' | 'LEVEL_3'
+                await api.pm.updateProject(projectId, { autonomy_level })
+                await refresh()
+              }}>
+                <option value="LEVEL_0">LEVEL_0 · всё с подтверждением</option>
+                <option value="LEVEL_1">LEVEL_1 · только малые bug fixes</option>
+                <option value="LEVEL_2">LEVEL_2 · согласованный scope</option>
+                <option value="LEVEL_3">LEVEL_3 · обычная разработка автономно</option>
+              </select>
+            </Field>}
+            <div className="grid-2" style={{ marginTop: 8, gap: 8 }}>
+              <Field label="Часовой пояс проекта" hint="UTC+5 = Asia/Yekaterinburg">
+                <input
+                  defaultValue={String(selected.project?.config?.timezone || selected.schedule?.timezone || 'Asia/Yekaterinburg')}
+                  onBlur={async event => {
+                    await patchProject({ timezone: event.target.value.trim() || 'Asia/Yekaterinburg' })
+                  }}
+                />
+              </Field>
+              <Field label="Рабочий день" hint="HH:MM–HH:MM">
+                <div className="head-actions">
+                  <input
+                    style={{ width: 80 }}
+                    defaultValue={String(selected.project?.config?.workday_start || selected.schedule?.workday_start || '09:00')}
+                    onBlur={async event => {
+                      await patchProject({ workday_start: event.target.value.trim() || '09:00' })
+                    }}
+                  />
+                  <span>—</span>
+                  <input
+                    style={{ width: 80 }}
+                    defaultValue={String(selected.project?.config?.workday_end || selected.schedule?.workday_end || '18:00')}
+                    onBlur={async event => {
+                      await patchProject({ workday_end: event.target.value.trim() || '18:00' })
+                    }}
+                  />
+                </div>
+              </Field>
+              <Field label="Ставка ₽/час" hint="Для расчёта стоимости по оценке длительности">
+                <input
+                  type="number"
+                  key={`rate-${projectId}-${selected.project?.config?.hourly_rate ?? selected.commerce?.hourly_rate ?? ''}`}
+                  defaultValue={String(selected.project?.config?.hourly_rate ?? selected.commerce?.hourly_rate ?? '')}
+                  placeholder="2500"
+                  onBlur={async event => {
+                    const raw = event.target.value.trim()
+                    await patchProject({ hourly_rate: raw === '' ? null : Number(raw) })
+                  }}
+                />
+              </Field>
+              <div className="toggle-box" style={{ gridColumn: '1 / -1' }}>
+                <Toggle
+                  label="Согласовывать стоимость с заказчиком перед Cursor"
+                  checked={Boolean(selected.project?.config?.cost_requires_customer_approval ?? selected.commerce?.cost_requires_customer_approval ?? selected.schedule?.cost_requires_customer_approval)}
+                  onChange={async checked => {
+                    await patchProject({ cost_requires_customer_approval: checked })
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        })()}
         </> : null}
       </section>}
+
+      <section className="panel">
+        <SectionHead
+          title={`Консультации (${openConsults.length} открытых)`}
+          text="Ответ закрывает вопрос и сразу запускает агента (force tick). «Снять с очереди» — для устаревших без запуска. Telegram: /answer id · /approve id · /reject id"
+        />
+        {openConsults.length === 0 ? <Empty icon={MessageCircle} title="Очередь пуста" text="Когда сотруднику что-то нужно — запрос появится здесь и у админов в Telegram."/> :
+          <div className="list-panel">{openConsults.map((item: Consultation) => <div className="server-row" key={item.id} style={{ alignItems: 'flex-start', paddingTop: 12, paddingBottom: 12 }}>
+            <span className="chip">{item.requires_approval ? 'approval' : 'consult'}</span>
+            <div className="grow">
+              <strong>#{item.id}{item.work_item_id ? ` · кейс #${item.work_item_id}` : ''} · агент {item.agent_id}</strong>
+              <small>{item.question}</small>
+              {item.context && <small>{item.context.slice(0, 240)}</small>}
+              {!item.work_item_id && <small className="consult-hint">Старая консультация без кейса — можно снять с очереди, если не актуальна.</small>}
+              <textarea rows={2} style={{ marginTop: 8, width: '100%' }} placeholder="Ответ руководителя…" value={answerDrafts[item.id] || ''} onChange={e => setAnswerDrafts(d => ({ ...d, [item.id]: e.target.value }))}/>
+              <div className="head-actions" style={{ marginTop: 8 }}>
+                <button className="secondary compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'answered')}>Ответить</button>
+                <button className="secondary compact" disabled={!!busy} onClick={() => void dismissConsult(item)}>Снять с очереди</button>
+                {item.requires_approval && <>
+                  <button className="primary compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'approved')}>Одобрить</button>
+                  <button className="danger compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'rejected')}>Отклонить</button>
+                </>}
+              </div>
+            </div>
+          </div>)}</div>}
+      </section>
+        </>}
+
+        {employeeTab === 'settings' && <>
+      <section className="panel">
+        <SectionHead
+          title="Заказчик и проект Cursor"
+          text="Промпт сотрудника подставляет заказчика и проект из этой карточки. Список проектов — из MCP cursorremote."
+          action={<button className="secondary compact" type="button" onClick={() => window.dispatchEvent(new CustomEvent('ice:goto', { detail: 'customers' }))}>Открыть заказчиков</button>}
+        />
+        {(state.customers || []).length === 0 ? (
+          <p className="transcript-empty">Пока нет карточек. Создайте заказчика в разделе «Заказчики» и отметьте его по умолчанию для этого сотрудника.</p>
+        ) : (
+          <div className="list-panel">
+            {(state.customers || []).map(item => (
+              <div className="server-row" key={item.id}>
+                <span className="chip">{item.is_default ? 'default' : 'customer'}</span>
+                <div className="grow">
+                  <strong>{item.name}</strong>
+                  <small>{item.project_id || 'без project_id'}{item.cursor_workspace ? ` · ${item.cursor_workspace}` : ''}{item.tracker_project_id ? ` · трекер ${item.tracker_poll_enabled === false ? 'выкл.' : 'опрос'}` : ''}</small>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {(state.customers || []).find(item => item.is_default)?.prompt_block && (
+          <pre className="customer-prompt-inline">{(state.customers || []).find(item => item.is_default)?.prompt_block}</pre>
+        )}
+      </section>
 
       <section className="panel">
         <SectionHead title={`${state.agent_name}`} text={`Тиков сегодня: ${state.profile.ticks_used_today}/${state.profile.budget_ticks_per_day} · последний тик: ${state.profile.last_tick_at ? new Date(state.profile.last_tick_at).toLocaleString() : '—'}`}/>
@@ -1895,32 +1978,8 @@ function EmployeeScreen() {
           onNext={() => setNeedsPage(p => p + 1)}
         />
       </section>
-
-      <section className="panel">
-        <SectionHead
-          title={`Консультации (${openConsults.length} открытых)`}
-          text="Ответ закрывает вопрос и сразу запускает агента (force tick). «Снять с очереди» — для устаревших без запуска. Telegram: /answer id · /approve id · /reject id"
-        />
-        {openConsults.length === 0 ? <Empty icon={MessageCircle} title="Очередь пуста" text="Когда сотруднику что-то нужно — запрос появится здесь и у админов в Telegram."/> :
-          <div className="list-panel">{openConsults.map((item: Consultation) => <div className="server-row" key={item.id} style={{ alignItems: 'flex-start', paddingTop: 12, paddingBottom: 12 }}>
-            <span className="chip">{item.requires_approval ? 'approval' : 'consult'}</span>
-            <div className="grow">
-              <strong>#{item.id}{item.work_item_id ? ` · кейс #${item.work_item_id}` : ''} · агент {item.agent_id}</strong>
-              <small>{item.question}</small>
-              {item.context && <small>{item.context.slice(0, 240)}</small>}
-              {!item.work_item_id && <small className="consult-hint">Старая консультация без кейса — можно снять с очереди, если не актуальна.</small>}
-              <textarea rows={2} style={{ marginTop: 8, width: '100%' }} placeholder="Ответ руководителя…" value={answerDrafts[item.id] || ''} onChange={e => setAnswerDrafts(d => ({ ...d, [item.id]: e.target.value }))}/>
-              <div className="head-actions" style={{ marginTop: 8 }}>
-                <button className="secondary compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'answered')}>Ответить</button>
-                <button className="secondary compact" disabled={!!busy} onClick={() => void dismissConsult(item)}>Снять с очереди</button>
-                {item.requires_approval && <>
-                  <button className="primary compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'approved')}>Одобрить</button>
-                  <button className="danger compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'rejected')}>Отклонить</button>
-                </>}
-              </div>
-            </div>
-          </div>)}</div>}
-      </section>
+        </>}
+      </div>
     </>}
   </>
 }

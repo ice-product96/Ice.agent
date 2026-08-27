@@ -57,6 +57,16 @@ h1, h2, h3, .brand { font-family: 'Manrope', sans-serif; }
 .employee-roster-card small { color: var(--muted); line-height: 1.35; }
 .employee-roster-stats { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 2px; }
 .employee-roster-stats span { font-size: 11px; color: #9aa3b8; background: #0d111a; border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
+.employee-shell { display: flex; flex-direction: column; gap: 14px; }
+.employee-tabs { display: inline-flex; align-items: center; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 12px; background: #0c1018; width: fit-content; max-width: 100%; }
+.employee-tab { display: inline-flex; align-items: center; gap: 8px; height: 36px; padding: 0 14px; border: 0; border-radius: 9px; background: transparent; color: #8b93a6; font-weight: 600; font-size: 13px; }
+.employee-tab:hover { color: #d5dae6; background: #ffffff08; }
+.employee-tab.active { color: #fff; background: linear-gradient(135deg, #7d6cf0, #5f4de0); box-shadow: 0 6px 18px #6b57f540; }
+.employee-tab .nav-badge { margin-left: 2px; }
+.case-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; padding-bottom: 10px; border-bottom: 1px solid #1f2533; }
+.case-tab { height: 30px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: #0d1118; color: #8f97aa; font-size: 12px; font-weight: 600; }
+.case-tab:hover { color: #d8dce8; border-color: #3a4254; }
+.case-tab.active { color: #efeaff; border-color: #7d6cf088; background: #7967ee22; }
 .work-card > small { color: #8b93a6; }
 .chip.status-failed { color: #ff8b9a; border-color: #ff6f8340; background: #ff6f8314; }
 .chip.status-waiting_manager { color: var(--amber); border-color: #f8b95c40; background: #f8b95c14; }
