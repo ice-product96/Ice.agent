@@ -1132,6 +1132,19 @@ async def list_agent_work_items(
     }
 
 
+@router.get("/agents/{agent_id}/employee/needs", dependencies=auth)
+async def list_employee_needs(
+    agent_id: str,
+    page: int = 1,
+    size: int = 20,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .employee import list_needs_page
+
+    agent = await one(db, Agent, agent_id)
+    return await list_needs_page(db, agent.id, page=page, size=size)
+
+
 @router.get("/agents/{agent_id}/work-items/{work_item_id}", dependencies=auth)
 async def get_agent_work_item(
     agent_id: str,

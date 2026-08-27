@@ -11,7 +11,7 @@ import type {
   AdminSettings, Agent, AgentTask, Consultation, CronJob, Dashboard, EmployeeState, LogEntry, McpServer,
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, RuntimeSettings,
   Customer, CursorProjectOption, EmployeePolicy, EmployeePolicyCatalog,
-  PromptSectionRevision, SipAccount, SipCall, Status, TelegramAccount, WorkItem, WorkItemEvent, WorkItemEventsPage,
+  PromptSectionRevision, SipAccount, SipCall, Status, TelegramAccount, WorkItem, WorkItemEvent, WorkItemEventsPage, EmployeeNeedsPage,
 } from './types'
 
 type Page = 'dashboard' | 'agents' | 'connections' | 'runtime' | 'telegram' | 'sip' | 'calls' | 'conversations' | 'employee' | 'customers' | 'memory' | 'mcp' | 'cron' | 'settings' | 'logs' | 'tasks'
@@ -218,6 +218,37 @@ function Modal({ title: heading, subtitle, onClose, children }: { title: string;
 }
 function SectionHead({ title: heading, text, action }: { title: string; text?: string; action?: ReactNode }) {
   return <div className="section-head"><div><h2>{heading}</h2>{text && <p>{text}</p>}</div>{action}</div>
+}
+function PaginationBar({
+  page,
+  pages,
+  total,
+  loading,
+  onPrev,
+  onNext,
+  unit = 'зап.',
+}: {
+  page: number
+  pages: number
+  total?: number
+  loading?: boolean
+  onPrev: () => void
+  onNext: () => void
+  unit?: string
+}) {
+  if ((total || 0) <= 0) return null
+  return <div className="timeline-pager">
+    <button type="button" className="secondary compact" disabled={loading || page >= pages} onClick={onNext}>
+      <ChevronLeft size={14}/>Старше
+    </button>
+    <small>
+      {loading ? '…' : `стр. ${page} / ${pages}`}
+      {total != null ? ` · ${total} ${unit}` : ''}
+    </small>
+    <button type="button" className="secondary compact" disabled={loading || page <= 1} onClick={onPrev}>
+      Новее<ChevronRight size={14}/>
+    </button>
+  </div>
 }
 function ConfirmDelete({ name, onClose, onDelete }: { name: string; onClose: () => void; onDelete: () => Promise<void> }) {
   const [busy, setBusy] = useState(false)
@@ -1068,9 +1099,15 @@ function EmployeeScreen() {
   const [selectedId, setSelectedId] = useState('')
   const [instructNote, setInstructNote] = useState('')
   const [selected, setSelected] = useState<WorkItem | null>(null)
+  const [selectedLoading, setSelectedLoading] = useState(false)
+  const [selectedError, setSelectedError] = useState('')
   const [eventsPage, setEventsPage] = useState(1)
   const [eventsFeed, setEventsFeed] = useState<WorkItemEventsPage | null>(null)
   const [eventsLoading, setEventsLoading] = useState(false)
+  const [needsPage, setNeedsPage] = useState(1)
+  const [needsFeed, setNeedsFeed] = useState<EmployeeNeedsPage | null>(null)
+  const [needsLoading, setNeedsLoading] = useState(false)
+  const [needsVersion, setNeedsVersion] = useState(0)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [sections, setSections] = useState<Record<string, string>>({})
   const [historyKey, setHistoryKey] = useState('')
@@ -1146,6 +1183,7 @@ function EmployeeScreen() {
       setBudget(data.profile.budget_ticks_per_day || 48)
       setAutonomy(Boolean(data.profile.autonomy_enabled))
       applyPolicy(data.profile.policy)
+      setNeedsVersion(v => v + 1)
     }).catch(err => {
       if (cancelled) return
       setState(null)
@@ -1172,6 +1210,7 @@ function EmployeeScreen() {
       setBudget(data.profile.budget_ticks_per_day || 48)
       setAutonomy(Boolean(data.profile.autonomy_enabled))
       applyPolicy(data.profile.policy)
+      setNeedsVersion(v => v + 1)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Не удалось загрузить сотрудника')
     } finally {
@@ -1183,22 +1222,40 @@ function EmployeeScreen() {
   useEffect(() => {
     setEventsPage(1)
     setEventsFeed(null)
+    setSelectedError('')
   }, [selectedId])
+
+  useEffect(() => {
+    setNeedsPage(1)
+    setNeedsFeed(null)
+  }, [agentId])
+
+  const refreshSelected = useCallback(async (id = selectedId) => {
+    if (!agentId || !id) return null
+    setSelectedLoading(true)
+    setSelectedError('')
+    try {
+      const item = await api.agents.workItem(agentId, id)
+      setSelected(item)
+      return item
+    } catch (err) {
+      setSelectedError(err instanceof Error ? err.message : 'Не удалось загрузить кейс')
+      return null
+    } finally {
+      setSelectedLoading(false)
+    }
+  }, [agentId, selectedId])
 
   useEffect(() => {
     if (!agentId || !selectedId) {
       setSelected(null)
       setEventsFeed(null)
+      setSelectedLoading(false)
+      setSelectedError('')
       return
     }
-    let cancelled = false
-    api.agents.workItem(agentId, selectedId).then(item => {
-      if (!cancelled) setSelected(item)
-    }).catch(() => {
-      if (!cancelled) setSelected(null)
-    })
-    return () => { cancelled = true }
-  }, [agentId, selectedId, state?.work_items])
+    void refreshSelected(selectedId)
+  }, [agentId, selectedId, refreshSelected])
 
   useEffect(() => {
     if (!agentId || !selectedId) {
@@ -1215,7 +1272,24 @@ function EmployeeScreen() {
       if (!cancelled) setEventsLoading(false)
     })
     return () => { cancelled = true }
-  }, [agentId, selectedId, eventsPage, state?.work_items])
+  }, [agentId, selectedId, eventsPage])
+
+  useEffect(() => {
+    if (!agentId) {
+      setNeedsFeed(null)
+      return
+    }
+    let cancelled = false
+    setNeedsLoading(true)
+    void api.agents.employeeNeeds(agentId, needsPage, 20).then(page => {
+      if (!cancelled) setNeedsFeed(page)
+    }).catch(() => {
+      if (!cancelled) setNeedsFeed(null)
+    }).finally(() => {
+      if (!cancelled) setNeedsLoading(false)
+    })
+    return () => { cancelled = true }
+  }, [agentId, needsPage, needsVersion])
 
   async function saveProfile() {
     if (!agentId) return
@@ -1325,6 +1399,7 @@ function EmployeeScreen() {
       }
       if (action !== 'delete' && action !== 'abort') setInstructNote('')
       await load(agentId)
+      if (selectedId) await refreshSelected(selectedId)
       await overview.refresh()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Действие не удалось')
@@ -1491,7 +1566,11 @@ function EmployeeScreen() {
           ))}</div>}
       </section>
 
-      {selected && <section className="panel work-card">
+      {selectedId && <section className="panel work-card">
+        {selectedLoading && !selected ? <Loading/> : selectedError && !selected ? <>
+          <Alert message={selectedError}/>
+          <button className="secondary compact" type="button" onClick={() => void refreshSelected()}><RefreshCw size={15}/>Повторить</button>
+        </> : selected ? <>
         <SectionHead title={`Кейс #${selected.id}`} text={`${selected.status_label || selected.status} · ждёт ${selected.wait_owner || '—'}${selected.wait_until ? ` с ${new Date(selected.wait_until).toLocaleString('ru-RU')}` : ''}`}/>
         <p className="work-goal">{selected.goal || selected.title}</p>
         <small>
@@ -1509,7 +1588,7 @@ function EmployeeScreen() {
         {(selected.project_id || selected.project) && (() => {
           const projectId = selected.project?.project_id || selected.project_id || ''
           const autonomy = selected.project?.autonomy_level || 'LEVEL_0'
-          const refresh = async () => setSelected(await api.agents.workItem(agentId, selected.id))
+          const refresh = async () => { await refreshSelected(String(selected.id)) }
           const patchProject = async (config: Record<string, unknown>, level = autonomy) => {
             await api.pm.updateProject(projectId, { autonomy_level: level, config })
             await refresh()
@@ -1680,30 +1759,16 @@ function EmployeeScreen() {
               </div>
             ))}
         </div>
-        {(eventsFeed?.total || 0) > 0 && (
-          <div className="timeline-pager">
-            <button
-              type="button"
-              className="secondary compact"
-              disabled={eventsLoading || eventsPage >= (eventsFeed?.pages || 1)}
-              onClick={() => setEventsPage(p => p + 1)}
-            >
-              <ChevronLeft size={14}/>Старше
-            </button>
-            <small>
-              {eventsLoading ? '…' : `стр. ${eventsFeed?.page || eventsPage} / ${eventsFeed?.pages || 1}`}
-              {eventsFeed?.total != null ? ` · ${eventsFeed.total} соб.` : ''}
-            </small>
-            <button
-              type="button"
-              className="secondary compact"
-              disabled={eventsLoading || eventsPage <= 1}
-              onClick={() => setEventsPage(p => Math.max(1, p - 1))}
-            >
-              Новее<ChevronRight size={14}/>
-            </button>
-          </div>
-        )}
+        <PaginationBar
+          page={eventsFeed?.page || eventsPage}
+          pages={eventsFeed?.pages || 1}
+          total={eventsFeed?.total}
+          loading={eventsLoading}
+          onPrev={() => setEventsPage(p => Math.max(1, p - 1))}
+          onNext={() => setEventsPage(p => p + 1)}
+          unit="соб."
+        />
+        </> : null}
       </section>}
 
       <section className="panel">
@@ -1812,12 +1877,21 @@ function EmployeeScreen() {
       </section>
 
       <section className="panel">
-        <SectionHead title={`Потребности (${state.needs.length})`}/>
-        {state.needs.length === 0 ? <p className="transcript-empty">Открытых потребностей нет.</p> :
-          <div className="list-panel">{state.needs.map(need => <div className="server-row" key={need.id}>
+        <SectionHead title={`Потребности (${needsFeed?.total ?? state.needs.length})`}/>
+        {needsLoading && !needsFeed ? <Loading/> :
+          (needsFeed?.items || state.needs).length === 0 ? <p className="transcript-empty">Потребностей нет.</p> :
+          <div className="list-panel">{(needsFeed?.items || state.needs).map(need => <div className="server-row" key={need.id}>
             <span className="chip">{need.kind}</span>
             <div className="grow"><strong>{need.title}</strong><small>{need.status} · p={need.priority} · {need.detail.slice(0, 160)}</small></div>
           </div>)}</div>}
+        <PaginationBar
+          page={needsFeed?.page || needsPage}
+          pages={needsFeed?.pages || 1}
+          total={needsFeed?.total}
+          loading={needsLoading}
+          onPrev={() => setNeedsPage(p => Math.max(1, p - 1))}
+          onNext={() => setNeedsPage(p => p + 1)}
+        />
       </section>
 
       <section className="panel">

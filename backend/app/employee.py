@@ -419,6 +419,47 @@ async def list_open_needs(db: AsyncSession, agent_id: int) -> list[EmployeeNeed]
     )
 
 
+async def list_needs_page(
+    db: AsyncSession,
+    agent_id: int,
+    *,
+    page: int = 1,
+    size: int = 20,
+) -> dict[str, Any]:
+    from sqlalchemy import func
+
+    page = max(1, int(page or 1))
+    size = max(1, min(100, int(size or 20)))
+    total = int(
+        await db.scalar(
+            select(func.count())
+            .select_from(EmployeeNeed)
+            .where(EmployeeNeed.agent_id == agent_id)
+        )
+        or 0
+    )
+    pages = max(1, (total + size - 1) // size) if total else 1
+    if page > pages:
+        page = pages
+    offset = (page - 1) * size
+    rows = list(
+        await db.scalars(
+            select(EmployeeNeed)
+            .where(EmployeeNeed.agent_id == agent_id)
+            .order_by(EmployeeNeed.priority.asc(), EmployeeNeed.id.desc())
+            .offset(offset)
+            .limit(size)
+        )
+    )
+    return {
+        "items": [need_json(need) for need in rows],
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": pages,
+    }
+
+
 async def list_open_consultations(db: AsyncSession, agent_id: int) -> list[Consultation]:
     return list(
         await db.scalars(

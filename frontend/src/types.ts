@@ -393,6 +393,14 @@ export interface WorkItemEventsPage {
   pages: number
 }
 
+export interface EmployeeNeedsPage {
+  items: EmployeeNeed[]
+  total: number
+  page: number
+  size: number
+  pages: number
+}
+
 export interface DecisionRecord {
   id: ID
   project_id: string

@@ -2,7 +2,7 @@ import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
   Conversation, ConversationDetail, Consultation, EmployeePolicy, EmployeePolicyCatalog, EmployeeProfile, EmployeeRosterEntry, EmployeeState,
   Customer, CursorProjectOption, LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
-  PmProjectDetail, ProjectState, PromptSectionRevision, RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts, WorkItemEventsPage,
+  PmProjectDetail, ProjectState, PromptSectionRevision, RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts, WorkItemEventsPage, EmployeeNeedsPage,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api/v1'
@@ -80,6 +80,8 @@ export const api = {
     update: (id: string, data: Partial<Agent>) => request<Agent>(`/agents/${id}`, { method: 'PATCH', ...body(data) }),
     remove: (id: string) => request<void>(`/agents/${id}`, { method: 'DELETE' }),
     employee: (id: string) => request<EmployeeState>(`/agents/${id}/employee`),
+    employeeNeeds: (id: string, page = 1, size = 20) =>
+      request<EmployeeNeedsPage>(`/agents/${id}/employee/needs${qs({ page, size })}`),
     updateEmployee: (id: string, data: Partial<EmployeeProfile> & { prompt_sections?: Record<string, string>; policy?: EmployeePolicy }) =>
       request<EmployeeState>(`/agents/${id}/employee`, { method: 'PATCH', ...body(data) }),
     promptRevisions: (id: string, key?: string, limit = 40) =>
