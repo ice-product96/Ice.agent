@@ -2857,31 +2857,34 @@ class AgentRuntime:
                         )
 
                 registry.before_call = _approval_gate
-            result = await client.complete(
-                messages,
-                registry,
-                permissions,
-            )
-            for call in registry.audit:
-                safe_call = json.loads(json.dumps(call, ensure_ascii=False, default=str))
-                db.add(
-                    MessageLog(
-                        agent_id=agent.id,
-                        account_id=account.id if account else None,
-                        direction="tool",
-                        chat_id=str(context.get("chat_id") or "") or None,
-                        message_at=as_utc(None),
-                        text=f"{call['tool']}: {call['status']}",
-                        metadata_json=safe_call,
-                        work_item_id=context.get("work_item_id"),
+            result = ""
+            try:
+                result = await client.complete(
+                    messages,
+                    registry,
+                    permissions,
+                )
+            finally:
+                for call in registry.audit:
+                    safe_call = json.loads(json.dumps(call, ensure_ascii=False, default=str))
+                    db.add(
+                        MessageLog(
+                            agent_id=agent.id,
+                            account_id=account.id if account else None,
+                            direction="tool",
+                            chat_id=str(context.get("chat_id") or "") or None,
+                            message_at=as_utc(None),
+                            text=f"{call['tool']}: {call['status']}",
+                            metadata_json=safe_call,
+                            work_item_id=context.get("work_item_id"),
+                        )
                     )
-                )
-                await self.events.publish(
-                    "tool.called",
-                    {"agent_id": agent.id, **safe_call},
-                )
-            if registry.audit:
-                await db.commit()
+                    await self.events.publish(
+                        "tool.called",
+                        {"agent_id": agent.id, **safe_call},
+                    )
+                if registry.audit:
+                    await db.commit()
             admin_report = format_admin_action_report(
                 agent_name=agent.name,
                 audit=registry.audit,

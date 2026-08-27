@@ -242,7 +242,8 @@ class LLMClient:
         conversation = list(messages)
         tool_schemas = schemas_for_tool_plane(tools, permissions, limit=MAX_LLM_TOOLS) or None
         reasoning_effort: str | None = "none" if tool_schemas and _chat_tools_need_no_reasoning(self.model) else None
-        for _ in range(self.max_rounds):
+        recent_signatures: list[str] = []
+        for round_idx in range(self.max_rounds):
             response = await self._chat_complete(
                 conversation,
                 tool_schemas,
@@ -252,15 +253,81 @@ class LLMClient:
             conversation.append(message.model_dump(exclude_none=True))
             if not message.tool_calls:
                 return message.content or ""
+            signatures: list[str] = []
             for call in message.tool_calls:
                 arguments = json.loads(call.function.arguments or "{}")
+                signatures.append(
+                    f"{call.function.name}:{json.dumps(arguments, sort_keys=True, ensure_ascii=False)}"
+                )
                 try:
                     result = await tools.call(call.function.name, arguments, permissions)
                     content = json.dumps(result, ensure_ascii=False, default=str)
                 except Exception as exc:
                     content = json.dumps({"error": str(exc)})
                 conversation.append({"role": "tool", "tool_call_id": call.id, "content": content})
-        raise RuntimeError("Maximum tool-call rounds exceeded")
+            # Same tool+args three rounds in a row → force a text reply.
+            round_key = "|".join(signatures)
+            if round_key and recent_signatures[-2:] == [round_key, round_key]:
+                logger.warning(
+                    "llm.tool_loop_break model=%s round=%s tools=%s",
+                    self.model,
+                    round_idx + 1,
+                    signatures,
+                )
+                conversation.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "You are repeating the same tool calls without progress. "
+                            "Stop calling tools. Reply to the user now with a short status "
+                            "of what you know and what is blocked."
+                        ),
+                    }
+                )
+                break
+            recent_signatures.append(round_key)
+            if len(recent_signatures) > 4:
+                recent_signatures = recent_signatures[-4:]
+
+        tool_names = [str(item.get("tool") or "?") for item in (tools.audit or [])]
+        logger.warning(
+            "llm.max_tool_rounds model=%s rounds=%s tools=%s",
+            self.model,
+            self.max_rounds,
+            ",".join(tool_names[-40:]) or "(none)",
+        )
+        # Soft landing: one final reply without tools instead of crashing Telegram routing.
+        conversation.append(
+            {
+                "role": "user",
+                "content": (
+                    "Tool budget exhausted. Do not call tools. "
+                    "Reply to the user in their language with a brief status: what was done, "
+                    "what is blocked, and the next concrete step. Keep it under 8 sentences."
+                ),
+            }
+        )
+        try:
+            response = await self._chat_complete(
+                conversation,
+                None,
+                reasoning_effort=None,
+            )
+            text = (response.choices[0].message.content or "").strip()
+            if text:
+                return text
+        except Exception as exc:
+            logger.warning("llm.max_tool_rounds_final_failed: %s", exc)
+        unique = []
+        for name in tool_names:
+            if name not in unique:
+                unique.append(name)
+        tools_hint = ", ".join(unique[-12:]) if unique else "нет"
+        return (
+            "Не успел завершить обработку за лимит шагов инструментов "
+            f"({self.max_rounds}). Уже вызывал: {tools_hint}. "
+            "Повторите короткое указание или откройте кейс в панели и нажмите «Продолжи»."
+        )
 
     async def transcribe_audio(
         self,

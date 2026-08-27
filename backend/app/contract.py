@@ -1170,8 +1170,9 @@ async def get_agent_work_item(
         )
     ).all()
     project = await db.get(ProjectState, item.project_id) if item.project_id else None
-    result = work_item_json(item, events=events_page["items"])
+    result = work_item_json(item)
     result.update(
+        events=events_page["items"],
         decisions=[decision_record_json(row) for row in decisions],
         cursor_runs=[cursor_run_json(row) for row in runs],
         project=project_state_json(project) if project else None,
