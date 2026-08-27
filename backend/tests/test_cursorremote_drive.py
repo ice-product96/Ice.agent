@@ -314,3 +314,63 @@ def test_send_prompt_uploads_customer_image_via_mcp_write(tmp_path) -> None:
     assert (workspace / rel).is_file()
 
 
+def test_workspace_match_normalizes_paths() -> None:
+    from app.cursorremote_drive import workspace_matches, workspace_paths_from_status
+
+    assert workspace_matches(
+        r"d:\projects\uraltrade",
+        [r"D:/projects/uraltrade"],
+    )
+    assert workspace_matches("uraltrade", [r"D:/projects/uraltrade"])
+    assert not workspace_matches(
+        r"d:\projects\uraltrade",
+        [r"D:/projects/lavve"],
+    )
+    paths = workspace_paths_from_status(
+        {
+            "windows": [
+                {"workspacePath": r"D:\projects\uraltrade", "id": "w1"},
+                {"workspace": r"D:\projects\lavve"},
+            ]
+        }
+    )
+    assert any("uraltrade" in p for p in paths)
+
+
+def test_send_prompt_refuses_when_workspace_closed() -> None:
+    session = ScriptSession(
+        {},
+        default={
+            "agentStatus": "idle",
+            "pendingApprovalCount": 0,
+            "workspacePath": r"D:\projects\other",
+        },
+    )
+    result = asyncio.run(
+        send_prompt_and_drive(
+            session,
+            "deploy",
+            expected_workspace=r"d:/projects/uraltrade",
+            timeout_ms=80,
+        )
+    )
+    assert result["prompt_sent"] is False
+    assert result["status"] == "workspace_unavailable"
+    assert result["done"] is False
+    assert not any(tool == "send_prompt" for tool, _ in session.calls)
+
+
+def test_prompt_actually_started_requires_busy() -> None:
+    from app.cursorremote_drive import prompt_actually_started
+
+    assert not prompt_actually_started(
+        {"prompt_sent": True, "status": "not_started", "seen_busy": False, "done": False}
+    )
+    assert prompt_actually_started(
+        {"prompt_sent": True, "status": "working", "seen_busy": True, "done": False}
+    )
+    assert not prompt_actually_started(
+        {"prompt_sent": False, "status": "workspace_unavailable", "done": False}
+    )
+
+

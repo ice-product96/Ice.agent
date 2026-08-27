@@ -66,6 +66,203 @@ NOT_STARTED_HINT = (
     "cursorremote_do once if needed, or schedule_self to retry. Do not tell the customer it is done."
 )
 
+WORKSPACE_UNAVAILABLE_HINT = (
+    "Required Cursor workspace is not open. Open that project folder in Cursor on the MCP host, "
+    "then retry submit_development_task / cursorremote_do. Do not leave the case waiting on Cursor."
+)
+
+CURSOR_UNAVAILABLE_HINT = (
+    "CursorRemote MCP has no usable Cursor window. Start Cursor on the MCP host and open the "
+    "project workspace, then retry. Do not leave the case waiting on Cursor."
+)
+
+
+def normalize_workspace_path(path: str | None) -> str:
+    raw = str(path or "").strip().replace("\\", "/").rstrip("/")
+    if not raw:
+        return ""
+    if len(raw) >= 2 and raw[1] == ":":
+        raw = raw[0].lower() + raw[1:]
+    return raw.lower()
+
+
+def workspace_paths_from_status(status: Any) -> list[str]:
+    data = _as_status_dict(status) or {}
+    found: list[str] = []
+
+    def add(value: Any) -> None:
+        text = normalize_workspace_path(str(value or ""))
+        if text and text not in found:
+            found.append(text)
+
+    for key in (
+        "workspacePath",
+        "workspace_path",
+        "workspaceFolder",
+        "workspace",
+        "workspaceUri",
+        "folderUri",
+        "path",
+    ):
+        add(data.get(key))
+    for window in list(data.get("windows") or data.get("targets") or []):
+        if not isinstance(window, dict):
+            continue
+        for key in (
+            "workspacePath",
+            "workspace_path",
+            "workspaceFolder",
+            "workspace",
+            "workspaceUri",
+            "folderUri",
+            "path",
+        ):
+            add(window.get(key))
+    return found
+
+
+def workspace_matches(expected: str | None, candidates: list[str]) -> bool:
+    want = normalize_workspace_path(expected)
+    if not want:
+        return True
+    for candidate in candidates:
+        got = normalize_workspace_path(candidate)
+        if not got:
+            continue
+        if got == want or got.endswith("/" + want) or want.endswith("/" + got):
+            return True
+        # Compare by last path segment (uraltrade).
+        if got.rstrip("/").split("/")[-1] == want.rstrip("/").split("/")[-1]:
+            return True
+    return False
+
+
+def prompt_actually_started(result: dict[str, Any] | None) -> bool:
+    """True only when Cursor accepted work for this assignment."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("skipped_prompt") or not result.get("prompt_sent"):
+        return False
+    status = str(result.get("status") or "").strip().lower()
+    if status in {
+        "workspace_unavailable",
+        "cursor_unavailable",
+        "not_started",
+        "no_window",
+    }:
+        return False
+    if result.get("done"):
+        return True
+    if result.get("seen_busy") or result.get("started"):
+        return True
+    return False
+
+
+async def ensure_cursor_workspace(
+    session: Any,
+    *,
+    expected_workspace: str | None = None,
+    expected_window_id: str | None = None,
+) -> dict[str, Any]:
+    """Verify Cursor is reachable and optionally on the expected project folder."""
+    status: Any = None
+    try:
+        status = await mcp_call(session, "get_status")
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "cursor_unavailable",
+            "reason": f"CursorRemote get_status failed: {exc}",
+            "hint": CURSOR_UNAVAILABLE_HINT,
+            "workspace": None,
+            "windows": [],
+        }
+    paths = workspace_paths_from_status(status)
+    if not paths:
+        try:
+            listed = await mcp_call(session, "list_windows")
+            paths = workspace_paths_from_status(listed) or workspace_paths_from_status(
+                {"windows": listed if isinstance(listed, list) else [listed]}
+            )
+        except Exception:
+            listed = None
+    if expected_window_id:
+        try:
+            await mcp_call(
+                session,
+                "switch_window",
+                {"windowId": expected_window_id, "id": expected_window_id},
+            )
+            status = await mcp_call(session, "get_status")
+            paths = workspace_paths_from_status(status) or paths
+        except Exception as exc:
+            logger.info("CursorRemote switch_window failed: %s", exc)
+    if expected_workspace and not workspace_matches(expected_workspace, paths):
+        # Try switching by matching path from list_windows if available.
+        try:
+            listed = await mcp_call(session, "list_windows")
+            windows = listed if isinstance(listed, list) else (
+                (listed or {}).get("windows") if isinstance(listed, dict) else []
+            )
+            for window in windows or []:
+                if not isinstance(window, dict):
+                    continue
+                window_paths = workspace_paths_from_status(window)
+                if not workspace_matches(expected_workspace, window_paths):
+                    continue
+                window_id = (
+                    window.get("id")
+                    or window.get("windowId")
+                    or window.get("targetId")
+                )
+                if not window_id:
+                    continue
+                try:
+                    await mcp_call(
+                        session,
+                        "switch_window",
+                        {"windowId": window_id, "id": window_id},
+                    )
+                    status = await mcp_call(session, "get_status")
+                    paths = workspace_paths_from_status(status) or window_paths
+                    break
+                except Exception as exc:
+                    logger.info("CursorRemote switch_window by path failed: %s", exc)
+        except Exception:
+            pass
+    if expected_workspace and not workspace_matches(expected_workspace, paths):
+        return {
+            "ok": False,
+            "status": "workspace_unavailable",
+            "reason": (
+                f"Cursor workspace «{expected_workspace}» is not open. "
+                f"Open windows: {paths or ['(none)']}."
+            ),
+            "hint": WORKSPACE_UNAVAILABLE_HINT,
+            "workspace": expected_workspace,
+            "windows": paths,
+            "last": status,
+        }
+    if not paths and expected_workspace:
+        return {
+            "ok": False,
+            "status": "workspace_unavailable",
+            "reason": (
+                f"No open Cursor window for workspace «{expected_workspace}»."
+            ),
+            "hint": WORKSPACE_UNAVAILABLE_HINT,
+            "workspace": expected_workspace,
+            "windows": [],
+            "last": status,
+        }
+    return {
+        "ok": True,
+        "status": "ready",
+        "workspace": paths[0] if paths else expected_workspace,
+        "windows": paths,
+        "last": status,
+    }
+
 
 def parse_mcp_payload(content: Any) -> Any:
     if isinstance(content, dict) and "text" in content:
@@ -432,11 +629,34 @@ async def send_prompt_and_drive(
     work_item_id: Any = None,
     public_base_url: str = "",
     secret_key: str = "",
+    expected_workspace: str | None = None,
+    expected_window_id: str | None = None,
 ) -> dict[str, Any]:
+    ensure = await ensure_cursor_workspace(
+        session,
+        expected_workspace=expected_workspace,
+        expected_window_id=expected_window_id,
+    )
+    if not ensure.get("ok"):
+        return {
+            "ok": False,
+            "done": False,
+            "sent": False,
+            "prompt_sent": False,
+            "started": False,
+            "seen_busy": False,
+            "status": ensure.get("status") or "workspace_unavailable",
+            "reason": ensure.get("reason"),
+            "summary": ensure.get("reason") or "",
+            "next": ensure.get("hint") or WORKSPACE_UNAVAILABLE_HINT,
+            "workspace": ensure.get("workspace"),
+            "windows": ensure.get("windows") or [],
+            "last": ensure.get("last"),
+        }
     try:
         current = await mcp_call(session, "get_status")
     except Exception:
-        current = None
+        current = ensure.get("last")
     if cursor_is_busy(current):
         driven = await drive_until_done(
             session,
@@ -473,7 +693,23 @@ async def send_prompt_and_drive(
     inline_attachments = delivery.get("send_prompt_attachments") or []
     if inline_attachments:
         send_payload["attachments"] = inline_attachments
-    sent = await mcp_call(session, "send_prompt", send_payload)
+    try:
+        sent = await mcp_call(session, "send_prompt", send_payload)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "done": False,
+            "sent": False,
+            "prompt_sent": False,
+            "started": False,
+            "seen_busy": False,
+            "status": "cursor_unavailable",
+            "reason": f"send_prompt failed: {exc}",
+            "summary": f"send_prompt failed: {exc}",
+            "next": CURSOR_UNAVAILABLE_HINT,
+            "workspace": ensure.get("workspace"),
+            "windows": ensure.get("windows") or [],
+        }
     driven = await drive_until_done(session, timeout_ms=timeout_ms, require_busy=True)
     result = {
         "sent": sent,
@@ -486,6 +722,24 @@ async def send_prompt_and_drive(
     }
     if delivery.get("paths"):
         result["images"] = delivery["paths"]
+    # Prompt API accepted, but Composer never became busy → treat as not delivered.
+    if (
+        not result.get("done")
+        and not result.get("seen_busy")
+        and str(result.get("status") or "") == "not_started"
+    ):
+        result.update(
+            {
+                "ok": False,
+                "prompt_sent": False,
+                "started": False,
+                "reason": (
+                    "Cursor did not start after send_prompt — workspace/window likely wrong "
+                    "or Composer did not accept the task."
+                ),
+                "next": NOT_STARTED_HINT,
+            }
+        )
     return result
 
 

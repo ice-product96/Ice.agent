@@ -1370,9 +1370,102 @@ class AgentRuntime:
                     CURSOR_CHECK_ONLY_MESSAGE,
                     check_and_drive,
                     pin_cursor_followup_message,
+                    prompt_actually_started,
                     send_prompt_and_drive,
                 )
                 from .cursor_assets import collect_images_for_cursor
+
+                async def _cursor_target_for_item(item: Any) -> tuple[str | None, str | None]:
+                    workspace = str((context or {}).get("cursor_workspace") or "").strip() or None
+                    window_id = str((context or {}).get("cursor_window_id") or "").strip() or None
+                    customer_id = ""
+                    if item is not None:
+                        customer_id = str(item.customer_id or "").strip()
+                        if not workspace:
+                            meta = item.metadata_json or {}
+                            workspace = str(meta.get("cursor_workspace") or "").strip() or None
+                    if not customer_id:
+                        customer_id = str((context or {}).get("customer_id") or "").strip()
+                    if customer_id and (not workspace or not window_id):
+                        from .db import Customer
+
+                        customer = await db.get(Customer, customer_id)
+                        if customer is not None:
+                            workspace = workspace or (
+                                str(customer.cursor_workspace or "").strip() or None
+                            )
+                            window_id = window_id or (
+                                str(customer.cursor_window_id or "").strip() or None
+                            )
+                    return workspace, window_id
+
+                async def _rollback_unstarted_cursor(
+                    item: Any,
+                    run: Any | None,
+                    result: dict[str, Any],
+                    *,
+                    detail: str,
+                ) -> dict[str, Any]:
+                    from .db import CursorRun as _CursorRun
+                    from .pm_state import transition_pm_phase, update_cursor_run
+                    from .work_items import add_event
+
+                    reason = str(
+                        result.get("reason")
+                        or result.get("summary")
+                        or detail
+                    )[:2000]
+                    if run is not None and isinstance(run, _CursorRun):
+                        await update_cursor_run(
+                            db,
+                            run,
+                            status="cancelled",
+                            result=result,
+                            error=reason[:2000],
+                        )
+                    if getattr(item, "pm_phase", None) in {"IN_DEVELOPMENT", "BLOCKED"}:
+                        await transition_pm_phase(
+                            db,
+                            item,
+                            "READY_FOR_DEV",
+                            detail=detail,
+                        )
+                    meta = dict(item.metadata_json or {})
+                    meta["cursor_in_flight"] = False
+                    item.metadata_json = meta
+                    item.active_cursor_run_id = None
+                    item.status = "waiting_manager"
+                    item.wait_owner = "manager"
+                    item.last_error = reason[:2000]
+                    item.next_action = (
+                        "Откройте Cursor на нужном workspace и нажмите «Продолжи» / "
+                        "submit_development_task"
+                    )
+                    await add_event(
+                        db,
+                        item,
+                        kind="blocked",
+                        title="Cursor не принял задачу",
+                        detail=reason[:800],
+                        payload={
+                            "status": result.get("status"),
+                            "workspace": result.get("workspace"),
+                            "windows": result.get("windows") or [],
+                        },
+                    )
+                    await db.commit()
+                    return {
+                        "task_id": str(item.id),
+                        "run_id": getattr(run, "id", None),
+                        "status": result.get("status") or "workspace_unavailable",
+                        "done": False,
+                        "prompt_sent": False,
+                        "started": False,
+                        "needs_workspace": True,
+                        "reason": reason,
+                        "next": result.get("next") or detail,
+                        "result": result,
+                    }
 
                 async def cursorremote_do(prompt: str) -> dict[str, Any]:
                     """Send a task to Cursor IDE, auto-click Allow/Accept/Run, wait until it actually finishes or times out."""
@@ -1417,6 +1510,7 @@ class AgentRuntime:
                         if result.get("done"):
                             cursor_state["finished"] = True
                         return result
+                    expected_ws, expected_window = await _cursor_target_for_item(item)
                     result = await send_prompt_and_drive(
                         cursor_session,
                         prompt,
@@ -1424,7 +1518,18 @@ class AgentRuntime:
                         work_item_id=(item.id if item is not None else context.get("work_item_id")),
                         public_base_url=self.settings.public_base_url,
                         secret_key=self.settings.secret_key.get_secret_value(),
+                        expected_workspace=expected_ws,
+                        expected_window_id=expected_window,
                     )
+                    if item is not None and not prompt_actually_started(result):
+                        return await _rollback_unstarted_cursor(
+                            item,
+                            None,
+                            result,
+                            detail=(
+                                str(result.get("reason") or "Cursor workspace not open / prompt not started")
+                            ),
+                        )
                     if result.get("prompt_sent"):
                         cursor_state["prompt_sent"] = True
                         from .work_items import stamp_cursor_prompt_sent
@@ -1507,8 +1612,37 @@ class AgentRuntime:
                     ) -> dict[str, Any]:
                         from .pm_state import is_leftover_cursor_idle, parse_cursor_result
 
+                        if not prompt_actually_started(result) and not result.get("done"):
+                            return await _rollback_unstarted_cursor(
+                                item,
+                                run,
+                                result,
+                                detail=(
+                                    str(
+                                        result.get("reason")
+                                        or "Cursor did not accept the prompt — workspace closed?"
+                                    )
+                                ),
+                            )
                         if not result.get("done"):
                             await update_cursor_run(db, run, status="running", result=result)
+                            item.status = "waiting_external"
+                            item.wait_owner = "external"
+                            ctx = dict(item.context_json or {}) if isinstance(item.context_json, dict) else {}
+                            min_minutes = ctx.get("min_execution_minutes")
+                            if min_minutes:
+                                item.next_action = (
+                                    f"Wait for structured Cursor result "
+                                    f"(min {min_minutes} min by estimate)"
+                                )
+                            else:
+                                item.next_action = "Wait for structured Cursor result"
+                            meta = dict(item.metadata_json or {})
+                            meta["cursor_in_flight"] = True
+                            item.metadata_json = meta
+                            from .work_items import stamp_cursor_prompt_sent
+
+                            await stamp_cursor_prompt_sent(db, item)
                             await db.commit()
                             return {
                                 "task_id": str(item.id),
@@ -1803,16 +1937,12 @@ class AgentRuntime:
                             db, item, "IN_DEVELOPMENT", detail=f"Cursor run #{attempt} started"
                         )
                         await update_cursor_run(db, run, status="running")
-                        item.status = "waiting_external"
-                        item.wait_owner = "external"
-                        item.next_action = "Wait for structured Cursor result"
-                        min_minutes = commerce.get("min_execution_minutes")
-                        if min_minutes:
-                            item.next_action = (
-                                f"Wait for structured Cursor result "
-                                f"(min {min_minutes} min by estimate)"
-                            )
+                        # Keep case actionable until Cursor actually accepts the prompt.
+                        item.status = "in_progress"
+                        item.wait_owner = "self"
+                        item.next_action = "Sending task to Cursor…"
                         await db.commit()
+                        expected_ws, expected_window = await _cursor_target_for_item(item)
                         try:
                             result = await send_prompt_and_drive(
                                 cursor_session,
@@ -1821,6 +1951,8 @@ class AgentRuntime:
                                 work_item_id=item.id,
                                 public_base_url=self.settings.public_base_url,
                                 secret_key=self.settings.secret_key.get_secret_value(),
+                                expected_workspace=expected_ws,
+                                expected_window_id=expected_window,
                             )
                         except Exception as exc:
                             await update_cursor_run(

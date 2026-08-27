@@ -847,13 +847,31 @@ async def after_agent_run(
                 "get_development_status",
                 "request_development_fix",
             }:
-                terminal = str(payload.get("status") or "") in {
+                status_name = str(payload.get("status") or "")
+                terminal = status_name in {
                     "completed",
                     "blocked",
                     "failed",
                     "cancelled",
                 }
-                cursor_busy = not bool(payload.get("done")) and not terminal
+                failed_start = (
+                    bool(payload.get("needs_workspace"))
+                    or status_name
+                    in {"workspace_unavailable", "cursor_unavailable", "not_started"}
+                    or payload.get("prompt_sent") is False
+                    or bool(payload.get("skipped_prompt"))
+                )
+                started = bool(
+                    payload.get("seen_busy")
+                    or payload.get("started")
+                    or (payload.get("prompt_sent") and not failed_start)
+                )
+                cursor_busy = (
+                    not bool(payload.get("done"))
+                    and not terminal
+                    and started
+                    and not failed_start
+                )
                 meta = dict(item.metadata_json or {})
                 meta["cursor_in_flight"] = cursor_busy
                 item.metadata_json = meta
@@ -909,6 +927,25 @@ async def after_agent_run(
             if consult is not None:
                 consult.work_item_id = item.id
                 await db.commit()
+        return item
+
+    needs_workspace = False
+    for call in audit:
+        if not isinstance(call, dict):
+            continue
+        payload = audit_tool_result(call)
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("needs_workspace") or str(payload.get("status") or "") in {
+            "workspace_unavailable",
+            "cursor_unavailable",
+            "not_started",
+        }:
+            needs_workspace = True
+            break
+    if needs_workspace and item.wait_owner == "manager":
+        # Already rolled back to manager action — do not flip into «Жду Cursor».
+        await db.commit()
         return item
 
     if context.get("_pm_mode") and item.pm_phase == "DONE":
