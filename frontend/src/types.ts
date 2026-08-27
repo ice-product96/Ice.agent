@@ -385,6 +385,14 @@ export interface WorkItemEvent {
   payload?: Record<string, unknown>
 }
 
+export interface WorkItemEventsPage {
+  items: WorkItemEvent[]
+  total: number
+  page: number
+  size: number
+  pages: number
+}
+
 export interface DecisionRecord {
   id: ID
   project_id: string
@@ -497,6 +505,7 @@ export interface WorkItem {
   created_at?: string | null
   updated_at?: string | null
   events?: WorkItemEvent[]
+  events_page?: WorkItemEventsPage
   intake?: {
     armed?: boolean
     count?: number

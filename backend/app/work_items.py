@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .action_reports import audit_tool_result, cursor_result_ready_for_customer
@@ -503,6 +503,47 @@ async def list_events(db: AsyncSession, work_item_id: int, *, limit: int = 80) -
             .limit(limit)
         )
     )
+
+
+async def list_events_page(
+    db: AsyncSession,
+    work_item_id: int,
+    *,
+    page: int = 1,
+    size: int = 20,
+) -> dict[str, Any]:
+    """Newest-first pages; items within a page are chronological (oldest → newest)."""
+    page = max(1, int(page or 1))
+    size = max(1, min(100, int(size or 20)))
+    total = int(
+        await db.scalar(
+            select(func.count())
+            .select_from(WorkItemEvent)
+            .where(WorkItemEvent.work_item_id == work_item_id)
+        )
+        or 0
+    )
+    pages = max(1, (total + size - 1) // size) if total else 1
+    if page > pages:
+        page = pages
+    offset = (page - 1) * size
+    rows = list(
+        await db.scalars(
+            select(WorkItemEvent)
+            .where(WorkItemEvent.work_item_id == work_item_id)
+            .order_by(WorkItemEvent.id.desc())
+            .offset(offset)
+            .limit(size)
+        )
+    )
+    items = list(reversed(rows))
+    return {
+        "items": [work_event_json(event) for event in items],
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": pages,
+    }
 
 
 async def counts_for_agent(db: AsyncSession, agent_id: int) -> dict[str, int]:

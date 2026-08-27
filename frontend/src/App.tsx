@@ -1,6 +1,6 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import {
-  Activity, Bot, BrainCircuit, Briefcase, CalendarClock, CheckCircle2, ChevronRight, CircleAlert,
+  Activity, Bot, BrainCircuit, Briefcase, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, CircleAlert,
   Clock3, Database, FileText, Globe2, KeyRound, LayoutDashboard, Link2, LoaderCircle, LogOut, Menu,
   MessageCircle, MessagesSquare, Moon, Phone, PhoneCall, PhoneOff, Play, Plus, RefreshCw, Search, ServerCog, Settings, ShieldCheck,
   Sparkles, Trash2, Users, Wifi, WifiOff, X, Zap, Inbox,
@@ -11,7 +11,7 @@ import type {
   AdminSettings, Agent, AgentTask, Consultation, CronJob, Dashboard, EmployeeState, LogEntry, McpServer,
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, RuntimeSettings,
   Customer, CursorProjectOption, EmployeePolicy, EmployeePolicyCatalog,
-  PromptSectionRevision, SipAccount, SipCall, Status, TelegramAccount, WorkItem,
+  PromptSectionRevision, SipAccount, SipCall, Status, TelegramAccount, WorkItem, WorkItemEvent, WorkItemEventsPage,
 } from './types'
 
 type Page = 'dashboard' | 'agents' | 'connections' | 'runtime' | 'telegram' | 'sip' | 'calls' | 'conversations' | 'employee' | 'customers' | 'memory' | 'mcp' | 'cron' | 'settings' | 'logs' | 'tasks'
@@ -1068,6 +1068,9 @@ function EmployeeScreen() {
   const [selectedId, setSelectedId] = useState('')
   const [instructNote, setInstructNote] = useState('')
   const [selected, setSelected] = useState<WorkItem | null>(null)
+  const [eventsPage, setEventsPage] = useState(1)
+  const [eventsFeed, setEventsFeed] = useState<WorkItemEventsPage | null>(null)
+  const [eventsLoading, setEventsLoading] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [sections, setSections] = useState<Record<string, string>>({})
   const [historyKey, setHistoryKey] = useState('')
@@ -1177,10 +1180,15 @@ function EmployeeScreen() {
   }
 
   useEffect(() => { setConfirmDelete(false) }, [selectedId])
+  useEffect(() => {
+    setEventsPage(1)
+    setEventsFeed(null)
+  }, [selectedId])
 
   useEffect(() => {
     if (!agentId || !selectedId) {
       setSelected(null)
+      setEventsFeed(null)
       return
     }
     let cancelled = false
@@ -1191,6 +1199,23 @@ function EmployeeScreen() {
     })
     return () => { cancelled = true }
   }, [agentId, selectedId, state?.work_items])
+
+  useEffect(() => {
+    if (!agentId || !selectedId) {
+      setEventsFeed(null)
+      return
+    }
+    let cancelled = false
+    setEventsLoading(true)
+    void api.agents.workItemEvents(agentId, selectedId, eventsPage, 20).then(page => {
+      if (!cancelled) setEventsFeed(page)
+    }).catch(() => {
+      if (!cancelled) setEventsFeed(null)
+    }).finally(() => {
+      if (!cancelled) setEventsLoading(false)
+    })
+    return () => { cancelled = true }
+  }, [agentId, selectedId, eventsPage, state?.work_items])
 
   async function saveProfile() {
     if (!agentId) return
@@ -1645,8 +1670,9 @@ function EmployeeScreen() {
         </div>
         <h3 className="work-timeline-title">Лента действий</h3>
         <div className="work-timeline">
-          {(selected.events || []).length === 0 ? <p className="transcript-empty">Пока нет событий по кейсу.</p> :
-            (selected.events || []).map(event => (
+          {eventsLoading && !eventsFeed ? <p className="transcript-empty">Загрузка событий…</p> :
+            (eventsFeed?.items || selected.events || []).length === 0 ? <p className="transcript-empty">Пока нет событий по кейсу.</p> :
+            (eventsFeed?.items || selected.events || []).map((event: WorkItemEvent) => (
               <div className={`work-event kind-${event.kind}`} key={event.id}>
                 <strong>{event.title}</strong>
                 <small>{event.created_at ? new Date(event.created_at).toLocaleString('ru-RU') : ''} · {event.kind}</small>
@@ -1654,6 +1680,30 @@ function EmployeeScreen() {
               </div>
             ))}
         </div>
+        {(eventsFeed?.total || 0) > 0 && (
+          <div className="timeline-pager">
+            <button
+              type="button"
+              className="secondary compact"
+              disabled={eventsLoading || eventsPage >= (eventsFeed?.pages || 1)}
+              onClick={() => setEventsPage(p => p + 1)}
+            >
+              <ChevronLeft size={14}/>Старше
+            </button>
+            <small>
+              {eventsLoading ? '…' : `стр. ${eventsFeed?.page || eventsPage} / ${eventsFeed?.pages || 1}`}
+              {eventsFeed?.total != null ? ` · ${eventsFeed.total} соб.` : ''}
+            </small>
+            <button
+              type="button"
+              className="secondary compact"
+              disabled={eventsLoading || eventsPage <= 1}
+              onClick={() => setEventsPage(p => Math.max(1, p - 1))}
+            >
+              Новее<ChevronRight size={14}/>
+            </button>
+          </div>
+        )}
       </section>}
 
       <section className="panel">

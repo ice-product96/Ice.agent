@@ -9,9 +9,11 @@ from app.employee import EmployeeService, save_once_job
 from app.job_result import build_followup_payload
 from app.work_items import (
     MAX_RETRIES,
+    add_event,
     after_agent_run,
     bind_work_item,
     handle_run_failure,
+    list_events_page,
     notify_channels,
     resume_work_item,
 )
@@ -261,4 +263,37 @@ async def test_save_once_job_keeps_work_item_id(tmp_path: Path) -> None:
             },
         )
         assert (job.payload or {}).get("work_item_id") == 9
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_events_page_newest_first(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "events.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.commit()
+        await db.refresh(agent)
+        item = WorkItem(
+            agent_id=agent.id,
+            title="case",
+            goal="goal",
+            status="in_progress",
+            source="telegram",
+        )
+        db.add(item)
+        await db.commit()
+        await db.refresh(item)
+        for index in range(5):
+            await add_event(db, item, kind="note", title=f"e{index}", detail=str(index))
+        await db.commit()
+        page1 = await list_events_page(db, item.id, page=1, size=2)
+        assert page1["total"] == 5
+        assert page1["pages"] == 3
+        assert page1["page"] == 1
+        assert [row["title"] for row in page1["items"]] == ["e3", "e4"]
+        page2 = await list_events_page(db, item.id, page=2, size=2)
+        assert [row["title"] for row in page2["items"]] == ["e1", "e2"]
+        page3 = await list_events_page(db, item.id, page=3, size=2)
+        assert [row["title"] for row in page3["items"]] == ["e0"]
     await engine.dispose()

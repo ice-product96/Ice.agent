@@ -74,6 +74,8 @@ h1, h2, h3, .brand { font-family: 'Manrope', sans-serif; }
 .work-goal { margin: 8px 0 10px; color: #c5cbd8; font-size: 13px; line-height: 1.45; }
 .work-timeline-title { margin: 18px 0 8px; font-size: 12px; color: #aeb5c4; }
 .work-timeline { display: flex; flex-direction: column; gap: 8px; }
+.timeline-pager { margin-top: 10px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.timeline-pager small { color: #7a8395; font-size: 11px; text-align: center; }
 .work-event { padding: 10px 12px; border: 1px solid #242a38; border-radius: 8px; background: #0d1118; }
 .work-event strong { display: block; font-size: 12px; color: #e7eaf2; }
 .work-event small { color: #6f778a; }

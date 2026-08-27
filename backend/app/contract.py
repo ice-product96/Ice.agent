@@ -1138,10 +1138,10 @@ async def get_agent_work_item(
     work_item_id: int,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    from .work_items import list_events, work_item_json
+    from .work_items import list_events_page, work_item_json
 
     _, item = await _agent_work_item(db, agent_id, work_item_id)
-    events = list(reversed(await list_events(db, item.id, limit=120)))
+    events_page = await list_events_page(db, item.id, page=1, size=20)
     decisions = (
         await db.scalars(
             select(DecisionRecord)
@@ -1157,11 +1157,12 @@ async def get_agent_work_item(
         )
     ).all()
     project = await db.get(ProjectState, item.project_id) if item.project_id else None
-    result = work_item_json(item, events=events)
+    result = work_item_json(item, events=events_page["items"])
     result.update(
         decisions=[decision_record_json(row) for row in decisions],
         cursor_runs=[cursor_run_json(row) for row in runs],
         project=project_state_json(project) if project else None,
+        events_page=events_page,
     )
     from .employee import get_or_create_profile
     from .project_schedule import enrich_work_item_commerce
@@ -1171,6 +1172,20 @@ async def get_agent_work_item(
         enrich_work_item_commerce(item, project, list(runs), profile=profile)
     )
     return result
+
+
+@router.get("/agents/{agent_id}/work-items/{work_item_id}/events", dependencies=auth)
+async def list_agent_work_item_events(
+    agent_id: str,
+    work_item_id: int,
+    page: int = 1,
+    size: int = 20,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .work_items import list_events_page
+
+    _, item = await _agent_work_item(db, agent_id, work_item_id)
+    return await list_events_page(db, item.id, page=page, size=size)
 
 
 @router.post("/agents/{agent_id}/work-items/{work_item_id}/resume", dependencies=auth)

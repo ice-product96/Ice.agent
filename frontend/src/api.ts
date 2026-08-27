@@ -2,7 +2,7 @@ import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
   Conversation, ConversationDetail, Consultation, EmployeePolicy, EmployeePolicyCatalog, EmployeeProfile, EmployeeRosterEntry, EmployeeState,
   Customer, CursorProjectOption, LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
-  PmProjectDetail, ProjectState, PromptSectionRevision, RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts,
+  PmProjectDetail, ProjectState, PromptSectionRevision, RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts, WorkItemEventsPage,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api/v1'
@@ -97,6 +97,8 @@ export const api = {
     workItems: (id: string, status = 'open') =>
       request<{ items: WorkItem[]; counts: WorkItemCounts }>(`/agents/${id}/work-items${qs({ status, limit: 80 })}`),
     workItem: (id: string, workItemId: string) => request<WorkItem>(`/agents/${id}/work-items/${workItemId}`),
+    workItemEvents: (id: string, workItemId: string, page = 1, size = 20) =>
+      request<WorkItemEventsPage>(`/agents/${id}/work-items/${workItemId}/events${qs({ page, size })}`),
     resumeWorkItem: (id: string, workItemId: string, note = '') =>
       request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/resume`, { method: 'POST', ...body({ note }) }),
     pauseWorkItem: (id: string, workItemId: string, note = '') =>
