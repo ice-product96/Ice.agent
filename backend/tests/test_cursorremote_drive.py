@@ -372,5 +372,16 @@ def test_prompt_actually_started_requires_busy() -> None:
     assert not prompt_actually_started(
         {"prompt_sent": False, "status": "workspace_unavailable", "done": False}
     )
+    # Skipped new prompt because Composer is already busy — still counts as started.
+    assert prompt_actually_started(
+        {
+            "prompt_sent": False,
+            "skipped_prompt": True,
+            "status": "working",
+            "started": True,
+            "seen_busy": True,
+            "done": False,
+        }
+    )
 
 

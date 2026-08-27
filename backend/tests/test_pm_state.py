@@ -387,10 +387,34 @@ def test_brief_and_result_parsing_are_canonical() -> None:
     assert embedded["status"] == "blocked"
     assert embedded["implementation"]["summary"] == "need ssh"
 
-    from app.pm_state import is_leftover_cursor_idle
+    from app.pm_state import is_leftover_cursor_idle, recover_truncated_cursor_result
 
     assert is_leftover_cursor_idle({"done": True, "skipped_prompt": True})
     assert is_leftover_cursor_idle({"done": True})
     assert not is_leftover_cursor_idle({"done": True, "prompt_sent": True})
     assert not is_leftover_cursor_idle({"done": True, "seen_busy": True})
+    assert not is_leftover_cursor_idle({"done": True, "started": True})
+    assert not is_leftover_cursor_idle(
+        {"done": True, "skipped_prompt": True, "started": True}
+    )
     assert not is_leftover_cursor_idle({"done": False})
+
+    truncated = (
+        '{  "task_id": 30,  "status": "completed",  "implementation": {    '
+        '"summary": "Семь правок UI уже в master",    "files_changed": ["a.tsx"], '
+        '"tests": ["tsc"]  },  "verification": {    "tests_passed": true, '
+        '"lint_passed": true,    "acceptance_criteria": [      {        '
+        '"criterion": "Название перенесено",        "passed": true,        '
+        '"evidence": "product-card'
+    )
+    recovered = recover_truncated_cursor_result(
+        truncated,
+        expected_task_id="30",
+        acceptance_criteria=["Название перенесено"],
+    )
+    assert recovered is not None
+    assert recovered["status"] == "completed"
+    assert recovered["task_id"] == "30"
+    assert "master" in recovered["implementation"]["summary"]
+    assert recovered["verification"]["acceptance_criteria"][0]["passed"] is True
+    assert recover_truncated_cursor_result(truncated, expected_task_id="99") is None

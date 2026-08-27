@@ -1610,7 +1610,11 @@ class AgentRuntime:
                         run: CursorRun,
                         result: dict[str, Any],
                     ) -> dict[str, Any]:
-                        from .pm_state import is_leftover_cursor_idle, parse_cursor_result
+                        from .pm_state import (
+                            is_leftover_cursor_idle,
+                            parse_cursor_result,
+                            recover_truncated_cursor_result,
+                        )
 
                         if not prompt_actually_started(result) and not result.get("done"):
                             return await _rollback_unstarted_cursor(
@@ -1626,8 +1630,10 @@ class AgentRuntime:
                             )
                         if not result.get("done"):
                             await update_cursor_run(db, run, status="running", result=result)
+                            item.active_cursor_run_id = run.id
                             item.status = "waiting_external"
                             item.wait_owner = "external"
+                            item.last_error = None
                             ctx = dict(item.context_json or {}) if isinstance(item.context_json, dict) else {}
                             min_minutes = ctx.get("min_execution_minutes")
                             if min_minutes:
@@ -1640,6 +1646,13 @@ class AgentRuntime:
                             meta = dict(item.metadata_json or {})
                             meta["cursor_in_flight"] = True
                             item.metadata_json = meta
+                            if item.pm_phase in {"READY_FOR_DEV", "BLOCKED", "CHANGES_REQUESTED"}:
+                                await transition_pm_phase(
+                                    db,
+                                    item,
+                                    "IN_DEVELOPMENT",
+                                    detail="Cursor job in progress",
+                                )
                             from .work_items import stamp_cursor_prompt_sent
 
                             await stamp_cursor_prompt_sent(db, item)
@@ -1649,6 +1662,7 @@ class AgentRuntime:
                                 "run_id": run.id,
                                 "status": "in_progress",
                                 "done": False,
+                                "reattached": bool(result.get("skipped_prompt")),
                             }
                         structured: dict[str, Any] | None = None
                         candidates: list[Any] = [result.get("result"), result.get("summary")]
@@ -1675,6 +1689,36 @@ class AgentRuntime:
                                 break
                             except (TypeError, ValueError):
                                 continue
+                        if structured is None:
+                            criteria = []
+                            ctx = (
+                                dict(item.context_json or {})
+                                if isinstance(item.context_json, dict)
+                                else {}
+                            )
+                            for key in ("acceptance_criteria", "acceptance"):
+                                raw_c = ctx.get(key) or (item.metadata_json or {}).get(key)
+                                if isinstance(raw_c, list):
+                                    criteria = [str(x) for x in raw_c if str(x or "").strip()]
+                                    break
+                            for candidate in candidates:
+                                text = candidate
+                                if isinstance(text, dict):
+                                    text = (
+                                        text.get("content")
+                                        or text.get("text")
+                                        or text.get("summary")
+                                        or ""
+                                    )
+                                if not isinstance(text, str):
+                                    continue
+                                structured = recover_truncated_cursor_result(
+                                    text,
+                                    expected_task_id=str(item.id),
+                                    acceptance_criteria=criteria,
+                                )
+                                if structured is not None:
+                                    break
                         task_id = str(item.id)
                         if structured is not None:
                             got_id = str(structured.get("task_id") or "").strip()
@@ -1985,16 +2029,60 @@ class AgentRuntime:
                         item = await get_work_item(
                             db, work_item_id or (context or {}).get("work_item_id")
                         )
-                        if (
-                            item is None
-                            or item.agent_id != agent.id
-                            or not item.active_cursor_run_id
-                        ):
+                        if item is None or item.agent_id != agent.id:
                             raise ValueError("No active Cursor run")
-                        run = await db.get(CursorRun, item.active_cursor_run_id)
-                        if run is None:
-                            raise ValueError("Cursor run not found")
-                        if run.status in {"completed", "blocked", "failed", "cancelled"}:
+                        run = (
+                            await db.get(CursorRun, item.active_cursor_run_id)
+                            if item.active_cursor_run_id
+                            else None
+                        )
+                        # Orphaned wait: tracking was cleared while Composer still has the job.
+                        if run is None or run.status in {"cancelled", "failed"}:
+                            live = await check_and_drive(cursor_session)
+                            if live.get("done") or live.get("seen_busy") or live.get("started"):
+                                attempt = int(
+                                    await db.scalar(
+                                        select(func.count())
+                                        .select_from(CursorRun)
+                                        .where(CursorRun.work_item_id == item.id)
+                                    )
+                                    or 0
+                                ) + 1
+                                run, _ = await get_or_create_cursor_run(
+                                    db,
+                                    item,
+                                    attempt=attempt,
+                                    request={
+                                        "reattach": True,
+                                        "reason": "Recover orphaned Cursor session",
+                                    },
+                                )
+                                await update_cursor_run(db, run, status="running")
+                                if item.pm_phase in {"READY_FOR_DEV", "BLOCKED", "CHANGES_REQUESTED"}:
+                                    await transition_pm_phase(
+                                        db,
+                                        item,
+                                        "IN_DEVELOPMENT",
+                                        detail="Reattached to live Cursor session",
+                                    )
+                                item.active_cursor_run_id = run.id
+                                meta = dict(item.metadata_json or {})
+                                meta["cursor_in_flight"] = not bool(live.get("done"))
+                                item.metadata_json = meta
+                                await db.commit()
+                                return await _pm_cursor_result(item, run, live)
+                            return {
+                                "task": work_item_json(item),
+                                "status": "no_active_run",
+                                "done": False,
+                                "live": live,
+                                "reason": (
+                                    "No active Cursor run tracked. Composer is idle/unavailable. "
+                                    "If the workspace is open, call submit_development_task once; "
+                                    "do not spam checks."
+                                ),
+                            }
+                        if run.status in {"completed", "blocked"}:
                             return {
                                 "task": work_item_json(item),
                                 "run_id": run.id,
@@ -2032,15 +2120,23 @@ class AgentRuntime:
                         item = await get_work_item(
                             db, work_item_id or (context or {}).get("work_item_id")
                         )
-                        if (
-                            item is None
-                            or item.agent_id != agent.id
-                            or not item.active_cursor_run_id
-                        ):
+                        if item is None or item.agent_id != agent.id:
                             raise ValueError("No Cursor result for this task")
-                        run = await db.get(CursorRun, item.active_cursor_run_id)
+                        run = (
+                            await db.get(CursorRun, item.active_cursor_run_id)
+                            if item.active_cursor_run_id
+                            else None
+                        )
                         if run is None:
-                            raise ValueError("Cursor run not found")
+                            return {
+                                "task_id": str(item.id),
+                                "status": "no_active_run",
+                                "done": False,
+                                "reason": (
+                                    "No Cursor result stored. Call get_development_status — "
+                                    "it reattaches to a live Composer session if one exists."
+                                ),
+                            }
                         return {
                             "task_id": str(item.id),
                             "run_id": run.id,

@@ -138,10 +138,8 @@ def workspace_matches(expected: str | None, candidates: list[str]) -> bool:
 
 
 def prompt_actually_started(result: dict[str, Any] | None) -> bool:
-    """True only when Cursor accepted work for this assignment."""
+    """True when Cursor accepted work for this assignment (or was already busy with it)."""
     if not isinstance(result, dict):
-        return False
-    if result.get("skipped_prompt") or not result.get("prompt_sent"):
         return False
     status = str(result.get("status") or "").strip().lower()
     if status in {
@@ -151,11 +149,14 @@ def prompt_actually_started(result: dict[str, Any] | None) -> bool:
         "no_window",
     }:
         return False
-    if result.get("done"):
+    # Already-busy Composer: we skipped a new prompt on purpose — still in flight.
+    if result.get("seen_busy") or result.get("started") or status in BUSY_STATUSES:
         return True
-    if result.get("seen_busy") or result.get("started"):
+    if result.get("done") and (result.get("prompt_sent") or result.get("seen_busy")):
         return True
-    return False
+    if result.get("skipped_prompt") or not result.get("prompt_sent"):
+        return False
+    return True
 
 
 async def ensure_cursor_workspace(
@@ -379,7 +380,9 @@ def summarize_cursor_state(state: Any) -> str:
         if kind == "assistant":
             text = str(item.get("text") or "").strip()
             if text:
-                chunks.append(text[:2000])
+                # Keep enough of the final JSON for PM parsing (CursorRemote often
+                # already clips each message; avoid clipping it again to a tiny stub).
+                chunks.append(text[:12000])
         elif kind == "plan":
             label = str(item.get("label") or "plan")
             desc = str(item.get("description") or "").strip()
@@ -491,6 +494,7 @@ def _result(
         "done": done,
         "status": status,
         "started": seen_busy,
+        "seen_busy": seen_busy,
         "summary": summary,
         "approvals": approvals,
         "last": last,
