@@ -164,6 +164,19 @@ def work_item_tracker_task_id(item: WorkItem) -> str:
     return ""
 
 
+def work_item_tracker_project_id(item: WorkItem) -> str:
+    ctx = item.context_json if isinstance(item.context_json, dict) else {}
+    meta = item.metadata_json if isinstance(item.metadata_json, dict) else {}
+    pm = meta.get("pm") if isinstance(meta.get("pm"), dict) else {}
+    for source in (ctx, pm, meta):
+        if not isinstance(source, dict):
+            continue
+        value = str(source.get("tracker_project_id") or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def tracker_intake_message_id(tracker_task_id: str) -> str:
     """Stable unique source_message_id so each tracker card can have its own WorkItem."""
     tid = str(tracker_task_id or "").strip()
@@ -373,8 +386,8 @@ def build_tracker_poll_instruction(backlog: dict[str, Any]) -> str:
         "в context_json обязательно tracker_task_id + tracker_project_id) → оценка/"
         "согласование по правилам проекта → при готовности submit_development_task.",
         "Не дублируй задачи, которые уже в already_tracked. Не пиши заказчику про "
-        "сам факт проверки трекера. Карточку в трекере обнови сам (move/complete) "
-        "когда работа реально принята.",
+        "сам факт проверки трекера. Карточку двигает платформа по фазе PM; "
+        "не вызывай move_task/complete_task вручную.",
         "Очередь:",
     ]
     for item in claimable[:8]:
@@ -386,3 +399,378 @@ def build_tracker_poll_instruction(backlog: dict[str, Any]) -> str:
             f"section={item.get('section') or '—'})"
         )
     return "\n".join(lines)
+
+
+def should_attach_tracker_poll(item: WorkItem | None, backlog: dict[str, Any] | None) -> bool:
+    """Do not glue a new tracker card onto an already focused unrelated case."""
+    if not int((backlog or {}).get("count_claimable") or 0):
+        return False
+    if item is None:
+        return True
+    status = str(getattr(item, "status", "") or "").strip().lower()
+    phase = str(getattr(item, "pm_phase", "") or "").strip().upper()
+    if status in {"done", "failed"} or phase in {"DONE", "CANCELLED"}:
+        return True
+    return False
+
+
+_runtime_mcp: Any = None
+
+# Board column names (lowercase) that correspond to a work lane.
+TRACKER_LANE_ALIASES: dict[str, tuple[str, ...]] = {
+    "todo": (
+        "новые",
+        "new",
+        "todo",
+        "to do",
+        "backlog",
+        "бэклог",
+        "очередь",
+        "inbox",
+        "к работе",
+        "постановка",
+    ),
+    "in_progress": (
+        "в работе",
+        "in progress",
+        "in_progress",
+        "doing",
+        "dev",
+        "разработка",
+        "работа",
+        "coding",
+    ),
+    "qa": (
+        "qa",
+        "тест",
+        "проверка",
+        "review",
+        "ревью",
+        "testing",
+        "контроль",
+        "приёмка",
+        "приемка",
+    ),
+    "blocked": ("блок", "blocked", "ожидание", "stuck", "hold"),
+    "completed": ("готово", "done", "completed", "закрыто", "готовые", "done.", "закрыт"),
+    "cancelled": ("отмена", "cancelled", "canceled", "отменено", "cancel"),
+}
+
+
+def set_tracker_mcp(mcp: Any) -> None:
+    global _runtime_mcp
+    _runtime_mcp = mcp
+
+
+def tracker_lane_for_phase(phase: str) -> str:
+    name = str(phase or "").strip().upper()
+    if name in {"QA", "DEV_COMPLETE", "CLIENT_REVIEW"}:
+        return "qa"
+    if name == "BLOCKED":
+        return "blocked"
+    if name == "DONE":
+        return "completed"
+    if name == "CANCELLED":
+        return "cancelled"
+    if name in {
+        "REQUIREMENTS_READY",
+        "CLIENT_CONFIRMED",
+        "READY_FOR_DEV",
+        "IN_DEVELOPMENT",
+        "CHANGES_REQUESTED",
+    }:
+        return "in_progress"
+    return "todo"
+
+
+def tracker_status_for_phase(phase: str) -> str:
+    lane = tracker_lane_for_phase(phase)
+    if lane in {"qa", "blocked"}:
+        return "in_progress"
+    if lane == "completed":
+        return "completed"
+    if lane == "cancelled":
+        return "cancelled"
+    return lane
+
+
+def _norm_section_name(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().replace("_", " ").split())
+
+
+def extract_sections(payload: Any) -> list[dict[str, str]]:
+    data = parse_mcp_payload(payload)
+    items: list[Any] = []
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        raw = data.get("sections") or data.get("columns") or data.get("items") or []
+        if isinstance(raw, list):
+            items = raw
+    found: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        section = item.get("section") if isinstance(item.get("section"), dict) else item
+        if not isinstance(section, dict):
+            continue
+        sid = str(section.get("id") or item.get("section_id") or "").strip()
+        name = str(section.get("name") or item.get("section_name") or "").strip()
+        key = sid or name
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        found.append({"id": sid, "name": name})
+    return found
+
+
+def match_section_for_lane(
+    sections: list[dict[str, str]],
+    lane: str,
+) -> dict[str, str] | None:
+    aliases = TRACKER_LANE_ALIASES.get(lane) or ()
+    for section in sections:
+        name = _norm_section_name(section.get("name") or "")
+        if not name:
+            continue
+        for alias in aliases:
+            want = _norm_section_name(alias)
+            if not want:
+                continue
+            if name == want or want in name or name in want:
+                return section
+    if lane == "qa":
+        return match_section_for_lane(sections, "in_progress")
+    if lane == "blocked":
+        return match_section_for_lane(sections, "in_progress")
+    return None
+
+
+def _task_section_id(task: MappingLike | None) -> str:
+    if not isinstance(task, dict):
+        return ""
+    section = task.get("section")
+    if isinstance(section, dict):
+        return str(section.get("id") or "").strip()
+    return str(
+        task.get("section_id") or task.get("column_id") or ""
+    ).strip()
+
+
+def _task_section_name(task: MappingLike | None) -> str:
+    if not isinstance(task, dict):
+        return ""
+    section = task.get("section")
+    if isinstance(section, dict):
+        return str(section.get("name") or "").strip()
+    return str(task.get("section_name") or task.get("column") or "").strip()
+
+
+async def _mcp_try(
+    session: Any,
+    tool: str,
+    attempts: list[dict[str, Any]],
+) -> Any:
+    last_error = ""
+    for arguments in attempts:
+        try:
+            return await mcp_call(session, tool, arguments)
+        except Exception as exc:
+            last_error = str(exc)[:500]
+            logger.info("tracker.%s failed %s: %s", tool, arguments, last_error)
+    raise RuntimeError(last_error or f"{tool} failed")
+
+
+async def sync_work_item_tracker_card(
+    item: WorkItem,
+    *,
+    phase: str | None = None,
+    mcp: Any = None,
+    session: Any = None,
+) -> dict[str, Any]:
+    """Move the bound ice_tracker card to the column/status for this PM phase."""
+    task_id = work_item_tracker_task_id(item)
+    if not task_id:
+        return {"skipped": True, "reason": "no_tracker_card"}
+    to_phase = str(phase or item.pm_phase or "").strip().upper()
+    lane = tracker_lane_for_phase(to_phase)
+    status = tracker_status_for_phase(to_phase)
+    tracker_session = session
+    if tracker_session is None:
+        tracker_session, _ = find_ice_tracker_session(mcp if mcp is not None else _runtime_mcp)
+    if tracker_session is None:
+        logger.info(
+            "tracker.sync skipped work_item=%s task=%s reason=no_session phase=%s",
+            getattr(item, "id", None),
+            task_id,
+            to_phase,
+        )
+        return {"skipped": True, "reason": "no_session", "phase": to_phase, "lane": lane}
+    logger.info(
+        "tracker.sync begin work_item=%s task=%s phase=%s lane=%s status=%s",
+        getattr(item, "id", None),
+        task_id,
+        to_phase,
+        lane,
+        status,
+    )
+    current: dict[str, Any] = {}
+    try:
+        raw = await _mcp_try(
+            tracker_session,
+            "get_task",
+            [{"task_id": task_id}, {"id": task_id}],
+        )
+        parsed = parse_mcp_payload(raw)
+        if isinstance(parsed, dict):
+            current = parsed
+    except Exception as exc:
+        logger.info("tracker.get_task failed work_item=%s: %s", getattr(item, "id", None), exc)
+    already_done = _task_status(current) in DONE_TRACKER_STATUSES or bool(
+        current.get("is_completed")
+    )
+    if to_phase == "DONE" and already_done:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "already_completed",
+            "phase": to_phase,
+            "task_id": task_id,
+        }
+    project_id = work_item_tracker_project_id(item) or str(
+        current.get("project_id") or ""
+    ).strip()
+    sections: list[dict[str, str]] = []
+    if project_id:
+        try:
+            listed = await _mcp_try(
+                tracker_session,
+                "list_sections",
+                [{"project_id": project_id}, {"id": project_id}],
+            )
+            sections = extract_sections(listed)
+        except Exception as exc:
+            logger.info("tracker.list_sections failed: %s", exc)
+            try:
+                board = await mcp_call(
+                    tracker_session,
+                    "get_project_board",
+                    {"project_id": project_id},
+                )
+                # Reuse columns from the board payload.
+                data = parse_mcp_payload(board)
+                sections = extract_sections(data if data is not None else board)
+                if not sections and isinstance(data, dict):
+                    sections = extract_sections({"columns": data.get("columns") or []})
+            except Exception as board_exc:
+                logger.info("tracker.get_project_board failed: %s", board_exc)
+    target = match_section_for_lane(sections, lane)
+    moved = False
+    completed = False
+    updated_status = False
+    current_section_id = _task_section_id(current)
+    result: dict[str, Any] = {
+        "ok": True,
+        "phase": to_phase,
+        "lane": lane,
+        "status": status,
+        "task_id": task_id,
+        "from_section": _task_section_name(current) or current_section_id or None,
+        "to_section": (target or {}).get("name") if target else None,
+    }
+    try:
+        if target and target.get("id") and target["id"] != current_section_id:
+            await _mcp_try(
+                tracker_session,
+                "move_task",
+                [
+                    {"task_id": task_id, "section_id": target["id"]},
+                    {"id": task_id, "section_id": target["id"]},
+                    {"task_id": task_id, "to_section_id": target["id"]},
+                ],
+            )
+            moved = True
+            logger.info(
+                "tracker.move work_item=%s task=%s section=%s (%s)",
+                getattr(item, "id", None),
+                task_id,
+                target.get("name"),
+                target.get("id"),
+            )
+        elif not target and status in {"todo", "in_progress", "cancelled"}:
+            current_status = _task_status(current)
+            if current_status != status:
+                await _mcp_try(
+                    tracker_session,
+                    "update_task",
+                    [
+                        {"task_id": task_id, "status": status},
+                        {"id": task_id, "status": status},
+                    ],
+                )
+                updated_status = True
+                logger.info(
+                    "tracker.status work_item=%s task=%s status=%s",
+                    getattr(item, "id", None),
+                    task_id,
+                    status,
+                )
+        if to_phase == "DONE" and not already_done:
+            await _mcp_try(
+                tracker_session,
+                "complete_task",
+                [{"task_id": task_id}, {"id": task_id}],
+            )
+            completed = True
+            logger.info(
+                "tracker.complete work_item=%s task=%s",
+                getattr(item, "id", None),
+                task_id,
+            )
+        if to_phase == "CANCELLED" and not already_done and not updated_status:
+            try:
+                await _mcp_try(
+                    tracker_session,
+                    "update_task",
+                    [
+                        {"task_id": task_id, "status": "cancelled"},
+                        {"id": task_id, "status": "canceled"},
+                    ],
+                )
+                updated_status = True
+            except Exception as exc:
+                logger.info("tracker.cancel status failed: %s", exc)
+    except Exception as exc:
+        error = str(exc)[:800]
+        logger.warning(
+            "tracker.sync failed work_item=%s task=%s phase=%s: %s",
+            getattr(item, "id", None),
+            task_id,
+            to_phase,
+            error,
+        )
+        return {
+            "ok": False,
+            "error": error,
+            "phase": to_phase,
+            "lane": lane,
+            "task_id": task_id,
+        }
+    result.update(
+        {
+            "moved": moved,
+            "completed": completed,
+            "updated_status": updated_status,
+            "skipped": not (moved or completed or updated_status),
+        }
+    )
+    logger.info(
+        "tracker.sync done work_item=%s task=%s moved=%s completed=%s status_updated=%s",
+        getattr(item, "id", None),
+        task_id,
+        moved,
+        completed,
+        updated_status,
+    )
+    return result

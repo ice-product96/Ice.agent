@@ -13,9 +13,12 @@ from app.work_items import (
     after_agent_run,
     bind_work_item,
     handle_run_failure,
+    is_operational_admin_command,
     list_events_page,
     notify_channels,
+    reset_project_work_items,
     resume_work_item,
+    watchdog_items,
 )
 
 
@@ -337,4 +340,83 @@ async def test_list_events_page_newest_first(tmp_path: Path) -> None:
         assert [row["title"] for row in page2["items"]] == ["e1", "e2"]
         page3 = await list_events_page(db, item.id, page=3, size=2)
         assert [row["title"] for row in page3["items"]] == ["e0"]
+    await engine.dispose()
+
+
+def test_operational_admin_command_detection() -> None:
+    text = (
+        "проверь все задачи по uraltrade и все сбрось удали все задачи обнулить "
+        "что бы не какие не зависших не было не каких"
+    )
+    assert is_operational_admin_command(text, is_admin=True)
+    assert not is_operational_admin_command(text, is_admin=False)
+    assert not is_operational_admin_command("удали кнопку из шапки", is_admin=True)
+
+
+@pytest.mark.asyncio
+async def test_admin_reset_order_does_not_create_or_reuse_case(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "ops-bind.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.commit()
+        await db.refresh(agent)
+        leftover = await bind_work_item(
+            db,
+            agent,
+            {"source": "telegram", "reply_chat_id": "183432854", "chat_id": "183432854"},
+            "Собери ветку",
+        )
+        assert leftover is not None
+        reset = await bind_work_item(
+            db,
+            agent,
+            {
+                "source": "telegram",
+                "is_admin": True,
+                "reply_chat_id": "183432854",
+                "chat_id": "183432854",
+                "work_item_id": leftover.id,
+            },
+            "проверь все задачи по uraltrade и все сбрось удали все задачи обнулить",
+        )
+        assert reset is None
+        count = await db.scalar(select(func.count()).select_from(WorkItem))
+        assert count == 1
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reset_project_aborts_open_cases(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "ops-reset.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        hanging = WorkItem(
+            agent_id=agent.id,
+            title="проверь все задачи по uraltrade и все сбрось удали все задачи",
+            goal="обнулить",
+            project_id="uraltrade",
+            status="in_progress",
+            pm_phase="DISCUSSION",
+        )
+        other = WorkItem(
+            agent_id=agent.id,
+            title="LAVVE banner",
+            project_id="lavve",
+            status="in_progress",
+            pm_phase="DISCUSSION",
+        )
+        db.add_all([hanging, other])
+        await db.commit()
+        result = await reset_project_work_items(db, agent, "uraltrade", mode="abort")
+        assert hanging.id in result["aborted_ids"]
+        assert other.id not in result["aborted_ids"]
+        await db.refresh(hanging)
+        await db.refresh(other)
+        assert hanging.status == "done"
+        assert other.status == "in_progress"
+        pending = await watchdog_items(db, agent.id)
+        assert [item.id for item in pending] == [other.id]
     await engine.dispose()

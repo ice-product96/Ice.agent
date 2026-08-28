@@ -531,3 +531,58 @@ async def test_submit_sends_when_composer_is_idle_with_old_task_json(
         assert result.get("status") != "cursor_busy"
         assert result.get("leftover") is not True
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pm_reset_project_aborts_open_cases_for_admin(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'pm-reset.db').as_posix()}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    mcp = McpManager()
+    mcp.sessions = {"cursorremote": FakeCursorSession()}
+    runtime = AgentRuntime(
+        Settings(mem0_enabled=False),
+        SimpleNamespace(),
+        FakeSearch(),
+        FakeEvents(),
+        mcp=mcp,
+    )
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="проверь все задачи по uraltrade и все сбрось",
+            project_id="uraltrade",
+            status="in_progress",
+            pm_phase="DISCUSSION",
+        )
+        db.add(item)
+        await db.commit()
+        guest = await runtime.registry(
+            agent,
+            mcp_server_names={"cursorremote"},
+            memory_enabled=False,
+            db=db,
+            context={"_pm_mode": True, "work_item_id": item.id},
+        )
+        with pytest.raises(PermissionError, match="manager"):
+            await guest.call("pm_reset_project", {"project_id": "uraltrade"})
+        registry = await runtime.registry(
+            agent,
+            mcp_server_names={"cursorremote"},
+            memory_enabled=False,
+            db=db,
+            context={"_pm_mode": True, "is_admin": True, "work_item_id": item.id},
+        )
+        result = await registry.call("pm_reset_project", {"project_id": "uraltrade"})
+        assert item.id in result["aborted_ids"]
+        await db.refresh(item)
+        assert item.status == "done"
+    await engine.dispose()

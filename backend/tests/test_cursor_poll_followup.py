@@ -399,6 +399,14 @@ def test_tick_focus_prefers_older_qa_case() -> None:
     older = WorkItem(id=31, title="old", status="in_progress", pm_phase="QA")
     newer = WorkItem(id=32, title="new", status="in_progress", pm_phase="READY_FOR_DEV")
     assert _tick_focus_item([newer, older]).id == 31
+    ops = WorkItem(
+        id=34,
+        title="проверь все задачи по uraltrade и все сбрось удали все задачи обнулить",
+        status="in_progress",
+        pm_phase="DISCUSSION",
+    )
+    assert _tick_focus_item([ops, newer, older]).id == 31
+    assert _tick_focus_item([ops, newer]).id == 32
 
 
 @pytest.mark.asyncio

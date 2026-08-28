@@ -627,6 +627,7 @@ async def transition_pm_phase(
     *,
     detail: str = "",
     payload: Mapping[str, Any] | None = None,
+    mcp: Any = None,
 ) -> WorkItemEvent:
     from_phase = item.pm_phase
     validate_transition(from_phase, to_phase)
@@ -642,6 +643,52 @@ async def transition_pm_phase(
     )
     db.add(event)
     await db.flush()
+    tracker_result: dict[str, Any] | None = None
+    try:
+        from .tracker_poll import sync_work_item_tracker_card
+
+        tracker_result = await sync_work_item_tracker_card(
+            item, phase=to_phase, mcp=mcp
+        )
+    except Exception as exc:
+        logger.warning(
+            "tracker.sync after %s→%s work_item=%s failed: %s",
+            from_phase,
+            to_phase,
+            item.id,
+            exc,
+        )
+        tracker_result = {"ok": False, "error": str(exc)[:500]}
+    if tracker_result and (
+        tracker_result.get("moved")
+        or tracker_result.get("completed")
+        or tracker_result.get("updated_status")
+        or tracker_result.get("error")
+    ):
+        event_payload = dict(event.payload or {})
+        event_payload["tracker"] = tracker_result
+        event.payload = event_payload
+        if tracker_result.get("error") and to_phase in {"DONE", "CANCELLED"}:
+            item.last_error = f"Tracker: {tracker_result.get('error')}"[:2000]
+        db.add(
+            WorkItemEvent(
+                work_item_id=item.id,
+                kind="tracker",
+                title=(
+                    "Карточка трекера закрыта"
+                    if tracker_result.get("completed")
+                    else f"Карточка трекера → {tracker_result.get('to_section') or tracker_result.get('lane')}"
+                ),
+                detail=str(
+                    tracker_result.get("error")
+                    or tracker_result.get("to_section")
+                    or tracker_result.get("status")
+                    or ""
+                )[:800],
+                payload=tracker_result,
+            )
+        )
+        await db.flush()
     logger.info(
         "pm.transition project=%s task=%s from=%s to=%s",
         item.project_id,

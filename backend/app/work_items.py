@@ -29,6 +29,18 @@ MAX_RETRIES = 2
 WAIT_EXTERNAL_SLA = timedelta(minutes=30)
 WAIT_MANAGER_SLA = timedelta(minutes=60)
 
+_WIPE_VERBS = (
+    "сбрось",
+    "сброс",
+    "обнул",
+    "удали",
+    "удалить",
+    "reset",
+    "delete",
+    "cancel",
+)
+_WIPE_SCOPE = ("все", "all", "завис", "обнул", "целиком", "полностью")
+
 STATUS_LABELS = {
     "open": "Новый",
     "in_progress": "В работе",
@@ -60,6 +72,28 @@ NOTIFY_CHANNELS: dict[str, set[str]] = {
 
 def notify_channels(event: str) -> set[str]:
     return set(NOTIFY_CHANNELS.get(event, {"ui"}))
+
+
+def is_operational_admin_command(message: str, *, is_admin: bool = False) -> bool:
+    """True for manager wipe/reset-all orders, not ordinary development chat."""
+    if not is_admin:
+        return False
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    has_verb = any(verb in text for verb in _WIPE_VERBS)
+    has_scope = any(scope in text for scope in _WIPE_SCOPE)
+    return has_verb and has_scope
+
+
+def work_item_looks_like_admin_ops(item: WorkItem | None) -> bool:
+    if item is None:
+        return False
+    blob = f"{item.title or ''}\n{item.goal or ''}"
+    if is_operational_admin_command(blob, is_admin=True):
+        return True
+    ctx = item.context_json if isinstance(item.context_json, dict) else {}
+    return bool(ctx.get("operational_admin"))
 
 
 def work_item_json(item: WorkItem, *, events: list[WorkItemEvent] | None = None) -> dict[str, Any]:
@@ -697,6 +731,14 @@ async def bind_work_item(
             await bind_customer_to_work_item(db, item, customer, context=context)
 
     existing = await get_work_item(db, context.get("work_item_id"))
+    operational = is_operational_admin_command(
+        message, is_admin=bool(context.get("is_admin"))
+    )
+    if operational:
+        context["_operational_admin"] = True
+        context.pop("work_item_id", None)
+        return None
+
     if existing is not None and existing.agent_id == agent.id:
         context["work_item_id"] = existing.id
         apply_origin(existing, context)
@@ -1221,6 +1263,8 @@ async def watchdog_items(db: AsyncSession, agent_id: int) -> list[WorkItem]:
     for item in await list_open_work_items(db, agent_id, include_paused=False):
         if work_item_aborted(item):
             continue
+        if work_item_looks_like_admin_ops(item):
+            continue
         if item.status == "collecting":
             due = item.wait_until
             if due is None:
@@ -1457,6 +1501,70 @@ async def delete_work_item(
     await db.execute(delete(WorkItemEvent).where(WorkItemEvent.work_item_id == item.id))
     await db.delete(item)
     await db.commit()
+
+
+async def list_open_project_work_items(
+    db: AsyncSession,
+    agent_id: int,
+    project_id: str,
+) -> list[WorkItem]:
+    want = str(project_id or "").strip().lower()
+    if not want:
+        return []
+    items = await list_open_work_items(db, agent_id, include_paused=True)
+    found: list[WorkItem] = []
+    for item in items:
+        if work_item_aborted(item):
+            continue
+        slug = str(item.project_id or "").strip().lower()
+        if slug == want:
+            found.append(item)
+    return found
+
+
+async def reset_project_work_items(
+    db: AsyncSession,
+    agent: Agent,
+    project_id: str,
+    *,
+    mode: str = "abort",
+    also_tracker: bool = False,
+    scheduler: Any | None = None,
+    note: str = "",
+) -> dict[str, Any]:
+    """Abort or delete open PM cases for a project. Never wipes ice_tracker history."""
+    del also_tracker
+    slug = str(project_id or "").strip()
+    if not slug:
+        raise ValueError("project_id is required")
+    mode_name = str(mode or "abort").strip().lower()
+    if mode_name not in {"abort", "delete"}:
+        raise ValueError("mode must be abort or delete")
+    items = await list_open_project_work_items(db, agent.id, slug)
+    aborted: list[int] = []
+    deleted: list[int] = []
+    errors: list[dict[str, Any]] = []
+    detail = note or f"Project reset ({mode_name}) by manager"
+    for item in items:
+        try:
+            if mode_name == "delete":
+                item_id = item.id
+                await delete_work_item(db, item, scheduler=scheduler)
+                deleted.append(item_id)
+            else:
+                await abort_work_item(db, item, note=detail, scheduler=scheduler)
+                aborted.append(item.id)
+        except Exception as exc:
+            errors.append({"work_item_id": item.id, "error": str(exc)[:400]})
+    return {
+        "ok": not errors,
+        "project_id": slug,
+        "mode": mode_name,
+        "aborted_ids": aborted,
+        "deleted_ids": deleted,
+        "errors": errors,
+        "tracker_touched": False,
+    }
 
 
 def work_item_aborted(item: WorkItem | None) -> bool:

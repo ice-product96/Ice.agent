@@ -56,6 +56,9 @@ from .work_items import (
     sync_cursor_work_items,
     should_collect_customer_intake,
     watchdog_items,
+    work_item_looks_like_admin_ops,
+    is_operational_admin_command,
+    reset_project_work_items,
 )
 from .employee import (
     AGENT_EDITABLE_SECTIONS,
@@ -189,14 +192,20 @@ def _pm_item_is_closed(item: WorkItem | None) -> bool:
 
 def _tick_focus_item(pending: list[WorkItem]) -> WorkItem:
     """Prefer an older QA case over a newer in_progress leftover."""
-    qa = [
+    real = [
         item
         for item in pending
+        if not work_item_looks_like_admin_ops(item)
+    ]
+    pool = real or pending
+    qa = [
+        item
+        for item in pool
         if item.pm_phase in {"QA", "CLIENT_REVIEW"}
     ]
     if qa:
         return sorted(qa, key=lambda item: item.id)[0]
-    return pending[0]
+    return pool[0]
 
 
 def _cursor_payload_task_id(result: dict[str, Any] | None) -> str:
@@ -329,35 +338,23 @@ async def _auto_accept_pm_qa(
     )
     if min_execution_remaining_minutes(item, all_runs) > 0:
         return None
-    from .tracker_poll import work_item_tracker_task_id
-
-    tracker_id = work_item_tracker_task_id(item)
-    tracker_error = None
-    if tracker_id and mcp_manager is not None:
-        from .cursorremote_drive import mcp_call
-        from .tracker_poll import find_ice_tracker_session
-
-        tracker_session, _ = find_ice_tracker_session(mcp_manager)
-        if tracker_session is not None:
-            try:
-                await mcp_call(
-                    tracker_session,
-                    "complete_task",
-                    {"task_id": tracker_id},
-                )
-            except Exception as exc:
-                tracker_error = f"Tracker completion failed: {exc}"[:2000]
     await transition_pm_phase(
         db,
         item,
         "DONE",
         detail="QA accepted automatically from verified Cursor evidence",
+        mcp=mcp_manager,
     )
     item.status = "done"
     item.active_cursor_run_id = None
     item.wait_owner = "none"
     item.next_action = ""
-    item.last_error = tracker_error
+    tracker_error = None
+    err = str(item.last_error or "")
+    if err.startswith("Tracker:"):
+        tracker_error = err
+    else:
+        item.last_error = None
     meta = dict(item.metadata_json or {})
     meta["cursor_in_flight"] = False
     meta.pop("cursor_baseline_summary", None)
@@ -960,6 +957,10 @@ class AgentRuntime:
         self.conversations = ConversationContextService()
         self.employee = EmployeeService(telegram=telegram, scheduler=None, events=events)
         self._agent_locks: dict[int, asyncio.Lock] = {}
+        if mcp is not None:
+            from .tracker_poll import set_tracker_mcp
+
+            set_tracker_mcp(mcp)
 
     def _lock_for(self, agent_id: int) -> asyncio.Lock:
         lock = self._agent_locks.get(agent_id)
@@ -2127,6 +2128,54 @@ class AgentRuntime:
             registry.register(pm_record_decision, "pm_record_decision")
             registry.register(pm_transition_task, "pm_transition_task")
 
+            async def pm_reset_project(
+                project_id: str,
+                mode: str = "abort",
+                also_tracker: bool = False,
+            ) -> dict[str, Any]:
+                """Abort or delete open PM cases for a project. Does not wipe ice_tracker."""
+                if not (context or {}).get("is_admin"):
+                    raise PermissionError(
+                        "pm_reset_project is only for the manager. "
+                        "Do not use it on a customer message."
+                    )
+                del also_tracker
+                return await reset_project_work_items(
+                    db,
+                    agent,
+                    project_id,
+                    mode=mode,
+                    also_tracker=False,
+                    scheduler=self.scheduler,
+                    note="Manager reset of open project cases",
+                )
+
+            registry.register(
+                pm_reset_project,
+                "pm_reset_project",
+                (
+                    "Abort (default) or delete all open PM work items for a project_id "
+                    "(e.g. uraltrade). Does not delete ice_tracker history. "
+                    "Use when the manager says to reset/wipe stuck cases."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "mode": {
+                            "type": "string",
+                            "enum": ["abort", "delete"],
+                            "description": "abort closes cases; delete removes them",
+                        },
+                        "also_tracker": {
+                            "type": "boolean",
+                            "description": "Ignored: customer tracker history is never wiped",
+                        },
+                    },
+                    "required": ["project_id"],
+                },
+            )
+
             async def pm_poll_tracker() -> dict[str, Any]:
                 """Poll ice_tracker for unfinished cards not yet bound to a WorkItem."""
                 from .tracker_poll import poll_tracker_backlog
@@ -2947,7 +2996,9 @@ class AgentRuntime:
                                 f"(~{int(remaining)} minutes left). "
                                 "Do not mark done yet; wait and re-check."
                             )
-                        await transition_pm_phase(db, item, "DONE", detail="QA accepted")
+                        await transition_pm_phase(
+                            db, item, "DONE", detail="QA accepted", mcp=self.mcp
+                        )
                         item.status = "done"
                         item.active_cursor_run_id = None
                         item.wait_owner = "none"
@@ -3733,11 +3784,16 @@ class AgentRuntime:
             else:
                 message = build_employee_tick_instruction(profile)
             if tracker_backlog and int(tracker_backlog.get("count_claimable") or 0) > 0:
-                from .tracker_poll import build_tracker_poll_instruction
+                from .tracker_poll import (
+                    build_tracker_poll_instruction,
+                    should_attach_tracker_poll,
+                )
 
-                tracker_msg = build_tracker_poll_instruction(tracker_backlog)
-                if tracker_msg:
-                    message = f"{tracker_msg}\n\n{message}"
+                focus_for_poll = await get_work_item(db, context.get("work_item_id"))
+                if should_attach_tracker_poll(focus_for_poll, tracker_backlog):
+                    tracker_msg = build_tracker_poll_instruction(tracker_backlog)
+                    if tracker_msg:
+                        message = f"{tracker_msg}\n\n{message}"
             focus = await get_work_item(db, context.get("work_item_id"))
             if focus is not None and focus.status == "collecting" and focus.wait_until:
                 from .work_items import _as_aware
@@ -3822,6 +3878,34 @@ class AgentRuntime:
         context["_user_message"] = message
         await bind_work_item(db, agent, context, message)
         from .work_items import get_work_item, work_item_aborted
+
+        if context.get("_operational_admin"):
+            from .customers import match_customer_from_text
+
+            customer = await match_customer_from_text(db, agent, message)
+            project_id = ""
+            if customer is not None:
+                project_id = str(customer.project_id or customer.id or "").strip()
+            if project_id:
+                reset = await reset_project_work_items(
+                    db,
+                    agent,
+                    project_id,
+                    mode="abort",
+                    scheduler=self.scheduler,
+                    note="Manager operational reset",
+                )
+                context["_project_reset"] = reset
+                message = (
+                    f"Платформа уже сбросила открытые PM-кейсы проекта {project_id}: "
+                    f"отменены {reset.get('aborted_ids') or []}, "
+                    f"удалены {reset.get('deleted_ids') or []}, "
+                    f"ошибки {reset.get('errors') or []}. "
+                    "Доску ice_tracker не трогай. Кратко подтверди руководителю факт сброса. "
+                    "Не создавай новый кейс разработки из этого приказа.\n\n"
+                    f"{message}"
+                )
+                context["_user_message"] = message
 
         bound_item = await get_work_item(db, context.get("work_item_id"))
         if work_item_aborted(bound_item):
