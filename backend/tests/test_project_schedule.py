@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 from app.db import ProjectState, WorkItem
 from app.project_schedule import (
     apply_task_estimate,
+    cost_approval_instruction,
     is_within_project_workday,
     next_workday_open,
     project_commerce_settings,
@@ -82,3 +83,12 @@ def test_elapsed_uses_wall_clock_from_first_start() -> None:
     )
     assert cursor_elapsed_minutes([cancelled]) >= 89
     assert min_execution_remaining_minutes(item, [cancelled]) == 0
+
+
+def test_cost_approval_instruction_respects_toggle() -> None:
+    off = cost_approval_instruction(False)
+    assert off["ask_customer_about_cost"] is False
+    assert "do not" in off["next"].lower()
+    on = cost_approval_instruction(True)
+    assert on["ask_customer_about_cost"] is True
+    assert "стоимость" in on["next"]

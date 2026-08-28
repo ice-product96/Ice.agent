@@ -586,3 +586,80 @@ async def test_pm_reset_project_aborts_open_cases_for_admin(
         await db.refresh(item)
         assert item.status == "done"
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_tracker_bug_submits_without_cost_confirmation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sent = {"called": False}
+
+    async def fake_send(*args, **kwargs):
+        sent["called"] = True
+        return {
+            "done": False,
+            "prompt_sent": True,
+            "started": True,
+            "seen_busy": True,
+            "status": "working",
+        }
+
+    monkeypatch.setattr(
+        "app.project_schedule.is_within_project_workday", lambda *a, **k: True
+    )
+    stub_idle_composer(monkeypatch)
+    monkeypatch.setattr("app.cursorremote_drive.send_prompt_and_drive", fake_send)
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'pm-tracker-submit.db').as_posix()}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    mcp = McpManager()
+    mcp.sessions = {"cursorremote": FakeCursorSession()}
+    runtime = AgentRuntime(
+        Settings(mem0_enabled=False),
+        SimpleNamespace(),
+        FakeSearch(),
+        FakeEvents(),
+        mcp=mcp,
+    )
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="Корзина перекрывает оформить заказ",
+            goal="Корзина перекрывает оформить заказ",
+            project_id="uraltrade",
+            task_type="bug",
+            requirements=["Checkout button stays visible while scrolling"],
+            acceptance_criteria=["Menu does not cover Оформить заказ"],
+            priority="normal",
+            pm_phase="REQUIREMENTS_READY",
+            context_json={
+                "tracker_task_id": "3a44b9e7-65ab-4263-a4fb-3ca6a65e3e96",
+                "estimated_duration_minutes": 30,
+                "estimated_cost": 750.0,
+                "owner_approved": False,
+            },
+        )
+        db.add(item)
+        await db.commit()
+        registry = await runtime.registry(
+            agent,
+            mcp_server_names={"cursorremote"},
+            memory_enabled=False,
+            db=db,
+            context={"_pm_mode": True, "work_item_id": item.id},
+        )
+        result = await registry.call("submit_development_task", {})
+        assert sent["called"] is True
+        assert result.get("prompt_sent") is True or result.get("status") != "deferred_off_hours"
+        await db.refresh(item)
+        assert item.pm_phase == "IN_DEVELOPMENT"
+        assert item.context_json.get("inside_agreed_scope") is True
+        assert item.context_json.get("small_fix") is True
+    await engine.dispose()

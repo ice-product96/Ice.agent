@@ -12,6 +12,8 @@ from app.pm_state import (
     development_is_client_confirmed,
     get_or_create_cursor_run,
     get_or_create_project_state,
+    infer_inside_agreed_scope,
+    infer_small_fix,
     is_client_confirmer,
     is_task_ready,
     item_has_client_confirmation,
@@ -20,8 +22,10 @@ from app.pm_state import (
     record_decision,
     record_scope_change,
     render_task_brief,
+    stamp_autonomy_flags,
     submission_requires_approval,
     transition_pm_phase,
+    work_item_is_tracker_sourced,
 )
 
 
@@ -128,6 +132,51 @@ def test_project_autonomy_submission_rules() -> None:
         small_fix=False,
     )
     assert submission_requires_approval("LEVEL_3", high_risk=True, **common)
+
+
+def test_tracker_bug_is_in_scope_small_fix_without_llm_flags() -> None:
+    item = WorkItem(
+        agent_id=1,
+        task_type="bug",
+        context_json={
+            "tracker_task_id": "3a44b9e7-65ab-4263-a4fb-3ca6a65e3e96",
+            "estimated_duration_minutes": 30,
+            "owner_approved": False,
+        },
+        metadata_json={},
+    )
+    assert work_item_is_tracker_sourced(item) is True
+    assert infer_inside_agreed_scope(item, client_confirmed=False) is True
+    assert infer_small_fix(item) is True
+    stamp_autonomy_flags(item)
+    assert item.context_json["inside_agreed_scope"] is True
+    assert item.context_json["small_fix"] is True
+    assert not submission_requires_approval(
+        "LEVEL_1",
+        task_type="bug",
+        client_confirmed=False,
+        inside_agreed_scope=True,
+        small_fix=True,
+    )
+
+
+def test_feature_without_scope_still_needs_confirmation() -> None:
+    item = WorkItem(
+        agent_id=1,
+        task_type="feature",
+        context_json={"estimated_duration_minutes": 240},
+        metadata_json={},
+    )
+    assert work_item_is_tracker_sourced(item) is False
+    assert infer_inside_agreed_scope(item, client_confirmed=False) is False
+    assert infer_small_fix(item) is False
+    assert submission_requires_approval(
+        "LEVEL_1",
+        task_type="feature",
+        client_confirmed=False,
+        inside_agreed_scope=False,
+        small_fix=False,
+    )
 
 
 def test_client_confirmation_is_not_manager_approval() -> None:

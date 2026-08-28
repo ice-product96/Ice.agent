@@ -256,10 +256,14 @@ def should_redirect_customer_outbound(
 ) -> bool:
     if not is_internal_execution(context):
         return False
-    if not is_customer_origin_peer(entity, context, admin_ids):
+    if is_admin_peer(entity, admin_ids):
         return False
+    # Tick/heartbeat chat is often the manager. Do not let the LLM DM a
+    # different customer peer about cost/start before QA acceptance.
     if (context or {}).get("_pm_mode") and not pm_accept_succeeded(audit):
         return True
+    if not is_customer_origin_peer(entity, context, admin_ids):
+        return False
     return not cursor_result_ready_for_customer(
         audit,
         cursor_was_in_flight=bool((context or {}).get("_cursor_was_in_flight")),

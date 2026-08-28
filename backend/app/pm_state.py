@@ -247,6 +247,87 @@ async def item_has_client_confirmation(db: AsyncSession, item: WorkItem) -> bool
     )
 
 
+SMALL_FIX_MAX_MINUTES = 120
+
+
+def work_item_is_tracker_sourced(item: WorkItem | None) -> bool:
+    """A card already on the customer ice_tracker board is the request."""
+    if item is None:
+        return False
+    ctx = item.context_json if isinstance(item.context_json, dict) else {}
+    meta = item.metadata_json if isinstance(item.metadata_json, dict) else {}
+    pm = meta.get("pm") if isinstance(meta.get("pm"), dict) else {}
+    for source in (ctx, pm):
+        if not isinstance(source, dict):
+            continue
+        if str(source.get("tracker_task_id") or source.get("card_id") or "").strip():
+            return True
+    return False
+
+
+def estimated_duration_minutes(item: WorkItem | None) -> float | None:
+    if item is None:
+        return None
+    ctx = item.context_json if isinstance(item.context_json, dict) else {}
+    for key in ("estimated_duration_minutes", "min_execution_minutes"):
+        raw = ctx.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def infer_inside_agreed_scope(
+    item: WorkItem | None,
+    *,
+    client_confirmed: bool = False,
+) -> bool:
+    if item is None:
+        return bool(client_confirmed)
+    if work_item_is_tracker_sourced(item):
+        return True
+    ctx = item.context_json if isinstance(item.context_json, dict) else {}
+    if "inside_agreed_scope" in ctx:
+        return bool(ctx.get("inside_agreed_scope"))
+    return bool(client_confirmed)
+
+
+def infer_small_fix(item: WorkItem | None) -> bool:
+    if item is None:
+        return False
+    ctx = item.context_json if isinstance(item.context_json, dict) else {}
+    if ctx.get("high_risk"):
+        return False
+    if ctx.get("small_fix"):
+        return True
+    minutes = estimated_duration_minutes(item)
+    if minutes is not None and minutes <= SMALL_FIX_MAX_MINUTES:
+        return True
+    return work_item_is_tracker_sourced(item) and str(
+        item.task_type or ""
+    ).strip().lower() == "bug"
+
+
+def stamp_autonomy_flags(
+    item: WorkItem,
+    *,
+    client_confirmed: bool = False,
+) -> WorkItem:
+    """Fill scope/small_fix so LEVEL_1 tracker bugs are not blocked on LLM flags."""
+    ctx = dict(item.context_json or {}) if isinstance(item.context_json, dict) else {}
+    ctx["inside_agreed_scope"] = infer_inside_agreed_scope(
+        item, client_confirmed=client_confirmed
+    )
+    ctx["small_fix"] = infer_small_fix(item)
+    item.context_json = ctx
+    return item
+
+
 def submission_requires_approval(
     level: str | int,
     *,

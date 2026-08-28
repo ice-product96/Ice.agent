@@ -87,6 +87,20 @@ def test_progress_to_customer_is_redirected_on_internal_runs() -> None:
     )
 
 
+def test_pm_tick_cannot_dm_another_customer_peer() -> None:
+    context = {
+        "source": "employee_tick",
+        "chat_id": 183432854,
+        "_pm_mode": True,
+    }
+    assert should_redirect_customer_outbound(
+        context, [], 999000111, admin_ids={183432854}
+    )
+    assert not should_redirect_customer_outbound(
+        context, [], 183432854, admin_ids={183432854}
+    )
+
+
 def test_pm_customer_message_requires_successful_qa_acceptance() -> None:
     context = {
         "source": "employee_tick",

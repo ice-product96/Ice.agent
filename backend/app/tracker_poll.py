@@ -383,8 +383,11 @@ def build_tracker_poll_instruction(backlog: dict[str, Any]) -> str:
         "Периодическая проверка ice_tracker: есть незакрытые задачи без кейса PM.",
         "Возьми в работу ОДНУ задачу (приоритетнее in_progress / выше в списке).",
         "Шаги: pm_structure_task (project_id = slug заказчика, не UUID трекера; "
-        "в context_json обязательно tracker_task_id + tracker_project_id) → оценка/"
-        "согласование по правилам проекта → при готовности submit_development_task.",
+        "в context_json обязательно tracker_task_id + tracker_project_id) → "
+        "pm_estimate_task (оценка внутренняя) → смотри ask_customer_about_cost: "
+        "если false — сразу submit_development_task, не пиши заказчику про оплату; "
+        "если true — согласуй сумму, затем submit.",
+        "Карточка на доске уже есть запрос заказчика: не проси подтвердить старт. "
         "Не дублируй задачи, которые уже в already_tracked. Не пиши заказчику про "
         "сам факт проверки трекера. Карточку двигает платформа по фазе PM; "
         "не вызывай move_task/complete_task вручную.",

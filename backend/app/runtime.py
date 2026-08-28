@@ -1442,6 +1442,7 @@ class AgentRuntime:
                 readiness_issues,
                 record_decision,
                 record_scope_change,
+                stamp_autonomy_flags,
                 transition_pm_phase,
             )
             from .work_items import (
@@ -1761,6 +1762,7 @@ class AgentRuntime:
                         ),
                         currency=str(commerce_settings["currency"]),
                     )
+                stamp_autonomy_flags(item)
                 await add_event(
                     db,
                     item,
@@ -1801,11 +1803,24 @@ class AgentRuntime:
                         payload={"source_message_id": source_message_id},
                     )
                 await db.commit()
+                from .project_schedule import cost_approval_instruction
+
+                cost_gate = cost_approval_instruction(
+                    commerce_settings["cost_requires_customer_approval"]
+                )
+                next_step = cost_gate["next"]
+                if not is_task_ready(item):
+                    next_step = (
+                        "Ask only the missing requirements. Do not start Cursor "
+                        "and do not discuss price."
+                    )
                 return {
                     "ok": True,
                     "duplicate": item.source_message_id == source_message_id
                     and item.id != (context or {}).get("work_item_id"),
                     "task": work_item_json(item),
+                    **cost_gate,
+                    "next": next_step,
                 }
 
             async def pm_get_task(work_item_id: int = 0) -> dict[str, Any]:
@@ -2109,13 +2124,18 @@ class AgentRuntime:
                     ),
                     payload=snap,
                 )
+                from .pm_state import stamp_autonomy_flags
+                from .project_schedule import cost_approval_instruction
+
+                stamp_autonomy_flags(item)
+                cost_gate = cost_approval_instruction(
+                    settings["cost_requires_customer_approval"]
+                )
                 await db.commit()
                 return {
                     "ok": True,
                     "commerce": snap,
-                    "cost_requires_customer_approval": settings[
-                        "cost_requires_customer_approval"
-                    ],
+                    **cost_gate,
                     "task": work_item_json(item),
                 }
 
@@ -2435,6 +2455,7 @@ class AgentRuntime:
                         is_task_ready,
                         item_has_client_confirmation,
                         render_task_brief,
+                        stamp_autonomy_flags,
                         submission_requires_approval,
                         transition_pm_phase,
                         update_cursor_run,
@@ -2555,11 +2576,9 @@ class AgentRuntime:
                                 "task": work_item_json(item),
                             }
                         confirmed = await item_has_client_confirmation(db, item)
+                        stamp_autonomy_flags(item, client_confirmed=confirmed)
                         inside_scope = bool(
-                            (item.context_json or {}).get(
-                                "inside_agreed_scope",
-                                confirmed,
-                            )
+                            (item.context_json or {}).get("inside_agreed_scope")
                         )
                         small_fix = bool((item.context_json or {}).get("small_fix"))
                         high_risk = bool((item.context_json or {}).get("high_risk"))
@@ -2578,9 +2597,17 @@ class AgentRuntime:
                             small_fix=small_fix,
                             high_risk=False,
                         ) and not confirmed:
+                            extra = ""
+                            if not commerce_settings["cost_requires_customer_approval"]:
+                                extra = (
+                                    " This is not a cost/payment question — "
+                                    "cost_requires_customer_approval is false; "
+                                    "do not ask the customer about оплата."
+                                )
                             raise PermissionError(
-                                "Project autonomy requires customer confirmation before development. "
-                                "Record it with pm_record_decision, then retry. "
+                                "Project autonomy requires customer confirmation before development."
+                                + extra
+                                + " Record it with pm_record_decision, then retry. "
                                 "Do not consult the manager for ordinary development."
                             )
                         if item.pm_phase in {"REQUIREMENTS_READY", "CLIENT_CONFIRMED", "CHANGES_REQUESTED"}:

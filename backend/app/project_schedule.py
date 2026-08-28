@@ -213,6 +213,27 @@ def task_commerce_snapshot(
     }
 
 
+def cost_approval_instruction(cost_requires_customer_approval: bool) -> dict[str, Any]:
+    """Tell the LLM whether talking to the customer about price is allowed."""
+    required = bool(cost_requires_customer_approval)
+    if required:
+        next_step = (
+            "Agree the amount with the customer, then pm_record_decision "
+            "with topic стоимость/cost, then submit_development_task."
+        )
+    else:
+        next_step = (
+            "cost_requires_customer_approval is false. "
+            "Do NOT message the customer about price, оплата, or стоимость. "
+            "The estimate is internal. Call submit_development_task now."
+        )
+    return {
+        "cost_requires_customer_approval": required,
+        "ask_customer_about_cost": required,
+        "next": next_step,
+    }
+
+
 def mark_cost_approved(item: WorkItem, *, decision_id: int | None = None) -> None:
     ctx = dict(item.context_json or {})
     ctx["cost_approved"] = True

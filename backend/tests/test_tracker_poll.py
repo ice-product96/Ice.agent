@@ -87,6 +87,8 @@ def test_work_item_tracker_task_id_and_instruction() -> None:
     )
     assert "card-1" in text
     assert "pm_structure_task" in text
+    assert "ask_customer_about_cost" in text
+    assert "оплат" in text
     assert build_tracker_poll_instruction({"claimable": []}) == ""
 
 
