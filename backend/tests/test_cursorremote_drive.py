@@ -5,6 +5,7 @@ from pathlib import Path
 from app.cursorremote_drive import (
     _approval_actions,
     check_and_drive,
+    composer_is_actively_working,
     cursor_has_active_work,
     cursor_is_busy,
     drive_until_done,
@@ -287,6 +288,27 @@ def test_check_idle_is_done() -> None:
     result = asyncio.run(check_and_drive(session, timeout_ms=500, idle_debounce_ms=0))
     assert result["done"] is True
     assert "Already finished" in result["summary"]
+    assert composer_is_actively_working(result) is False
+
+
+def test_idle_leftover_summary_is_not_active_work() -> None:
+    assert not composer_is_actively_working(
+        {
+            "done": True,
+            "status": "idle",
+            "seen_busy": True,
+            "started": True,
+            "summary": '{"task_id": "31", "status": "completed"}',
+        }
+    )
+    assert composer_is_actively_working(
+        {
+            "done": False,
+            "status": "generating",
+            "seen_busy": True,
+            "started": True,
+        }
+    )
 
 
 def test_check_does_not_finish_on_waiting_approval() -> None:

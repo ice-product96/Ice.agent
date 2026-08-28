@@ -326,6 +326,29 @@ def cursor_is_busy(status: Any) -> bool:
     return True
 
 
+def composer_is_actively_working(result: Any) -> bool:
+    """True only while Composer is in-flight, not idle leftover from a previous job."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("done") is True:
+        return False
+    status = str(result.get("status") or "").strip().lower()
+    if status in IDLE_STATUSES or status in {
+        "not_started",
+        "workspace_unavailable",
+        "cursor_unavailable",
+        "leftover_idle",
+        "no_active_run",
+    }:
+        return False
+    if status in BUSY_STATUSES:
+        return True
+    last = result.get("last")
+    if last is not None and cursor_is_busy(last):
+        return True
+    return bool(result.get("seen_busy") or result.get("started"))
+
+
 def cursor_has_active_work(state: Any) -> bool:
     """True if the chat already shows search/tools/plan — not a blank idle editor."""
     data = parse_mcp_payload(state)

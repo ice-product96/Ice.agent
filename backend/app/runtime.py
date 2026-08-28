@@ -2153,6 +2153,7 @@ class AgentRuntime:
                 from .cursorremote_drive import (
                     CURSOR_CHECK_ONLY_MESSAGE,
                     check_and_drive,
+                    composer_is_actively_working,
                     prompt_actually_started,
                     send_prompt_and_drive,
                 )
@@ -2528,11 +2529,15 @@ class AgentRuntime:
                             )
                         other_cursor_item = await db.scalar(
                             select(WorkItem)
+                            .join(
+                                CursorRun,
+                                CursorRun.id == WorkItem.active_cursor_run_id,
+                            )
                             .where(
                                 WorkItem.agent_id == agent.id,
                                 WorkItem.id != item.id,
                                 WorkItem.status == "waiting_external",
-                                WorkItem.active_cursor_run_id.is_not(None),
+                                CursorRun.status.in_(("pending", "running")),
                             )
                             .order_by(WorkItem.id)
                             .limit(1)
@@ -2554,12 +2559,14 @@ class AgentRuntime:
                                 "Task is in QA. Call pm_accept_task, not submit_development_task."
                             )
                         try:
-                            live = await check_and_drive(cursor_session)
+                            live = await check_and_drive(
+                                cursor_session,
+                                timeout_ms=8_000,
+                                idle_debounce_ms=400,
+                            )
                         except Exception:
                             live = {}
-                        if live.get("seen_busy") or (
-                            live.get("started") and not live.get("done")
-                        ):
+                        if composer_is_actively_working(live):
                             return {
                                 "task_id": str(item.id),
                                 "status": "cursor_busy",
@@ -2567,20 +2574,6 @@ class AgentRuntime:
                                 "prompt_sent": False,
                                 "reason": (
                                     "Composer is still working. Wait; do not submit another prompt."
-                                ),
-                            }
-                        foreign_id = _cursor_payload_task_id(live)
-                        if foreign_id and foreign_id != str(item.id):
-                            return {
-                                "task_id": str(item.id),
-                                "status": "leftover_idle",
-                                "done": False,
-                                "prompt_sent": False,
-                                "leftover": True,
-                                "resubmit": False,
-                                "reason": (
-                                    f"Composer still shows task_id {foreign_id}. "
-                                    "Do not call submit_development_task until that result is gone."
                                 ),
                             }
                         attempt = int(

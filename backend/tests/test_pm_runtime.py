@@ -440,3 +440,86 @@ async def test_new_tracker_card_is_not_duplicate_of_closed_case(tmp_path: Path) 
         ) == 2
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_submit_sends_when_composer_is_idle_with_old_task_json(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sent = {"called": False}
+
+    async def fake_check(*args, **kwargs):
+        return {
+            "done": True,
+            "status": "idle",
+            "seen_busy": True,
+            "started": True,
+            "result": {
+                "task_id": "31",
+                "status": "completed",
+                "implementation": {"summary": "old"},
+                "verification": {
+                    "tests_passed": True,
+                    "lint_passed": True,
+                    "acceptance_criteria": [],
+                },
+            },
+        }
+
+    async def fake_send(*args, **kwargs):
+        sent["called"] = True
+        return {
+            "done": False,
+            "prompt_sent": True,
+            "status": "working",
+            "seen_busy": True,
+        }
+
+    monkeypatch.setattr("app.cursorremote_drive.check_and_drive", fake_check)
+    monkeypatch.setattr("app.cursorremote_drive.send_prompt_and_drive", fake_send)
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'pm-idle-submit.db').as_posix()}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    mcp = McpManager()
+    mcp.sessions = {"cursorremote": FakeCursorSession()}
+    runtime = AgentRuntime(
+        Settings(mem0_enabled=False),
+        SimpleNamespace(),
+        FakeSearch(),
+        FakeEvents(),
+        mcp=mcp,
+    )
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="Catalog menu",
+            goal="Fix catalog dropdown",
+            project_id="uraltrade",
+            task_type="bug",
+            requirements=["Open catalog in header"],
+            acceptance_criteria=["Catalog expands on hover/tap"],
+            priority="high",
+            pm_phase="READY_FOR_DEV",
+            context_json={"inside_agreed_scope": True, "small_fix": True},
+        )
+        db.add(item)
+        await db.commit()
+        registry = await runtime.registry(
+            agent,
+            mcp_server_names={"cursorremote"},
+            memory_enabled=False,
+            db=db,
+            context={"_pm_mode": True, "work_item_id": item.id},
+        )
+        result = await registry.call("submit_development_task", {})
+        assert sent["called"] is True
+        assert result.get("status") != "cursor_busy"
+        assert result.get("leftover") is not True
+    await engine.dispose()
