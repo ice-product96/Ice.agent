@@ -45,7 +45,11 @@ def stub_idle_composer(monkeypatch) -> None:
     async def fake_check(*args, **kwargs):
         return {"done": True, "status": "idle"}
 
+    async def fake_peek(*args, **kwargs):
+        return {"ok": True, "busy": False, "agentStatus": "idle"}
+
     monkeypatch.setattr("app.cursorremote_drive.check_and_drive", fake_check)
+    monkeypatch.setattr("app.cursorremote_drive.peek_composer", fake_peek)
 
 
 @pytest.mark.asyncio
@@ -476,7 +480,11 @@ async def test_submit_sends_when_composer_is_idle_with_old_task_json(
             "seen_busy": True,
         }
 
+    async def fake_peek(*args, **kwargs):
+        return {"ok": True, "busy": False, "agentStatus": "idle"}
+
     monkeypatch.setattr("app.cursorremote_drive.check_and_drive", fake_check)
+    monkeypatch.setattr("app.cursorremote_drive.peek_composer", fake_peek)
     monkeypatch.setattr("app.cursorremote_drive.send_prompt_and_drive", fake_send)
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{(tmp_path / 'pm-idle-submit.db').as_posix()}"

@@ -1506,6 +1506,7 @@ async def sync_cursor_work_items(
                 baseline_summary=str(
                     (item.metadata_json or {}).get("cursor_baseline_summary") or ""
                 ),
+                work_item_id=item.id,
             )
         except Exception as exc:
             logger.warning("cursor poll failed for work item %s: %s", item.id, exc)

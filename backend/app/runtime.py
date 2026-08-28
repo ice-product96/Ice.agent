@@ -419,6 +419,17 @@ async def _apply_pm_cursor_result(
             or result.get("summary")
             or "Cursor did not accept the prompt"
         )[:2000]
+        from .cursorremote_drive import log_cursor_stage
+
+        log_cursor_stage(
+            "apply_not_started",
+            work_item_id=item.id,
+            run_id=run.id,
+            status=result.get("status"),
+            reason=reason,
+            prompt_sent=result.get("prompt_sent"),
+            skipped=result.get("skipped_prompt"),
+        )
         await update_cursor_run(
             db,
             run,
@@ -691,7 +702,7 @@ async def _poll_pm_cursor_item(
                     "Call pm_accept_task if still in QA; do not start a new Cursor run."
                 ),
             }
-        live = await check_and_drive(cursor_session)
+        live = await check_and_drive(cursor_session, work_item_id=item.id)
         if live.get("done") or live.get("seen_busy") or live.get("started"):
             attempt = int(
                 await db.scalar(
@@ -752,6 +763,7 @@ async def _poll_pm_cursor_item(
             baseline_summary=str(
                 (run.result_json or {}).get("baseline_summary") or ""
             ),
+            work_item_id=item.id,
         ),
     )
 
@@ -2153,7 +2165,8 @@ class AgentRuntime:
                 from .cursorremote_drive import (
                     CURSOR_CHECK_ONLY_MESSAGE,
                     check_and_drive,
-                    composer_is_actively_working,
+                    log_cursor_stage,
+                    peek_composer,
                     prompt_actually_started,
                     send_prompt_and_drive,
                 )
@@ -2298,6 +2311,7 @@ class AgentRuntime:
                                 )
                                 or ""
                             ),
+                            work_item_id=item.id if item is not None else None,
                         )
                         result = {
                             **result,
@@ -2358,6 +2372,7 @@ class AgentRuntime:
                             if item is not None
                             else ""
                         ),
+                        work_item_id=item.id if item is not None else None,
                     )
                     if result.get("done"):
                         cursor_state["finished"] = True
@@ -2559,14 +2574,57 @@ class AgentRuntime:
                                 "Task is in QA. Call pm_accept_task, not submit_development_task."
                             )
                         try:
-                            live = await check_and_drive(
-                                cursor_session,
-                                timeout_ms=8_000,
-                                idle_debounce_ms=400,
+                            peek = await peek_composer(
+                                cursor_session, work_item_id=item.id
                             )
-                        except Exception:
-                            live = {}
-                        if composer_is_actively_working(live):
+                        except Exception as exc:
+                            peek = {
+                                "ok": False,
+                                "busy": False,
+                                "error": str(exc)[:500],
+                            }
+                        log_cursor_stage(
+                            "submit_peek",
+                            work_item_id=item.id,
+                            ok=peek.get("ok"),
+                            busy=bool(peek.get("busy")),
+                            agentStatus=peek.get("agentStatus"),
+                            error=peek.get("error"),
+                            workspace=peek.get("workspace"),
+                        )
+                        await add_event(
+                            db,
+                            item,
+                            kind="cursor",
+                            title="Composer: проверка перед отправкой",
+                            detail=(
+                                f"busy={peek.get('busy')} "
+                                f"status={peek.get('agentStatus') or peek.get('error') or 'ok'}"
+                            ),
+                            payload={
+                                "ok": peek.get("ok"),
+                                "busy": peek.get("busy"),
+                                "agentStatus": peek.get("agentStatus"),
+                                "pendingApprovalCount": peek.get("pendingApprovalCount"),
+                                "workspace": peek.get("workspace"),
+                                "error": peek.get("error"),
+                            },
+                        )
+                        if peek.get("busy"):
+                            await add_event(
+                                db,
+                                item,
+                                kind="blocked",
+                                title="Composer занят — промпт не отправлен",
+                                detail=str(peek.get("agentStatus") or "busy"),
+                                payload={
+                                    "agentStatus": peek.get("agentStatus"),
+                                    "pendingApprovalCount": peek.get(
+                                        "pendingApprovalCount"
+                                    ),
+                                },
+                            )
+                            await db.commit()
                             return {
                                 "task_id": str(item.id),
                                 "status": "cursor_busy",
@@ -2575,6 +2633,12 @@ class AgentRuntime:
                                 "reason": (
                                     "Composer is still working. Wait; do not submit another prompt."
                                 ),
+                                "peek": {
+                                    "agentStatus": peek.get("agentStatus"),
+                                    "pendingApprovalCount": peek.get(
+                                        "pendingApprovalCount"
+                                    ),
+                                },
                             }
                         attempt = int(
                             await db.scalar(
@@ -2615,8 +2679,33 @@ class AgentRuntime:
                         item.status = "in_progress"
                         item.wait_owner = "self"
                         item.next_action = "Sending task to Cursor…"
-                        await db.commit()
                         expected_ws, expected_window = await _cursor_target_for_item(item)
+                        await add_event(
+                            db,
+                            item,
+                            kind="cursor",
+                            title="Отправка задачи в Cursor",
+                            detail=(
+                                f"run #{attempt}, workspace={expected_ws or '(any)'}, "
+                                f"window={expected_window or '(any)'}"
+                            ),
+                            payload={
+                                "attempt": attempt,
+                                "workspace": expected_ws,
+                                "window_id": expected_window,
+                                "brief_chars": len(brief),
+                            },
+                        )
+                        await db.commit()
+                        log_cursor_stage(
+                            "submit_send",
+                            work_item_id=item.id,
+                            run_id=run.id,
+                            attempt=attempt,
+                            workspace=expected_ws,
+                            window_id=expected_window,
+                            brief_chars=len(brief),
+                        )
                         try:
                             result = await send_prompt_and_drive(
                                 cursor_session,
@@ -2629,6 +2718,19 @@ class AgentRuntime:
                                 expected_window_id=expected_window,
                             )
                         except Exception as exc:
+                            log_cursor_stage(
+                                "submit_send_exception",
+                                work_item_id=item.id,
+                                run_id=run.id,
+                                error=str(exc)[:800],
+                            )
+                            await add_event(
+                                db,
+                                item,
+                                kind="blocked",
+                                title="Отправка в Cursor упала исключением",
+                                detail=str(exc)[:800],
+                            )
                             await update_cursor_run(
                                 db, run, status="failed", error=str(exc)[:2000]
                             )
@@ -2639,6 +2741,44 @@ class AgentRuntime:
                             item.last_error = str(exc)[:2000]
                             await db.commit()
                             raise
+                        started = prompt_actually_started(result) or bool(
+                            result.get("prompt_sent")
+                        )
+                        log_cursor_stage(
+                            "submit_result",
+                            work_item_id=item.id,
+                            run_id=run.id,
+                            status=result.get("status"),
+                            prompt_sent=result.get("prompt_sent"),
+                            done=result.get("done"),
+                            skipped=result.get("skipped_prompt"),
+                            started=started,
+                            reason=result.get("reason"),
+                        )
+                        await add_event(
+                            db,
+                            item,
+                            kind="cursor" if started else "blocked",
+                            title=(
+                                "Cursor принял задачу, ожидание"
+                                if started and not result.get("done")
+                                else "Cursor завершил сразу"
+                                if started
+                                else "Cursor не принял задачу"
+                            ),
+                            detail=str(
+                                result.get("reason") or result.get("status") or ""
+                            )[:800],
+                            payload={
+                                "status": result.get("status"),
+                                "prompt_sent": result.get("prompt_sent"),
+                                "done": result.get("done"),
+                                "seen_busy": result.get("seen_busy"),
+                                "started": result.get("started"),
+                                "skipped_prompt": result.get("skipped_prompt"),
+                                "workspace": result.get("workspace"),
+                            },
+                        )
                         return await _pm_cursor_result(item, run, result)
 
                     async def submit_development_task(
@@ -3277,6 +3417,7 @@ class AgentRuntime:
                             )
                             or ""
                         ),
+                        work_item_id=item.id,
                     )
                     audit = [
                         {

@@ -136,6 +136,18 @@ def test_cursor_is_busy_statuses() -> None:
     assert not cursor_is_busy({"agentStatus": "idle", "pendingApprovalCount": 0})
 
 
+def test_cursor_is_explicitly_busy_ignores_idle_leftover() -> None:
+    from app.cursorremote_drive import cursor_is_explicitly_busy
+
+    assert not cursor_is_explicitly_busy(
+        {"agentStatus": "idle", "agentActivityLive": True, "pendingApprovalCount": 0}
+    )
+    assert not cursor_is_explicitly_busy({"foo": "bar"})
+    assert not cursor_is_explicitly_busy({})
+    assert cursor_is_explicitly_busy({"agentStatus": "searching"})
+    assert cursor_is_explicitly_busy({"agentStatus": "idle", "pendingApprovalCount": 2})
+
+
 def test_search_messages_count_as_active_work() -> None:
     assert cursor_has_active_work(
         {"messages": [{"type": "assistant", "text": "Searching the codebase…"}]}
@@ -332,22 +344,87 @@ def test_send_prompt_skipped_when_cursor_already_working() -> None:
             "get_status": [
                 busy,
                 busy,
-                {"agentStatus": "idle", "pendingApprovalCount": 0},
-                {"agentStatus": "idle", "pendingApprovalCount": 0},
-                {"agentStatus": "idle", "pendingApprovalCount": 0},
-            ],
-            "wait": [{"status": "needs_input", "pendingApprovalCount": 0}],
-            "get_state": [
-                {"messages": [{"type": "assistant", "text": "Search finished, patch applied."}]}
             ],
         },
-        default={"agentStatus": "idle", "pendingApprovalCount": 0},
+        default=busy,
     )
     result = asyncio.run(send_prompt_and_drive(session, "ты остановился на поиске, сделай ещё раз"))
     assert result["skipped_prompt"] is True
     assert result["prompt_sent"] is False
+    assert result["done"] is False
+    assert result["status"] == "cursor_busy"
+    assert result["ok"] is False
     assert not any(tool == "send_prompt" for tool, _ in session.calls)
-    assert result["done"] is True
+
+
+def test_send_prompt_when_idle_leftover_still_sends() -> None:
+    leftover = {
+        "agentStatus": "idle",
+        "pendingApprovalCount": 0,
+        "agentActivityLive": True,
+    }
+    session = ScriptSession({}, default=leftover)
+    result = asyncio.run(
+        send_prompt_and_drive(session, "# Task: Catalog menu\nFix header dropdown", timeout_ms=80)
+    )
+    assert any(tool == "send_prompt" for tool, _ in session.calls)
+    assert result["prompt_sent"] is False
+    assert result["status"] == "not_started"
+    assert result["ok"] is False
+    assert result["done"] is False
+
+
+def test_send_prompt_errors_when_composer_stays_empty() -> None:
+    idle = {"agentStatus": "idle", "pendingApprovalCount": 0, "agentActivityLive": False}
+    session = ScriptSession(
+        {"get_state": [{"messages": []}]},
+        default=idle,
+    )
+    result = asyncio.run(
+        send_prompt_and_drive(session, "# Task: Catalog menu\nFix header dropdown", timeout_ms=80)
+    )
+    assert any(tool == "send_prompt" for tool, _ in session.calls)
+    assert result["status"] == "not_started"
+    assert result["prompt_sent"] is False
+    assert result["ok"] is False
+
+
+def test_send_prompt_waits_when_composer_starts() -> None:
+    idle = {"agentStatus": "idle", "pendingApprovalCount": 0, "agentActivityLive": False}
+    thinking = {
+        "agentStatus": "thinking",
+        "pendingApprovalCount": 0,
+        "agentActivityLive": True,
+    }
+    prompt = "# Task: Catalog menu\nFix header dropdown now please"
+    session = ScriptSession(
+        {
+            "get_status": [idle, idle, idle, thinking, thinking, thinking],
+            "wait": [{"status": "timeout"} for _ in range(20)],
+            "get_state": [
+                {"messages": []},
+                {"messages": []},
+                {"messages": [{"type": "human", "text": prompt}]},
+            ],
+        },
+        default=thinking,
+    )
+    result = asyncio.run(send_prompt_and_drive(session, prompt, timeout_ms=80))
+    assert any(tool == "send_prompt" for tool, _ in session.calls)
+    assert result["prompt_sent"] is True
+    assert result["started"] is True
+    assert result["status"] != "not_started"
+    assert result["status"] != "cursor_busy"
+
+
+def test_unknown_status_still_sends_prompt() -> None:
+    unknown = {"foo": "bar"}
+    session = ScriptSession({}, default=unknown)
+    result = asyncio.run(
+        send_prompt_and_drive(session, "# Task: Catalog menu\nFix header dropdown", timeout_ms=80)
+    )
+    assert any(tool == "send_prompt" for tool, _ in session.calls)
+    assert result["status"] == "not_started"
 
 
 def test_searching_status_is_not_treated_as_not_started() -> None:
@@ -452,13 +529,12 @@ def test_prompt_actually_started_requires_busy() -> None:
     assert not prompt_actually_started(
         {"prompt_sent": False, "status": "workspace_unavailable", "done": False}
     )
-    # Skipped new prompt because Composer is already busy — still counts as started.
-    assert prompt_actually_started(
+    assert not prompt_actually_started(
         {
             "prompt_sent": False,
             "skipped_prompt": True,
-            "status": "working",
-            "started": True,
+            "status": "cursor_busy",
+            "started": False,
             "seen_busy": True,
             "done": False,
         }

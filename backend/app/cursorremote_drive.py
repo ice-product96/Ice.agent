@@ -137,9 +137,48 @@ def workspace_matches(expected: str | None, candidates: list[str]) -> bool:
     return False
 
 
+def log_cursor_stage(stage: str, *, work_item_id: Any = None, **fields: Any) -> None:
+    payload = {key: value for key, value in fields.items() if value is not None}
+    if work_item_id is not None:
+        payload["work_item_id"] = work_item_id
+    try:
+        blob = json.dumps(payload, ensure_ascii=False, default=str)
+    except TypeError:
+        blob = str(payload)
+    logger.info("cursor.%s %s", stage, blob[:4000])
+
+
+def status_snapshot(status: Any) -> dict[str, Any]:
+    data = _as_status_dict(status) or {}
+    paths = workspace_paths_from_status(data)
+    return {
+        "agentStatus": data.get("agentStatus") or data.get("status") or "",
+        "pendingApprovalCount": int(data.get("pendingApprovalCount") or 0),
+        "agentActivityLive": bool(data.get("agentActivityLive")),
+        "workspace": paths[0] if paths else None,
+    }
+
+
+def cursor_is_explicitly_busy(status: Any) -> bool:
+    """True only for a live Composer job, not idle leftover or unknown MCP shapes."""
+    data = _as_status_dict(status)
+    if not data:
+        return False
+    if int(data.get("pendingApprovalCount") or 0) > 0:
+        return True
+    name = str(data.get("agentStatus") or data.get("status") or "").strip().lower()
+    if name in IDLE_STATUSES or name in STOPPED_STATUSES or name in {"", "unknown"}:
+        return False
+    if name in BUSY_STATUSES:
+        return True
+    return bool(data.get("agentActivityLive"))
+
+
 def prompt_actually_started(result: dict[str, Any] | None) -> bool:
-    """True when Cursor accepted work for this assignment (or was already busy with it)."""
+    """True when THIS assignment's prompt was accepted by Composer."""
     if not isinstance(result, dict):
+        return False
+    if result.get("skipped_prompt") and not result.get("prompt_sent"):
         return False
     status = str(result.get("status") or "").strip().lower()
     if status in {
@@ -147,16 +186,16 @@ def prompt_actually_started(result: dict[str, Any] | None) -> bool:
         "cursor_unavailable",
         "not_started",
         "no_window",
+        "cursor_busy",
     }:
         return False
-    # Already-busy Composer: we skipped a new prompt on purpose — still in flight.
-    if result.get("seen_busy") or result.get("started") or status in BUSY_STATUSES:
+    if result.get("prompt_sent") and (
+        result.get("seen_busy") or result.get("started") or result.get("done")
+    ):
         return True
-    if result.get("done") and (result.get("prompt_sent") or result.get("seen_busy")):
+    if result.get("prompt_sent") and status in BUSY_STATUSES:
         return True
-    if result.get("skipped_prompt") or not result.get("prompt_sent"):
-        return False
-    return True
+    return False
 
 
 async def ensure_cursor_workspace(
@@ -344,9 +383,40 @@ def composer_is_actively_working(result: Any) -> bool:
     if status in BUSY_STATUSES:
         return True
     last = result.get("last")
-    if last is not None and cursor_is_busy(last):
+    if last is not None and cursor_is_explicitly_busy(last):
         return True
     return bool(result.get("seen_busy") or result.get("started"))
+
+
+def prompt_visible_in_composer(state: Any, prompt: str) -> bool:
+    """True when Composer chat already contains this assignment's prompt."""
+    data = parse_mcp_payload(state)
+    parts: list[str] = []
+    if isinstance(data, dict):
+        try:
+            parts.append(json.dumps(data, ensure_ascii=False, default=str))
+        except TypeError:
+            parts.append(str(data))
+        for item in list(data.get("messages") or []):
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item))
+    elif data is not None:
+        parts.append(str(data))
+    haystack = "\n".join(parts).lower()
+    if not haystack.strip():
+        return False
+    needles: list[str] = []
+    for line in (prompt or "").splitlines():
+        text = " ".join(line.strip().split())
+        if len(text) >= 20:
+            needles.append(text[:96].lower())
+        if len(needles) >= 4:
+            break
+    if not needles and (prompt or "").strip():
+        needles.append((prompt or "").strip()[:64].lower())
+    return any(needle in haystack for needle in needles)
 
 
 def cursor_has_active_work(state: Any) -> bool:
@@ -546,6 +616,7 @@ async def drive_until_done(
     idle_debounce_ms: int = 3_000,
     require_busy: bool = True,
     baseline_summary: str = "",
+    work_item_id: Any = None,
 ) -> dict[str, Any]:
     """Poll Cursor until it has actually worked and then gone idle.
 
@@ -555,9 +626,17 @@ async def drive_until_done(
     """
     approvals: list[dict[str, Any]] = []
     seen_busy = False
+    logged_busy = False
     last: Any = None
     deadline = time.monotonic() + max(1, timeout_ms) / 1000
     start = time.monotonic()
+    log_cursor_stage(
+        "wait_begin",
+        work_item_id=work_item_id,
+        timeout_ms=timeout_ms,
+        require_busy=require_busy,
+        start_grace_ms=start_grace_ms,
+    )
 
     while time.monotonic() < deadline:
         approvals.extend(await click_pending_approvals(session))
@@ -570,6 +649,13 @@ async def drive_until_done(
 
         if cursor_is_busy(last):
             seen_busy = True
+            if not logged_busy:
+                logged_busy = True
+                log_cursor_stage(
+                    "wait_busy",
+                    work_item_id=work_item_id,
+                    **status_snapshot(last),
+                )
             try:
                 last = await mcp_call(
                     session,
@@ -593,6 +679,11 @@ async def drive_until_done(
                 await asyncio.sleep(2)
                 continue
             status, state, summary = await _snapshot(session)
+            log_cursor_stage(
+                "wait_not_started",
+                work_item_id=work_item_id,
+                **status_snapshot(status or last),
+            )
             return _result(
                 done=False,
                 status="not_started",
@@ -625,6 +716,12 @@ async def drive_until_done(
             baseline_summary.strip()
             and summary.strip() == baseline_summary.strip()
         ):
+            log_cursor_stage(
+                "wait_awaiting_result",
+                work_item_id=work_item_id,
+                seen_busy=seen_busy,
+                summary_chars=len(summary or ""),
+            )
             return _result(
                 done=False,
                 status="awaiting_result",
@@ -635,6 +732,12 @@ async def drive_until_done(
                 seen_busy=seen_busy,
                 hint=FOLLOW_UP_HINT,
             )
+        log_cursor_stage(
+            "wait_done",
+            work_item_id=work_item_id,
+            seen_busy=seen_busy,
+            summary_chars=len(summary or ""),
+        )
         return _result(
             done=True,
             status="idle",
@@ -650,6 +753,13 @@ async def drive_until_done(
     name = "working" if cursor_is_busy(status or last) else _status_name(status or last)
     if name in {"idle", "unknown"} and seen_busy:
         name = "timeout"
+    log_cursor_stage(
+        "wait_timeout",
+        work_item_id=work_item_id,
+        status=name,
+        seen_busy=seen_busy,
+        **status_snapshot(status or last),
+    )
     return _result(
         done=False,
         status=name,
@@ -673,6 +783,90 @@ async def drive_until_idle(
     return await drive_until_done(session, timeout_ms=timeout_ms)
 
 
+async def peek_composer(
+    session: Any,
+    *,
+    work_item_id: Any = None,
+) -> dict[str, Any]:
+    """Cheap get_status probe: do not wait, do not treat leftover idle as busy."""
+    try:
+        status = await mcp_call(session, "get_status")
+    except Exception as exc:
+        log_cursor_stage("peek_failed", work_item_id=work_item_id, error=str(exc)[:500])
+        return {"ok": False, "busy": False, "error": str(exc)[:500], "last": None}
+    snap = status_snapshot(status)
+    busy = cursor_is_explicitly_busy(status)
+    log_cursor_stage("peek", work_item_id=work_item_id, busy=busy, **snap)
+    return {"ok": True, "busy": busy, "last": status, **snap}
+
+
+async def wait_for_prompt_to_land(
+    session: Any,
+    *,
+    prompt: str,
+    baseline_summary: str = "",
+    grace_ms: int = 12_000,
+    work_item_id: Any = None,
+) -> dict[str, Any]:
+    """After send_prompt: confirm Composer actually took this assignment."""
+    deadline = time.monotonic() + max(50, int(grace_ms)) / 1000
+    status: Any = None
+    state: Any = None
+    summary = ""
+    ticks = 0
+    while True:
+        ticks += 1
+        try:
+            status, state, summary = await _snapshot(session)
+        except Exception as exc:
+            log_cursor_stage(
+                "verify_failed",
+                work_item_id=work_item_id,
+                tick=ticks,
+                error=str(exc)[:500],
+            )
+            status, state, summary = status, None, ""
+        busy = cursor_is_explicitly_busy(status)
+        visible = prompt_visible_in_composer(state, prompt)
+        changed = bool(baseline_summary.strip()) and bool(summary.strip()) and (
+            summary.strip() != baseline_summary.strip()
+        )
+        landed = busy or visible or changed
+        log_cursor_stage(
+            "verify",
+            work_item_id=work_item_id,
+            tick=ticks,
+            landed=landed,
+            busy=busy,
+            visible=visible,
+            summary_changed=changed,
+            **status_snapshot(status),
+            summary_chars=len(summary or ""),
+        )
+        if landed:
+            return {
+                "landed": True,
+                "busy": busy,
+                "visible": visible,
+                "summary_changed": changed,
+                "status": status,
+                "state": state,
+                "summary": summary,
+            }
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {
+                "landed": False,
+                "busy": False,
+                "visible": visible,
+                "summary_changed": changed,
+                "status": status,
+                "state": state,
+                "summary": summary,
+            }
+        await asyncio.sleep(min(1.5, remaining))
+
+
 async def send_prompt_and_drive(
     session: Any,
     text: str,
@@ -685,10 +879,26 @@ async def send_prompt_and_drive(
     expected_workspace: str | None = None,
     expected_window_id: str | None = None,
 ) -> dict[str, Any]:
+    log_cursor_stage(
+        "send_begin",
+        work_item_id=work_item_id,
+        prompt_chars=len(text or ""),
+        expected_workspace=expected_workspace,
+        expected_window_id=expected_window_id,
+    )
     ensure = await ensure_cursor_workspace(
         session,
         expected_workspace=expected_workspace,
         expected_window_id=expected_window_id,
+    )
+    log_cursor_stage(
+        "workspace",
+        work_item_id=work_item_id,
+        ok=bool(ensure.get("ok")),
+        status=ensure.get("status"),
+        workspace=ensure.get("workspace"),
+        windows=ensure.get("windows") or [],
+        reason=ensure.get("reason"),
     )
     if not ensure.get("ok"):
         return {
@@ -708,24 +918,39 @@ async def send_prompt_and_drive(
         }
     try:
         current = await mcp_call(session, "get_status")
-    except Exception:
+    except Exception as exc:
         current = ensure.get("last")
-    if cursor_is_busy(current):
-        driven = await drive_until_done(
-            session,
-            timeout_ms=timeout_ms,
-            require_busy=False,
-            start_grace_ms=0,
+        log_cursor_stage(
+            "status_before_failed",
+            work_item_id=work_item_id,
+            error=str(exc)[:500],
+        )
+    before = status_snapshot(current)
+    log_cursor_stage("status_before", work_item_id=work_item_id, **before)
+    if cursor_is_explicitly_busy(current):
+        log_cursor_stage(
+            "skip_busy",
+            work_item_id=work_item_id,
+            reason="composer_explicitly_busy",
+            **before,
         )
         return {
-            **driven,
+            "ok": False,
+            "done": False,
             "sent": False,
             "prompt_sent": False,
             "skipped_prompt": True,
+            "started": False,
+            "seen_busy": True,
+            "status": "cursor_busy",
             "reason": (
-                "Cursor already working — did not send a duplicate task. "
-                "Polled the current job instead."
+                "Composer is actually working. Did not send this assignment."
             ),
+            "summary": "",
+            "next": FOLLOW_UP_HINT,
+            "workspace": ensure.get("workspace"),
+            "windows": ensure.get("windows") or [],
+            "last": current,
         }
     from .cursor_file_transfer import build_customer_files_prompt, deliver_customer_files_to_cursor
 
@@ -735,6 +960,12 @@ async def send_prompt_and_drive(
         work_item_id=work_item_id,
         public_base_url=public_base_url,
         secret_key=secret_key,
+    )
+    log_cursor_stage(
+        "files",
+        work_item_id=work_item_id,
+        method=delivery.get("method"),
+        paths=delivery.get("paths") or [],
     )
     prompt = build_customer_files_prompt(
         text,
@@ -748,11 +979,27 @@ async def send_prompt_and_drive(
         send_payload["attachments"] = inline_attachments
     try:
         _, _, baseline_summary = await _snapshot(session)
-    except Exception:
+    except Exception as exc:
         baseline_summary = ""
+        log_cursor_stage(
+            "baseline_failed",
+            work_item_id=work_item_id,
+            error=str(exc)[:500],
+        )
+    log_cursor_stage(
+        "send_prompt",
+        work_item_id=work_item_id,
+        prompt_chars=len(prompt),
+        baseline_chars=len(baseline_summary or ""),
+    )
     try:
         sent = await mcp_call(session, "send_prompt", send_payload)
     except Exception as exc:
+        log_cursor_stage(
+            "send_prompt_failed",
+            work_item_id=work_item_id,
+            error=str(exc)[:800],
+        )
         return {
             "ok": False,
             "done": False,
@@ -767,42 +1014,113 @@ async def send_prompt_and_drive(
             "workspace": ensure.get("workspace"),
             "windows": ensure.get("windows") or [],
         }
+    log_cursor_stage(
+        "send_prompt_ok",
+        work_item_id=work_item_id,
+        mcp=str(sent)[:500],
+    )
+    try:
+        after_send = await mcp_call(session, "get_status")
+    except Exception as exc:
+        after_send = None
+        log_cursor_stage(
+            "status_after_failed",
+            work_item_id=work_item_id,
+            error=str(exc)[:500],
+        )
+    else:
+        log_cursor_stage(
+            "status_after",
+            work_item_id=work_item_id,
+            **status_snapshot(after_send),
+        )
+    landed = await wait_for_prompt_to_land(
+        session,
+        prompt=prompt,
+        baseline_summary=baseline_summary,
+        grace_ms=min(12_000, max(int(timeout_ms), 50)),
+        work_item_id=work_item_id,
+    )
+    if not landed.get("landed"):
+        reason = (
+            "send_prompt returned, but Composer did not start this assignment. "
+            "The chat is still idle with the previous contents — prompt did not land."
+        )
+        log_cursor_stage(
+            "not_delivered",
+            work_item_id=work_item_id,
+            reason=reason,
+            visible=landed.get("visible"),
+            busy=landed.get("busy"),
+            summary_changed=landed.get("summary_changed"),
+            **status_snapshot(landed.get("status")),
+        )
+        return {
+            "ok": False,
+            "done": False,
+            "sent": sent,
+            "prompt_sent": False,
+            "started": False,
+            "seen_busy": False,
+            "status": "not_started",
+            "reason": reason,
+            "summary": landed.get("summary") or "",
+            "next": NOT_STARTED_HINT,
+            "workspace": ensure.get("workspace"),
+            "windows": ensure.get("windows") or [],
+            "last": landed.get("status") or after_send,
+            "messages": (
+                (landed.get("state") or {}).get("messages")
+                if isinstance(landed.get("state"), dict)
+                else []
+            ),
+            "file_delivery": {
+                "method": delivery.get("method"),
+                "paths": delivery.get("paths") or [],
+            },
+        }
+    log_cursor_stage(
+        "delivered",
+        work_item_id=work_item_id,
+        busy=landed.get("busy"),
+        visible=landed.get("visible"),
+        summary_changed=landed.get("summary_changed"),
+        **status_snapshot(landed.get("status")),
+    )
     driven = await drive_until_done(
         session,
         timeout_ms=timeout_ms,
         require_busy=True,
         baseline_summary=baseline_summary,
+        work_item_id=work_item_id,
     )
     result = {
+        **driven,
         "sent": sent,
         "prompt_sent": True,
+        "started": True,
+        "seen_busy": bool(driven.get("seen_busy") or landed.get("busy")),
+        "prompt_visible": bool(landed.get("visible")),
         "baseline_summary": baseline_summary,
-        **driven,
         "file_delivery": {
             "method": delivery.get("method"),
             "paths": delivery.get("paths") or [],
         },
     }
+    if str(result.get("status") or "") == "not_started":
+        result["status"] = "working" if result.get("seen_busy") else "awaiting_result"
+        result["ok"] = True
+        result["done"] = False
     if delivery.get("paths"):
         result["images"] = delivery["paths"]
-    # Prompt API accepted, but Composer never became busy → treat as not delivered.
-    if (
-        not result.get("done")
-        and not result.get("seen_busy")
-        and str(result.get("status") or "") == "not_started"
-    ):
-        result.update(
-            {
-                "ok": False,
-                "prompt_sent": False,
-                "started": False,
-                "reason": (
-                    "Cursor did not start after send_prompt — workspace/window likely wrong "
-                    "or Composer did not accept the task."
-                ),
-                "next": NOT_STARTED_HINT,
-            }
-        )
+    log_cursor_stage(
+        "waiting" if not result.get("done") else "finished",
+        work_item_id=work_item_id,
+        status=result.get("status"),
+        done=bool(result.get("done")),
+        seen_busy=bool(result.get("seen_busy")),
+        summary_chars=len(str(result.get("summary") or "")),
+    )
     return result
 
 
@@ -812,8 +1130,10 @@ async def check_and_drive(
     timeout_ms: int = 90_000,
     idle_debounce_ms: int = 3_000,
     baseline_summary: str = "",
+    work_item_id: Any = None,
 ) -> dict[str, Any]:
     """Poll an already-running Cursor job. Idle without prior activity is a real finish here."""
+    log_cursor_stage("poll_begin", work_item_id=work_item_id, timeout_ms=timeout_ms)
     result = await drive_until_done(
         session,
         timeout_ms=timeout_ms,
@@ -821,7 +1141,16 @@ async def check_and_drive(
         start_grace_ms=0,
         idle_debounce_ms=idle_debounce_ms,
         baseline_summary=baseline_summary,
+        work_item_id=work_item_id,
     )
     if baseline_summary:
         result["baseline_summary"] = baseline_summary
+    log_cursor_stage(
+        "poll_end",
+        work_item_id=work_item_id,
+        status=result.get("status"),
+        done=result.get("done"),
+        seen_busy=result.get("seen_busy"),
+        summary_chars=len(str(result.get("summary") or "")),
+    )
     return result
