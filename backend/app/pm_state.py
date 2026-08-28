@@ -279,11 +279,18 @@ def apply_task_contract(item: WorkItem, contract: TaskContract) -> WorkItem:
     item.priority = contract.priority
     item.source_message_id = str(contract.source.get("message_id") or "") or None
     metadata = dict(item.metadata_json or {})
+    previous_pm = metadata.get("pm") if isinstance(metadata.get("pm"), dict) else {}
     metadata["pm"] = {
         "dependencies": contract.dependencies,
         "related_tasks": contract.related_tasks,
         "source": contract.source,
     }
+    for key in ("tracker_task_id", "tracker_project_id", "card_id"):
+        value = str(
+            contract.context.get(key) or previous_pm.get(key) or ""
+        ).strip()
+        if value:
+            metadata["pm"][key] = value
     item.metadata_json = metadata
     return item
 

@@ -164,6 +164,42 @@ def work_item_tracker_task_id(item: WorkItem) -> str:
     return ""
 
 
+def tracker_intake_message_id(tracker_task_id: str) -> str:
+    """Stable unique source_message_id so each tracker card can have its own WorkItem."""
+    tid = str(tracker_task_id or "").strip()
+    if not tid:
+        return ""
+    return f"tracker:{tid}"[:64]
+
+
+def work_item_is_closed(item: WorkItem | None) -> bool:
+    if item is None:
+        return False
+    status = str(getattr(item, "status", "") or "").strip().lower()
+    phase = str(getattr(item, "pm_phase", "") or "").strip().upper()
+    return status in {"done", "cancelled", "canceled"} or phase in {"DONE", "CANCELLED"}
+
+
+def can_reuse_work_item_for_structure(
+    item: WorkItem | None,
+    *,
+    tracker_task_id: str = "",
+    create_new_task: bool = False,
+) -> bool:
+    """Reuse only the same tracker card. Closed cases must not steal a new card."""
+    if item is None:
+        return False
+    wanted = str(tracker_task_id or "").strip()
+    existing = work_item_tracker_task_id(item)
+    if wanted:
+        return existing == wanted
+    if create_new_task:
+        return False
+    if work_item_is_closed(item):
+        return False
+    return True
+
+
 async def indexed_tracker_work_items(
     db: AsyncSession,
     agent_id: int,

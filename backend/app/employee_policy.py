@@ -146,7 +146,8 @@ def pm_system_instruction() -> str:
         "When a customer card has tracker_project_id, the platform periodically polls ice_tracker. "
         "On a tracker backlog tick call pm_poll_tracker (or use the listed claimable cards), then "
         "pm_structure_task for ONE unfinished card with context_json.tracker_task_id + "
-        "tracker_project_id (never invent a second case for the same tracker_task_id). "
+        "tracker_project_id (never invent a second case for the same tracker_task_id; "
+        "a closed case for a different tracker_task_id is NOT a duplicate — create a new case). "
         "Communicate naturally and briefly; do not expose internal JSON or raw Cursor output."
     )
 

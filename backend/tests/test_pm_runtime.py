@@ -360,3 +360,83 @@ async def test_structured_cursor_result_requires_and_then_passes_qa(
         assert item.status == "done"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_new_tracker_card_is_not_duplicate_of_closed_case(tmp_path: Path) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'pm-tracker-dedupe.db').as_posix()}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    mcp = McpManager()
+    runtime = AgentRuntime(
+        Settings(mem0_enabled=False),
+        SimpleNamespace(),
+        FakeSearch(),
+        FakeEvents(),
+        mcp=mcp,
+    )
+    closed_card = "a75de1b6-c1af-4c06-a141-9b56505ff6a4"
+    new_card = "7f157a72-3408-474e-a183-d1777638fc4c"
+    project_uuid = "d82c8c0d-c1af-4c06-a141-9b56505ff6a4"
+    async with sessions() as db:
+        agent = Agent(name="max")
+        db.add(agent)
+        await db.flush()
+        closed = WorkItem(
+            agent_id=agent.id,
+            title="мобильная версия — кривая вёрстка",
+            goal="mobile layout",
+            project_id="uraltrade",
+            status="done",
+            pm_phase="DONE",
+            source="employee_tick",
+            chat_id="customer-1",
+            source_message_id="old-tg-msg",
+            context_json={
+                "tracker_task_id": closed_card,
+                "tracker_project_id": project_uuid,
+            },
+            metadata_json={"pm": {"tracker_task_id": closed_card}},
+        )
+        db.add(closed)
+        await db.commit()
+        runtime_context = {
+            "_pm_mode": True,
+            "work_item_id": closed.id,
+            "source": "employee_tick",
+            "chat_id": "customer-1",
+            "message_id": "old-tg-msg",
+        }
+        registry = await runtime.registry(
+            agent,
+            mcp_server_names=set(),
+            memory_enabled=False,
+            db=db,
+            context=runtime_context,
+        )
+        created = await registry.call(
+            "pm_structure_task",
+            {
+                "project_id": "uraltrade",
+                "task_type": "bug",
+                "title": "в верхнем меню перестал раскрывать каталог",
+                "requirements": ["Каталог в шапке раскрывается"],
+                "acceptance_criteria": ["Подменю каталога открывается"],
+                "create_new_task": True,
+                "context_json": {
+                    "tracker_task_id": new_card,
+                    "tracker_project_id": project_uuid,
+                },
+            },
+        )
+        assert created["duplicate"] is False
+        assert created["task"]["id"] != closed.id
+        assert created["task"]["context"]["tracker_task_id"] == new_card
+        assert (
+            await db.scalar(select(func.count()).select_from(WorkItem))
+        ) == 2
+
+    await engine.dispose()

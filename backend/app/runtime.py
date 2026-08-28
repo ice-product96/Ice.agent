@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -1454,7 +1455,24 @@ class AgentRuntime:
                 estimated_duration_minutes: int = 0,
             ) -> dict[str, Any]:
                 """Create or update the current deterministic PM task. Never call for an idea."""
+                from .tracker_poll import (
+                    can_reuse_work_item_for_structure,
+                    find_work_item_for_tracker_task,
+                    tracker_intake_message_id,
+                )
+
+                tracker_task_id = str(
+                    (context_json or {}).get("tracker_task_id")
+                    or (context_json or {}).get("card_id")
+                    or ""
+                ).strip()
+                intake_message_id = tracker_intake_message_id(tracker_task_id)
                 source_message_id = str((context or {}).get("message_id") or "") or None
+                # Each tracker card gets its own unique source_message_id so a closed
+                # case from the same chat/tick cannot collide via uq_work_items_source_message.
+                if intake_message_id and context is not None:
+                    context["message_id"] = intake_message_id
+                    source_message_id = intake_message_id
                 item = None
                 if source_message_id:
                     item = await db.scalar(
@@ -1465,7 +1483,13 @@ class AgentRuntime:
                             WorkItem.source_message_id == source_message_id,
                         )
                     )
-                    if item is not None:
+                    if not can_reuse_work_item_for_structure(
+                        item,
+                        tracker_task_id=tracker_task_id,
+                        create_new_task=create_new_task,
+                    ):
+                        item = None
+                    elif item is not None:
                         if context is not None:
                             context["work_item_id"] = item.id
                         return {
@@ -1477,15 +1501,14 @@ class AgentRuntime:
                     item = await get_work_item(
                         db, (context or {}).get("work_item_id")
                     )
+                    if not can_reuse_work_item_for_structure(
+                        item,
+                        tracker_task_id=tracker_task_id,
+                        create_new_task=False,
+                    ):
+                        item = None
                 # Deduplicate by ice_tracker card id when reclaiming from backlog.
-                tracker_task_id = str(
-                    (context_json or {}).get("tracker_task_id")
-                    or (context_json or {}).get("card_id")
-                    or ""
-                ).strip()
                 if item is None and tracker_task_id:
-                    from .tracker_poll import find_work_item_for_tracker_task
-
                     existing_tracker = await find_work_item_for_tracker_task(
                         db, agent.id, tracker_task_id
                     )
@@ -1512,7 +1535,7 @@ class AgentRuntime:
                         )
                     except IntegrityError:
                         await db.rollback()
-                        item = await db.scalar(
+                        collided = await db.scalar(
                             select(WorkItem).where(
                                 WorkItem.agent_id == agent.id,
                                 WorkItem.source
@@ -1522,13 +1545,29 @@ class AgentRuntime:
                                 WorkItem.source_message_id == source_message_id,
                             )
                         )
-                        if item is None:
+                        if can_reuse_work_item_for_structure(
+                            collided,
+                            tracker_task_id=tracker_task_id,
+                            create_new_task=create_new_task,
+                        ):
+                            return {
+                                "ok": True,
+                                "duplicate": True,
+                                "task": work_item_json(collided),
+                            }
+                        if context is None:
                             raise
-                        return {
-                            "ok": True,
-                            "duplicate": True,
-                            "task": work_item_json(item),
-                        }
+                        context["message_id"] = f"pm-new:{uuid.uuid4().hex}"[:64]
+                        source_message_id = context["message_id"]
+                        item = await create_work_item(
+                            db,
+                            agent,
+                            title=title,
+                            goal=str((context_json or {}).get("business_reason") or title),
+                            context=context,
+                            source=str((context or {}).get("source") or "manual"),
+                            commit=False,
+                        )
                     if context is not None:
                         context["work_item_id"] = item.id
                 normalized_task_context = dict(context_json or {})
@@ -3505,6 +3544,13 @@ class AgentRuntime:
             origin = collect_origin_from_jobs(
                 await list_agent_jobs(db, agent.id, enabled_only=False)
             )
+            extra_work_item_id = extra.get("work_item_id")
+            if extra_work_item_id and claimable_count > 0:
+                from .work_items import get_work_item as _get_tick_item
+
+                bound = await _get_tick_item(db, extra_work_item_id)
+                if _pm_item_is_closed(bound):
+                    extra_work_item_id = None
             context = {
                 "source": "employee_tick",
                 "employee_tick": True,
@@ -3515,7 +3561,6 @@ class AgentRuntime:
                 **{
                     key: extra[key]
                     for key in (
-                        "work_item_id",
                         "reply_chat_id",
                         "reply_phone",
                         "chat_id",
@@ -3526,8 +3571,8 @@ class AgentRuntime:
                     if extra.get(key) not in (None, "")
                 },
             }
-            if extra.get("work_item_id"):
-                context["work_item_id"] = extra["work_item_id"]
+            if extra_work_item_id:
+                context["work_item_id"] = extra_work_item_id
             elif pending:
                 context["work_item_id"] = _tick_focus_item(pending).id
             from .work_items import get_work_item, work_item_aborted
