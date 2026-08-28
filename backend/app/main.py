@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, WebSocket
@@ -11,10 +13,11 @@ from .api import router
 from .config import Settings, get_settings
 from .contract import router as contract_router, websocket_events
 from .db import (
-    AdminSettings, Agent, LlmProfile, McpServer, RuntimeSettings, SessionLocal,
+    AdminSettings, Agent, CronJob, LlmProfile, McpServer, RuntimeSettings, SessionLocal,
     SipAccount, TelegramAccount, create_schema,
+    WorkItem,
 )
-from .employee import list_agent_jobs
+from .employee import list_agent_jobs, save_once_job
 from .events import events
 from .integrations import McpManager, MemoryStore, WebSearch, exception_text
 from .job_result import collect_origin_from_jobs, origin_chat_id, origin_phone, send_origin_reply
@@ -193,8 +196,123 @@ async def lifespan(app: FastAPI):
                     chat_id = origin_chat_id(recovered)
                 return await send_origin_reply(telegram, phone, chat_id, body)
 
+            async def schedule_delivery_retry(
+                text: str,
+                *,
+                attempt: int,
+                extra: dict[str, Any] | None = None,
+            ) -> CronJob:
+                run_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+                merged = {**payload, **(extra or {})}
+                retry_payload = {
+                    **merged,
+                    "kind": "cursor_result_delivery",
+                    "source": "scheduled_delivery",
+                    "message": text,
+                    "delivery_attempt": attempt,
+                    "delivery_key": merged.get("delivery_key"),
+                    "run_once_at": run_at.isoformat(),
+                    "timezone": "UTC",
+                }
+                return await save_once_job(
+                    db,
+                    scheduler,
+                    agent_id=agent.id,
+                    name=f"case{merged.get('work_item_id')}-cursor-delivery",
+                    payload=retry_payload,
+                    current_job_id=payload.get("_cron_job_id"),
+                )
+
+            async def deliver_cursor_result_once(
+                text: str,
+                *,
+                extra: dict[str, Any] | None = None,
+            ) -> dict[str, Any]:
+                merged = {**payload, **(extra or {})}
+                item_id = merged.get("work_item_id")
+                item = await db.get(WorkItem, item_id) if item_id else None
+                assignment = (
+                    merged.get("cursor_assignment_seq")
+                    if merged.get("cursor_assignment_seq") is not None
+                    else (
+                        (item.metadata_json or {}).get("cursor_assignment_seq", 0)
+                        if item is not None
+                        else 0
+                    )
+                )
+                key = str(merged.get("delivery_key") or "").strip() or hashlib.sha256(
+                    f"{item_id}:{assignment}:{text}".encode("utf-8")
+                ).hexdigest()
+                payload["delivery_key"] = key
+                if item is not None:
+                    meta = dict(item.metadata_json or {})
+                    delivery_state = (
+                        dict(meta.get("cursor_delivery") or {})
+                        if isinstance(meta.get("cursor_delivery"), dict)
+                        else {}
+                    )
+                    if delivery_state.get("key") == key and delivery_state.get(
+                        "status"
+                    ) in {"sending", "sent"}:
+                        return {
+                            "sent": True,
+                            "deduplicated": True,
+                            "reason": "результат уже отправлен или отправляется.",
+                        }
+                    meta["cursor_delivery"] = {
+                        "key": key,
+                        "status": "sending",
+                        "attempt": int(merged.get("delivery_attempt") or 0),
+                    }
+                    item.metadata_json = meta
+                    await db.commit()
+                delivery = await deliver_result(text, extra=extra)
+                if item is not None:
+                    await db.refresh(item)
+                    meta = dict(item.metadata_json or {})
+                    state = dict(meta.get("cursor_delivery") or {})
+                    if state.get("key") == key:
+                        state["status"] = (
+                            "sent" if delivery.get("sent") else "failed"
+                        )
+                        state["reason"] = str(delivery.get("reason") or "")[:500]
+                        meta["cursor_delivery"] = state
+                        item.metadata_json = meta
+                        await db.commit()
+                return delivery
+
             kind = str(payload.get("kind") or "")
             try:
+                if kind == "cursor_result_delivery":
+                    delivery = await deliver_cursor_result_once(
+                        str(payload.get("message") or "")
+                    )
+                    attempt = int(payload.get("delivery_attempt") or 1)
+                    outcome = {
+                        "ok": bool(delivery.get("sent")),
+                        "poll_only": True,
+                        "delivery": delivery,
+                        "notified": bool(delivery.get("sent")),
+                    }
+                    if not delivery.get("sent") and attempt < 5:
+                        job = await schedule_delivery_retry(
+                            str(payload.get("message") or ""),
+                            attempt=attempt + 1,
+                        )
+                        outcome["rescheduled"] = True
+                        outcome["job_id"] = job.id
+                    elif not delivery.get("sent"):
+                        phone = origin_phone(payload)
+                        if phone and telegram.admin_ids:
+                            await telegram.notify_admins(
+                                phone,
+                                (
+                                    "[Ice.agent] Не удалось доставить итог заказчику\n"
+                                    f"Кейс #{payload.get('work_item_id')}: "
+                                    f"{delivery.get('reason') or 'неизвестная ошибка'}"
+                                ),
+                            )
+                    return outcome
                 if kind == "employee_tick" or payload.get("source") in {
                     "employee_heartbeat",
                     "consult_resolved",
@@ -219,6 +337,37 @@ async def lifespan(app: FastAPI):
                         tick_result["delivery"] = delivery
                         tick_result["notified"] = bool(delivery.get("sent"))
                     return tick_result
+                from .cursorremote_drive import is_cursor_poll_followup
+
+                if is_cursor_poll_followup(payload):
+                    poll_result = await runtime.poll_cursor_followup(
+                        db,
+                        agent,
+                        payload,
+                    )
+                    if poll_result.get("deliver_origin"):
+                        delivery = await deliver_cursor_result_once(
+                            str(poll_result.get("result") or ""),
+                            extra={
+                                "reply_phone": poll_result.get("reply_phone"),
+                                "reply_chat_id": poll_result.get("reply_chat_id"),
+                            },
+                        )
+                        poll_result["delivery"] = delivery
+                        poll_result["notified"] = bool(delivery.get("sent"))
+                        if not delivery.get("sent"):
+                            job = await schedule_delivery_retry(
+                                str(poll_result.get("result") or ""),
+                                attempt=1,
+                                extra={
+                                    "reply_phone": poll_result.get("reply_phone"),
+                                    "reply_chat_id": poll_result.get("reply_chat_id"),
+                                },
+                            )
+                            poll_result["delivery_rescheduled"] = True
+                            poll_result["delivery_job_id"] = job.id
+                    if not poll_result.get("fallback_llm"):
+                        return poll_result
                 result = await runtime.run(db, agent, str(payload.get("message", "")), payload)
                 outcome = {
                     "ok": True,

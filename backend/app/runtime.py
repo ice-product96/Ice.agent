@@ -3,7 +3,6 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select, update
@@ -17,13 +16,14 @@ from .db import (
     AgentLink,
     AgentTask,
     CronJob,
+    CursorRun,
     EmployeeNeed,
     LlmProfile,
     McpServer,
     MessageLog,
-    PromptSection,
     RuntimeSettings,
     TelegramAccount,
+    WorkItem,
     agent_mcp_servers,
     utcnow,
 )
@@ -33,6 +33,7 @@ from .action_reports import (
     format_manager_status,
     is_internal_execution,
     should_redirect_customer_outbound,
+    should_suppress_manager_status,
 )
 from .job_result import (
     build_followup_payload,
@@ -121,6 +122,378 @@ NO_TELEGRAM_REPLY = "[[NO_TELEGRAM_REPLY]]"
 
 class PermissionDenied(PermissionError):
     pass
+
+
+async def _pm_cursor_leftover(
+    db: AsyncSession,
+    item: WorkItem,
+    run: CursorRun,
+    result: dict[str, Any],
+    *,
+    error: str,
+    detail: str,
+    reason: str,
+) -> dict[str, Any]:
+    from .pm_state import transition_pm_phase, update_cursor_run
+
+    await update_cursor_run(
+        db,
+        run,
+        status="cancelled",
+        result=result,
+        error=error,
+    )
+    if item.pm_phase in {"IN_DEVELOPMENT", "BLOCKED"}:
+        await transition_pm_phase(db, item, "READY_FOR_DEV", detail=detail)
+    meta = dict(item.metadata_json or {})
+    meta["cursor_in_flight"] = False
+    item.metadata_json = meta
+    item.active_cursor_run_id = None
+    item.status = "in_progress"
+    item.wait_owner = "self"
+    item.next_action = (
+        "Cursor returned another job's leftover. "
+        "Resubmit with submit_development_task when Composer is free."
+    )
+    item.last_error = None
+    await db.commit()
+    return {
+        "task_id": str(item.id),
+        "run_id": run.id,
+        "status": "leftover_idle",
+        "done": False,
+        "leftover": True,
+        "reason": reason,
+        "result": result,
+    }
+
+
+async def _apply_pm_cursor_result(
+    db: AsyncSession,
+    item: WorkItem,
+    run: CursorRun,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist one structured PM Cursor poll without an LLM round."""
+    from .cursorremote_drive import prompt_actually_started
+    from .pm_state import (
+        is_leftover_cursor_idle,
+        parse_cursor_result,
+        recover_truncated_cursor_result,
+        transition_pm_phase,
+        update_cursor_run,
+    )
+    from .work_items import add_event, stamp_cursor_prompt_sent
+
+    if not prompt_actually_started(result) and not result.get("done"):
+        reason = str(
+            result.get("reason")
+            or result.get("summary")
+            or "Cursor did not accept the prompt"
+        )[:2000]
+        await update_cursor_run(
+            db,
+            run,
+            status="cancelled",
+            result=result,
+            error=reason,
+        )
+        if item.pm_phase in {"IN_DEVELOPMENT", "BLOCKED"}:
+            await transition_pm_phase(
+                db,
+                item,
+                "READY_FOR_DEV",
+                detail="Cursor did not accept the prompt",
+            )
+        meta = dict(item.metadata_json or {})
+        meta["cursor_in_flight"] = False
+        item.metadata_json = meta
+        item.active_cursor_run_id = None
+        item.status = "waiting_manager"
+        item.wait_owner = "manager"
+        item.last_error = reason
+        item.next_action = (
+            "Откройте Cursor на нужном workspace и нажмите «Продолжи» / "
+            "submit_development_task"
+        )
+        await add_event(
+            db,
+            item,
+            kind="blocked",
+            title="Cursor не принял задачу",
+            detail=reason[:800],
+            payload={
+                "status": result.get("status"),
+                "workspace": result.get("workspace"),
+                "windows": result.get("windows") or [],
+            },
+        )
+        await db.commit()
+        return {
+            "task_id": str(item.id),
+            "run_id": run.id,
+            "status": result.get("status") or "workspace_unavailable",
+            "done": False,
+            "prompt_sent": False,
+            "started": False,
+            "needs_workspace": True,
+            "reason": reason,
+            "result": result,
+        }
+    if not result.get("done"):
+        await update_cursor_run(db, run, status="running", result=result)
+        item.active_cursor_run_id = run.id
+        item.status = "waiting_external"
+        item.wait_owner = "external"
+        item.last_error = None
+        ctx = item.context_json if isinstance(item.context_json, dict) else {}
+        min_minutes = ctx.get("min_execution_minutes")
+        item.next_action = (
+            f"Wait for structured Cursor result (min {min_minutes} min by estimate)"
+            if min_minutes
+            else "Wait for structured Cursor result"
+        )
+        meta = dict(item.metadata_json or {})
+        meta["cursor_in_flight"] = True
+        item.metadata_json = meta
+        if item.pm_phase in {"READY_FOR_DEV", "BLOCKED", "CHANGES_REQUESTED"}:
+            await transition_pm_phase(
+                db,
+                item,
+                "IN_DEVELOPMENT",
+                detail="Cursor job in progress",
+            )
+        await stamp_cursor_prompt_sent(db, item)
+        await db.commit()
+        return {
+            "task_id": str(item.id),
+            "run_id": run.id,
+            "status": "in_progress",
+            "done": False,
+            "reattached": bool(result.get("skipped_prompt")),
+        }
+
+    candidates: list[Any] = [result.get("result"), result.get("summary")]
+    if isinstance(result.get("messages"), list):
+        for message in reversed(result.get("messages") or []):
+            if isinstance(message, dict):
+                candidates.append(
+                    message.get("text")
+                    or message.get("content")
+                    or message.get("detail")
+                    or message
+                )
+            else:
+                candidates.append(message)
+    structured: dict[str, Any] | None = None
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            candidate = candidate.get("content") or candidate.get("text") or candidate
+        try:
+            structured = parse_cursor_result(candidate)
+            break
+        except (TypeError, ValueError):
+            continue
+    if structured is None:
+        criteria: list[str] = []
+        ctx = item.context_json if isinstance(item.context_json, dict) else {}
+        for key in ("acceptance_criteria", "acceptance"):
+            raw_criteria = ctx.get(key) or (item.metadata_json or {}).get(key)
+            if isinstance(raw_criteria, list):
+                criteria = [
+                    str(value)
+                    for value in raw_criteria
+                    if str(value or "").strip()
+                ]
+                break
+        for candidate in candidates:
+            text = candidate
+            if isinstance(text, dict):
+                text = (
+                    text.get("content")
+                    or text.get("text")
+                    or text.get("summary")
+                    or ""
+                )
+            if not isinstance(text, str):
+                continue
+            structured = recover_truncated_cursor_result(
+                text,
+                expected_task_id=str(item.id),
+                acceptance_criteria=criteria,
+            )
+            if structured is not None:
+                break
+    task_id = str(item.id)
+    if structured is not None:
+        got_id = str(structured.get("task_id") or "").strip()
+        if got_id and got_id != task_id:
+            return await _pm_cursor_leftover(
+                db,
+                item,
+                run,
+                result,
+                error="Cursor result task_id mismatch",
+                detail="Cursor result belonged to another task",
+                reason="Cursor result task_id mismatch — resubmit",
+            )
+    elif is_leftover_cursor_idle(result):
+        return await _pm_cursor_leftover(
+            db,
+            item,
+            run,
+            result,
+            error="Leftover idle Cursor summary — prompt was not for this assignment",
+            detail="Leftover Cursor idle; resubmit when Composer is free",
+            reason=(
+                "Leftover idle from another Cursor job — not this task. "
+                "Do not consult the manager. Wait until Composer is free, then "
+                "call submit_development_task again."
+            ),
+        )
+    else:
+        return await _pm_cursor_leftover(
+            db,
+            item,
+            run,
+            result,
+            error="Cursor returned no valid structured completion payload",
+            detail="No structured Cursor payload; resubmit when free",
+            reason=(
+                "No structured completion for this task — leftover or incomplete. "
+                "Do not consult the manager. Resubmit submit_development_task."
+            ),
+        )
+
+    await update_cursor_run(
+        db,
+        run,
+        status=structured["status"],
+        result=structured,
+        error=(
+            "Invalid or blocked Cursor result"
+            if structured["status"] != "completed"
+            else None
+        ),
+    )
+    meta = dict(item.metadata_json or {})
+    meta["cursor_in_flight"] = False
+    item.metadata_json = meta
+    if structured["status"] == "completed":
+        await transition_pm_phase(
+            db, item, "DEV_COMPLETE", detail="Cursor development complete"
+        )
+        await transition_pm_phase(
+            db, item, "QA", detail="Result awaits acceptance checks"
+        )
+        item.status = "in_progress"
+        item.wait_owner = "self"
+        item.next_action = "Verify acceptance criteria and explicitly accept QA"
+        item.last_error = None
+    else:
+        await transition_pm_phase(
+            db,
+            item,
+            (
+                "CHANGES_REQUESTED"
+                if item.pm_phase in {"QA", "CLIENT_REVIEW", "DEV_COMPLETE"}
+                else "READY_FOR_DEV"
+            ),
+            detail="Cursor reported blocked/failed — request a fix",
+        )
+        item.status = "in_progress"
+        item.wait_owner = "self"
+        item.next_action = "Request a Cursor fix via request_development_fix"
+        item.last_error = None
+    await db.commit()
+    return {
+        "task_id": str(item.id),
+        "run_id": run.id,
+        "status": structured["status"],
+        "done": structured["status"] == "completed",
+        "qa_required": structured["status"] == "completed",
+        "result": structured,
+    }
+
+
+async def _poll_pm_cursor_item(
+    db: AsyncSession,
+    item: WorkItem,
+    cursor_session: Any,
+) -> dict[str, Any]:
+    """Poll or reattach a PM Cursor run without invoking the agent LLM."""
+    from .cursorremote_drive import check_and_drive
+    from .pm_state import (
+        get_or_create_cursor_run,
+        transition_pm_phase,
+        update_cursor_run,
+    )
+    from .work_items import work_item_json
+
+    run = (
+        await db.get(CursorRun, item.active_cursor_run_id)
+        if item.active_cursor_run_id
+        else None
+    )
+    if run is None or run.status in {"cancelled", "failed"}:
+        live = await check_and_drive(cursor_session)
+        if live.get("done") or live.get("seen_busy") or live.get("started"):
+            attempt = int(
+                await db.scalar(
+                    select(func.count())
+                    .select_from(CursorRun)
+                    .where(CursorRun.work_item_id == item.id)
+                )
+                or 0
+            ) + 1
+            run, _ = await get_or_create_cursor_run(
+                db,
+                item,
+                attempt=attempt,
+                request={
+                    "reattach": True,
+                    "reason": "Recover orphaned Cursor session",
+                },
+            )
+            await update_cursor_run(db, run, status="running")
+            if item.pm_phase in {"READY_FOR_DEV", "BLOCKED", "CHANGES_REQUESTED"}:
+                await transition_pm_phase(
+                    db,
+                    item,
+                    "IN_DEVELOPMENT",
+                    detail="Reattached to live Cursor session",
+                )
+            item.active_cursor_run_id = run.id
+            meta = dict(item.metadata_json or {})
+            meta["cursor_in_flight"] = not bool(live.get("done"))
+            item.metadata_json = meta
+            await db.commit()
+            return await _apply_pm_cursor_result(db, item, run, live)
+        return {
+            "task": work_item_json(item),
+            "status": "no_active_run",
+            "done": False,
+            "live": live,
+            "reason": (
+                "No active Cursor run tracked. Composer is idle/unavailable. "
+                "If the workspace is open, call submit_development_task once; "
+                "do not spam checks."
+            ),
+        }
+    if run.status in {"completed", "blocked"}:
+        return {
+            "task": work_item_json(item),
+            "run_id": run.id,
+            "status": run.status,
+            "done": run.status == "completed",
+            "result": run.result_json,
+        }
+    return await _apply_pm_cursor_result(
+        db,
+        item,
+        run,
+        await check_and_drive(cursor_session),
+    )
 
 
 class TaskBus:
@@ -1420,7 +1793,6 @@ class AgentRuntime:
                 from .cursorremote_drive import (
                     CURSOR_CHECK_ONLY_MESSAGE,
                     check_and_drive,
-                    pin_cursor_followup_message,
                     prompt_actually_started,
                     send_prompt_and_drive,
                 )
@@ -1611,255 +1983,15 @@ class AgentRuntime:
                     )
                     from .work_items import add_event, get_work_item, work_item_json
 
-                    async def _pm_cursor_leftover(
-                        item: Any,
-                        run: CursorRun,
-                        result: dict[str, Any],
-                        *,
-                        error: str,
-                        detail: str,
-                        reason: str,
-                    ) -> dict[str, Any]:
-                        await update_cursor_run(
-                            db,
-                            run,
-                            status="cancelled",
-                            result=result,
-                            error=error,
-                        )
-                        if item.pm_phase in {"IN_DEVELOPMENT", "BLOCKED"}:
-                            await transition_pm_phase(
-                                db,
-                                item,
-                                "READY_FOR_DEV",
-                                detail=detail,
-                            )
-                        meta = dict(item.metadata_json or {})
-                        meta["cursor_in_flight"] = False
-                        item.metadata_json = meta
-                        item.active_cursor_run_id = None
-                        item.status = "in_progress"
-                        item.wait_owner = "self"
-                        item.next_action = (
-                            "Cursor returned another job's leftover. "
-                            "Resubmit with submit_development_task when Composer is free."
-                        )
-                        item.last_error = None
-                        await db.commit()
-                        return {
-                            "task_id": str(item.id),
-                            "run_id": run.id,
-                            "status": "leftover_idle",
-                            "done": False,
-                            "leftover": True,
-                            "reason": reason,
-                            "result": result,
-                        }
-
                     async def _pm_cursor_result(
                         item: Any,
                         run: CursorRun,
                         result: dict[str, Any],
                     ) -> dict[str, Any]:
-                        from .pm_state import (
-                            is_leftover_cursor_idle,
-                            parse_cursor_result,
-                            recover_truncated_cursor_result,
-                        )
-
-                        if not prompt_actually_started(result) and not result.get("done"):
-                            return await _rollback_unstarted_cursor(
-                                item,
-                                run,
-                                result,
-                                detail=(
-                                    str(
-                                        result.get("reason")
-                                        or "Cursor did not accept the prompt — workspace closed?"
-                                    )
-                                ),
-                            )
-                        if not result.get("done"):
-                            await update_cursor_run(db, run, status="running", result=result)
-                            item.active_cursor_run_id = run.id
-                            item.status = "waiting_external"
-                            item.wait_owner = "external"
-                            item.last_error = None
-                            ctx = dict(item.context_json or {}) if isinstance(item.context_json, dict) else {}
-                            min_minutes = ctx.get("min_execution_minutes")
-                            if min_minutes:
-                                item.next_action = (
-                                    f"Wait for structured Cursor result "
-                                    f"(min {min_minutes} min by estimate)"
-                                )
-                            else:
-                                item.next_action = "Wait for structured Cursor result"
-                            meta = dict(item.metadata_json or {})
-                            meta["cursor_in_flight"] = True
-                            item.metadata_json = meta
-                            if item.pm_phase in {"READY_FOR_DEV", "BLOCKED", "CHANGES_REQUESTED"}:
-                                await transition_pm_phase(
-                                    db,
-                                    item,
-                                    "IN_DEVELOPMENT",
-                                    detail="Cursor job in progress",
-                                )
-                            from .work_items import stamp_cursor_prompt_sent
-
-                            await stamp_cursor_prompt_sent(db, item)
-                            await db.commit()
-                            return {
-                                "task_id": str(item.id),
-                                "run_id": run.id,
-                                "status": "in_progress",
-                                "done": False,
-                                "reattached": bool(result.get("skipped_prompt")),
-                            }
-                        structured: dict[str, Any] | None = None
-                        candidates: list[Any] = [result.get("result"), result.get("summary")]
-                        if isinstance(result.get("messages"), list):
-                            for message in reversed(result.get("messages") or []):
-                                if isinstance(message, dict):
-                                    candidates.append(
-                                        message.get("text")
-                                        or message.get("content")
-                                        or message.get("detail")
-                                        or message
-                                    )
-                                else:
-                                    candidates.append(message)
-                        for candidate in candidates:
-                            if isinstance(candidate, dict):
-                                candidate = (
-                                    candidate.get("content")
-                                    or candidate.get("text")
-                                    or candidate
-                                )
-                            try:
-                                structured = parse_cursor_result(candidate)
-                                break
-                            except (TypeError, ValueError):
-                                continue
-                        if structured is None:
-                            criteria = []
-                            ctx = (
-                                dict(item.context_json or {})
-                                if isinstance(item.context_json, dict)
-                                else {}
-                            )
-                            for key in ("acceptance_criteria", "acceptance"):
-                                raw_c = ctx.get(key) or (item.metadata_json or {}).get(key)
-                                if isinstance(raw_c, list):
-                                    criteria = [str(x) for x in raw_c if str(x or "").strip()]
-                                    break
-                            for candidate in candidates:
-                                text = candidate
-                                if isinstance(text, dict):
-                                    text = (
-                                        text.get("content")
-                                        or text.get("text")
-                                        or text.get("summary")
-                                        or ""
-                                    )
-                                if not isinstance(text, str):
-                                    continue
-                                structured = recover_truncated_cursor_result(
-                                    text,
-                                    expected_task_id=str(item.id),
-                                    acceptance_criteria=criteria,
-                                )
-                                if structured is not None:
-                                    break
-                        task_id = str(item.id)
-                        if structured is not None:
-                            got_id = str(structured.get("task_id") or "").strip()
-                            if got_id and got_id != task_id:
-                                return await _pm_cursor_leftover(
-                                    item,
-                                    run,
-                                    result,
-                                    error="Cursor result task_id mismatch",
-                                    detail="Cursor result belonged to another task",
-                                    reason="Cursor result task_id mismatch — resubmit",
-                                )
-                            # Matching structured payload wins over leftover-idle heuristics.
-                        elif is_leftover_cursor_idle(result):
-                            return await _pm_cursor_leftover(
-                                item,
-                                run,
-                                result,
-                                error=(
-                                    "Leftover idle Cursor summary — prompt was not for this "
-                                    "assignment"
-                                ),
-                                detail="Leftover Cursor idle; resubmit when Composer is free",
-                                reason=(
-                                    "Leftover idle from another Cursor job — not this task. "
-                                    "Do not consult the manager. Wait until Composer is free, "
-                                    "then call submit_development_task again."
-                                ),
-                            )
-                        else:
-                            # Prose/idle without JSON for this task — never BLOCKED/manager.
-                            return await _pm_cursor_leftover(
-                                item,
-                                run,
-                                result,
-                                error="Cursor returned no valid structured completion payload",
-                                detail="No structured Cursor payload; resubmit when free",
-                                reason=(
-                                    "No structured completion for this task — leftover or incomplete. "
-                                    "Do not consult the manager. Resubmit submit_development_task."
-                                ),
-                            )
-                        cursor_state["finished"] = True
-                        await update_cursor_run(
-                            db,
-                            run,
-                            status=structured["status"],
-                            result=structured,
-                            error=(
-                                "Invalid or blocked Cursor result"
-                                if structured["status"] != "completed"
-                                else None
-                            ),
-                        )
-                        if structured["status"] == "completed":
-                            await transition_pm_phase(
-                                db, item, "DEV_COMPLETE", detail="Cursor development complete"
-                            )
-                            await transition_pm_phase(
-                                db, item, "QA", detail="Result awaits acceptance checks"
-                            )
-                            item.status = "in_progress"
-                            item.wait_owner = "self"
-                            item.next_action = (
-                                "Verify acceptance criteria and explicitly accept QA"
-                            )
-                            item.last_error = None
-                        else:
-                            # Real blocked JSON from Cursor for THIS task — stay with agent.
-                            await transition_pm_phase(
-                                db,
-                                item,
-                                "CHANGES_REQUESTED"
-                                if item.pm_phase in {"QA", "CLIENT_REVIEW", "DEV_COMPLETE"}
-                                else "READY_FOR_DEV",
-                                detail="Cursor reported blocked/failed — request a fix",
-                            )
-                            item.status = "in_progress"
-                            item.wait_owner = "self"
-                            item.next_action = "Request a Cursor fix via request_development_fix"
-                            item.last_error = None
-                        await db.commit()
-                        return {
-                            "task_id": str(item.id),
-                            "run_id": run.id,
-                            "status": structured["status"],
-                            "done": structured["status"] == "completed",
-                            "qa_required": structured["status"] == "completed",
-                            "result": structured,
-                        }
+                        applied = await _apply_pm_cursor_result(db, item, run, result)
+                        if applied.get("done"):
+                            cursor_state["finished"] = True
+                        return applied
 
                     async def _submit_pm_item(
                         item: Any,
@@ -2082,67 +2214,10 @@ class AgentRuntime:
                         )
                         if item is None or item.agent_id != agent.id:
                             raise ValueError("No active Cursor run")
-                        run = (
-                            await db.get(CursorRun, item.active_cursor_run_id)
-                            if item.active_cursor_run_id
-                            else None
-                        )
-                        # Orphaned wait: tracking was cleared while Composer still has the job.
-                        if run is None or run.status in {"cancelled", "failed"}:
-                            live = await check_and_drive(cursor_session)
-                            if live.get("done") or live.get("seen_busy") or live.get("started"):
-                                attempt = int(
-                                    await db.scalar(
-                                        select(func.count())
-                                        .select_from(CursorRun)
-                                        .where(CursorRun.work_item_id == item.id)
-                                    )
-                                    or 0
-                                ) + 1
-                                run, _ = await get_or_create_cursor_run(
-                                    db,
-                                    item,
-                                    attempt=attempt,
-                                    request={
-                                        "reattach": True,
-                                        "reason": "Recover orphaned Cursor session",
-                                    },
-                                )
-                                await update_cursor_run(db, run, status="running")
-                                if item.pm_phase in {"READY_FOR_DEV", "BLOCKED", "CHANGES_REQUESTED"}:
-                                    await transition_pm_phase(
-                                        db,
-                                        item,
-                                        "IN_DEVELOPMENT",
-                                        detail="Reattached to live Cursor session",
-                                    )
-                                item.active_cursor_run_id = run.id
-                                meta = dict(item.metadata_json or {})
-                                meta["cursor_in_flight"] = not bool(live.get("done"))
-                                item.metadata_json = meta
-                                await db.commit()
-                                return await _pm_cursor_result(item, run, live)
-                            return {
-                                "task": work_item_json(item),
-                                "status": "no_active_run",
-                                "done": False,
-                                "live": live,
-                                "reason": (
-                                    "No active Cursor run tracked. Composer is idle/unavailable. "
-                                    "If the workspace is open, call submit_development_task once; "
-                                    "do not spam checks."
-                                ),
-                            }
-                        if run.status in {"completed", "blocked"}:
-                            return {
-                                "task": work_item_json(item),
-                                "run_id": run.id,
-                                "status": run.status,
-                                "result": run.result_json,
-                            }
-                        return await _pm_cursor_result(
-                            item, run, await check_and_drive(cursor_session)
-                        )
+                        result = await _poll_pm_cursor_item(db, item, cursor_session)
+                        if result.get("done"):
+                            cursor_state["finished"] = True
+                        return result
 
                     async def request_development_fix(
                         fix_request: str,
@@ -2358,6 +2433,19 @@ class AgentRuntime:
                     context=context,
                     account_phone=phone,
                 )
+                if payload.get("cursor_assignment_seq") is None:
+                    follow_item = await get_work_item(
+                        db,
+                        (context or {}).get("work_item_id"),
+                    )
+                    payload["cursor_assignment_seq"] = int(
+                        (follow_item.metadata_json or {}).get(
+                            "cursor_assignment_seq",
+                            0,
+                        )
+                        if follow_item is not None
+                        else 0
+                    )
                 from .cursorremote_drive import pin_cursor_followup_message
 
                 payload["message"] = pin_cursor_followup_message(str(payload.get("message") or message))
@@ -2575,6 +2663,279 @@ class AgentRuntime:
         registry.register(self_configure, "self_configure", "Update editable prompt sections")
         registry.register(employee_status, "employee_status", "Current employee focus and state")
 
+    async def _ensure_cursor_poll_job(
+        self,
+        db: AsyncSession,
+        agent: Agent,
+        item: WorkItem,
+        *,
+        context: dict[str, Any] | None = None,
+        current_job_id: int | None = None,
+    ) -> CronJob | None:
+        if self.scheduler is None:
+            return None
+        from .cursorremote_drive import CURSOR_CHECK_ONLY_MESSAGE
+
+        run_at = utcnow() + timedelta(minutes=2)
+        source = {
+            "work_item_id": item.id,
+            "reply_chat_id": item.chat_id,
+            "chat_id": item.chat_id,
+            "reply_phone": item.reply_phone,
+            "phone": item.reply_phone,
+            **(context or {}),
+        }
+        source["cursor_assignment_seq"] = int(
+            source.get("cursor_assignment_seq")
+            if source.get("cursor_assignment_seq") is not None
+            else (item.metadata_json or {}).get("cursor_assignment_seq", 0)
+        )
+        payload = build_followup_payload(
+            message=CURSOR_CHECK_ONLY_MESSAGE,
+            run_at_iso=run_at.isoformat(),
+            timezone="UTC",
+            context=source,
+            account_phone=item.reply_phone,
+        )
+        payload["work_item_id"] = item.id
+        job = await save_once_job(
+            db,
+            self.scheduler,
+            agent_id=agent.id,
+            name=f"case{item.id}-cursor-poll",
+            payload=payload,
+            current_job_id=current_job_id,
+        )
+        item.cron_job_id = job.id
+        item.wait_until = run_at
+        await db.commit()
+        return job
+
+    async def poll_cursor_followup(
+        self,
+        db: AsyncSession,
+        agent: Agent,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute a scheduled Cursor check without spending an LLM turn."""
+        async with self._lock_for(agent.id):
+            item = await get_work_item(db, payload.get("work_item_id"))
+            if item is None or item.agent_id != agent.id:
+                return {
+                    "ok": False,
+                    "skipped": True,
+                    "poll_only": True,
+                    "reason": "work_item_missing",
+                }
+            expected_assignment = int(
+                (item.metadata_json or {}).get("cursor_assignment_seq", 0)
+            )
+            try:
+                scheduled_assignment = int(payload["cursor_assignment_seq"])
+            except (KeyError, TypeError, ValueError):
+                scheduled_assignment = -1
+            if scheduled_assignment != expected_assignment:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "poll_only": True,
+                    "reason": "stale_cursor_assignment",
+                }
+            active_pm_run = (
+                await db.get(CursorRun, item.active_cursor_run_id)
+                if item.active_cursor_run_id
+                else None
+            )
+            still_assigned = (
+                item.status == "waiting_external"
+                and bool((item.metadata_json or {}).get("cursor_in_flight"))
+            )
+            if active_pm_run is not None:
+                still_assigned = still_assigned and active_pm_run.status in {
+                    "pending",
+                    "running",
+                }
+            if not still_assigned:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "poll_only": True,
+                    "reason": "stale_cursor_poll",
+                }
+            cursor_session = await self._cursorremote_session(db, agent)
+            if cursor_session is None:
+                poll_error = "CursorRemote MCP is not connected"
+                errors = int(payload.get("cursor_poll_errors") or 0) + 1
+                retry_context = {
+                    **payload,
+                    "cursor_poll_errors": errors,
+                }
+                job = await self._ensure_cursor_poll_job(
+                    db,
+                    agent,
+                    item,
+                    context=retry_context,
+                    current_job_id=payload.get("_cron_job_id"),
+                )
+                if errors >= 3 and not (item.metadata_json or {}).get(
+                    "cursor_poll_alerted"
+                ):
+                    meta = dict(item.metadata_json or {})
+                    meta["cursor_poll_alerted"] = True
+                    item.metadata_json = meta
+                    await db.commit()
+                    await self._notify_manager_status(
+                        payload.get("reply_phone") or item.reply_phone,
+                        agent,
+                        payload,
+                        poll_error,
+                    )
+                return {
+                    "ok": False,
+                    "poll_only": True,
+                    "done": False,
+                    "skipped_llm": True,
+                    "rescheduled": job is not None,
+                    "reason": poll_error,
+                }
+            profile = await get_or_create_profile(db, agent.id)
+            context = dict(payload or {})
+            context["_cursor_was_in_flight"] = True
+            context["_pm_mode"] = pm_mode_enabled(profile)
+            try:
+                if context["_pm_mode"]:
+                    result = await _poll_pm_cursor_item(db, item, cursor_session)
+                else:
+                    from .cursorremote_drive import check_and_drive
+
+                    result = await check_and_drive(cursor_session)
+                    audit = [
+                        {
+                            "tool": "cursorremote_check",
+                            "status": "success",
+                            "result": result,
+                        }
+                    ]
+                    await after_agent_run(
+                        db,
+                        agent,
+                        context,
+                        str(result.get("summary") or result.get("reason") or ""),
+                        audit,
+                        employee=self.employee,
+                    )
+            except Exception as exc:
+                await db.rollback()
+                item = await get_work_item(db, payload.get("work_item_id"))
+                if item is None:
+                    raise
+                errors = int(payload.get("cursor_poll_errors") or 0) + 1
+                retry_context = {
+                    **payload,
+                    "cursor_poll_errors": errors,
+                }
+                job = await self._ensure_cursor_poll_job(
+                    db,
+                    agent,
+                    item,
+                    context=retry_context,
+                    current_job_id=payload.get("_cron_job_id"),
+                )
+                if errors >= 3 and not (item.metadata_json or {}).get(
+                    "cursor_poll_alerted"
+                ):
+                    meta = dict(item.metadata_json or {})
+                    meta["cursor_poll_alerted"] = True
+                    item.metadata_json = meta
+                    await db.commit()
+                    await self._notify_manager_status(
+                        payload.get("reply_phone") or item.reply_phone,
+                        agent,
+                        payload,
+                        f"CursorRemote недоступен: {exc}",
+                    )
+                return {
+                    "ok": False,
+                    "poll_only": True,
+                    "done": False,
+                    "skipped_llm": True,
+                    "rescheduled": job is not None,
+                    "reason": str(exc),
+                }
+            await db.refresh(item)
+            if (item.metadata_json or {}).get("cursor_poll_alerted"):
+                meta = dict(item.metadata_json or {})
+                meta.pop("cursor_poll_alerted", None)
+                item.metadata_json = meta
+                await db.commit()
+            if result.get("status") == "no_active_run":
+                return {
+                    "ok": True,
+                    "poll_only": True,
+                    "done": False,
+                    "skipped_llm": True,
+                    "fallback_llm": True,
+                    "reason": str(result.get("reason") or ""),
+                }
+            done = bool(result.get("done"))
+            if done:
+                pm_qa = bool(context["_pm_mode"] and item.pm_phase == "QA")
+                structured_result = (
+                    result.get("result")
+                    if isinstance(result.get("result"), dict)
+                    else {}
+                )
+                implementation = (
+                    structured_result.get("implementation")
+                    if isinstance(structured_result.get("implementation"), dict)
+                    else {}
+                )
+                summary = str(
+                    result.get("summary")
+                    or implementation.get("summary")
+                    or "Работа в Cursor завершена."
+                ).strip()
+                return {
+                    "ok": True,
+                    "poll_only": True,
+                    "done": True,
+                    "skipped_llm": True,
+                    "result": summary,
+                    "deliver_origin": not pm_qa,
+                    "reply_phone": payload.get("reply_phone") or item.reply_phone,
+                    "reply_chat_id": payload.get("reply_chat_id") or item.chat_id,
+                    "pm_qa_required": pm_qa,
+                }
+
+            still_waiting = (
+                item.status == "waiting_external"
+                and bool((item.metadata_json or {}).get("cursor_in_flight"))
+            )
+            if still_waiting:
+                job = await self._ensure_cursor_poll_job(
+                    db,
+                    agent,
+                    item,
+                    context={**payload, "cursor_poll_errors": 0},
+                    current_job_id=payload.get("_cron_job_id"),
+                )
+                return {
+                    "ok": True,
+                    "poll_only": True,
+                    "done": False,
+                    "skipped_llm": True,
+                    "rescheduled": job is not None,
+                    "job_id": job.id if job is not None else None,
+                }
+            return {
+                "ok": True,
+                "poll_only": True,
+                "done": False,
+                "skipped_llm": True,
+                "fallback_llm": True,
+                "reason": str(result.get("reason") or result.get("status") or ""),
+            }
+
     async def tick(
         self,
         db: AsyncSession,
@@ -2606,6 +2967,47 @@ class AgentRuntime:
                             db, self.mcp, agent.id
                         )
             claimable_count = int((tracker_backlog or {}).get("count_claimable") or 0)
+            cursor_wait_only = bool(pending) and all(
+                item.status == "waiting_external"
+                and bool((item.metadata_json or {}).get("cursor_in_flight"))
+                for item in pending
+            )
+            if (
+                cursor_wait_only
+                and claimable_count <= 0
+                and not force
+                and self.scheduler is not None
+            ):
+                from .cursorremote_drive import is_cursor_poll_followup
+
+                jobs = await list_agent_jobs(db, agent.id)
+                scheduled_ids = {
+                    int((job.payload or {}).get("work_item_id"))
+                    for job in jobs
+                    if is_cursor_poll_followup(job.payload or {})
+                    and str((job.payload or {}).get("work_item_id") or "").isdigit()
+                }
+                created: list[int] = []
+                for item in pending:
+                    if item.id in scheduled_ids:
+                        continue
+                    job = await self._ensure_cursor_poll_job(db, agent, item)
+                    if job is not None:
+                        created.append(job.id)
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "cursor_poll_only",
+                    "watchdog": {
+                        "count": len(pending),
+                        "ids": [item.id for item in pending],
+                    },
+                    "cursor_poll_jobs_created": created,
+                    "tracker": {
+                        "enabled": bool((tracker_backlog or {}).get("enabled")),
+                        "claimable": 0,
+                    },
+                }
             if (
                 not extra.get("work_item_id")
                 and not pending
@@ -3069,7 +3471,8 @@ class AgentRuntime:
                     f"The original Telegram chat is {chat}. "
                     "If THIS assignment finished (done=true), write the customer-facing result — "
                     "the platform will send that text to the chat. "
-                    "Otherwise write a short status for the manager, not a journal for the customer. "
+                    f"If done=false, call telegram_suppress_reply or return exactly "
+                    f"{NO_TELEGRAM_REPLY}; do not message the customer or manager. "
                     "Do not claim that a Telegram message was already sent. "
                     + customer_result_only_instruction()
                     + customer_telegram_instruction()
@@ -3352,6 +3755,11 @@ class AgentRuntime:
                 is_internal_execution(context)
                 and not suppressed
                 and result.strip()
+                and not should_suppress_manager_status(
+                    context,
+                    registry.audit,
+                    work_item,
+                )
             ):
                 notify_phone = (
                     (account.phone if account else None)

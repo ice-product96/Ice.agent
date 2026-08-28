@@ -1,8 +1,11 @@
+from types import SimpleNamespace
+
 from app.action_reports import (
     cursor_result_ready_for_customer,
     format_manager_status,
     is_internal_execution,
     should_redirect_customer_outbound,
+    should_suppress_manager_status,
 )
 
 
@@ -93,3 +96,44 @@ def test_manager_status_is_labeled_for_flush() -> None:
     assert "Запуск накопленного задания" in text
     assert "Кейс #12" in text
     assert "Перевёл задание" in text
+
+
+def test_manager_status_is_silent_while_cursor_is_running() -> None:
+    item = SimpleNamespace(
+        status="waiting_external",
+        pm_phase="IN_DEVELOPMENT",
+        metadata_json={"cursor_in_flight": True},
+    )
+    context = {"source": "scheduled", "_cursor_was_in_flight": True}
+    audit = [
+        {
+            "tool": "cursorremote_check",
+            "status": "success",
+            "result": {"done": False, "started": True},
+        }
+    ]
+    assert should_suppress_manager_status(context, audit, item)
+
+
+def test_manager_status_is_not_silent_for_completion_or_blocker() -> None:
+    completed = SimpleNamespace(
+        status="waiting_external",
+        pm_phase="IN_DEVELOPMENT",
+        metadata_json={"cursor_in_flight": True},
+    )
+    done_audit = [
+        {
+            "tool": "cursorremote_check",
+            "status": "success",
+            "result": {"done": True, "summary": "готово"},
+        }
+    ]
+    context = {"source": "scheduled", "_cursor_was_in_flight": True}
+    assert not should_suppress_manager_status(context, done_audit, completed)
+
+    blocked = SimpleNamespace(
+        status="waiting_manager",
+        pm_phase="BLOCKED",
+        metadata_json={"cursor_in_flight": False},
+    )
+    assert not should_suppress_manager_status(context, [], blocked)

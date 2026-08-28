@@ -369,6 +369,17 @@ def pin_cursor_followup_message(message: str) -> str:
     return message
 
 
+def is_cursor_poll_followup(payload: Any) -> bool:
+    """True for a scheduled check-only Cursor follow-up."""
+    if not isinstance(payload, dict):
+        return False
+    return (
+        str(payload.get("source") or "") == "scheduled"
+        and str(payload.get("message") or "").strip() == CURSOR_CHECK_ONLY_MESSAGE
+        and payload.get("work_item_id") not in (None, "", False)
+    )
+
+
 def summarize_cursor_state(state: Any) -> str:
     if not isinstance(state, dict):
         return ""

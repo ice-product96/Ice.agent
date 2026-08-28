@@ -184,6 +184,37 @@ def cursor_result_ready_for_customer(
     return bool(saw_prompt_sent or saw_in_progress or cursor_was_in_flight)
 
 
+def should_suppress_manager_status(
+    context: dict[str, Any] | None,
+    audit: list[dict[str, Any]] | None,
+    work_item: Any = None,
+) -> bool:
+    """Keep routine Cursor-wait progress out of manager Telegram."""
+    ctx = context or {}
+    if not is_internal_execution(ctx) or work_item is None:
+        return False
+    status = str(getattr(work_item, "status", "") or "").strip()
+    phase = str(getattr(work_item, "pm_phase", "") or "").strip()
+    metadata = getattr(work_item, "metadata_json", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    waiting_for_cursor = status == "waiting_external" or bool(
+        metadata.get("cursor_in_flight")
+    )
+    if not waiting_for_cursor:
+        return False
+    if status in {"failed", "waiting_manager"} or phase == "BLOCKED":
+        return False
+    for call in audit or []:
+        if not isinstance(call, dict) or call.get("status") != "success":
+            continue
+        if str(call.get("tool") or "") in {"consult_manager", "request_approval"}:
+            return False
+    return not cursor_result_ready_for_customer(
+        audit,
+        cursor_was_in_flight=bool(ctx.get("_cursor_was_in_flight")),
+    )
+
+
 def should_redirect_customer_outbound(
     context: dict[str, Any] | None,
     audit: list[dict[str, Any]] | None,

@@ -71,6 +71,8 @@ def build_followup_payload(
         "is_admin": bool(source.get("is_admin")),
         "message_id": source.get("message_id"),
         "work_item_id": source.get("work_item_id"),
+        "cursor_assignment_seq": source.get("cursor_assignment_seq"),
+        "cursor_poll_errors": source.get("cursor_poll_errors", 0),
     }
 
 

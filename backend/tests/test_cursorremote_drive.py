@@ -8,6 +8,7 @@ from app.cursorremote_drive import (
     cursor_has_active_work,
     cursor_is_busy,
     drive_until_done,
+    is_cursor_poll_followup,
     parse_mcp_payload,
     pin_cursor_followup_message,
     send_prompt_and_drive,
@@ -147,6 +148,31 @@ def test_pin_followup_blocks_restart_wording() -> None:
     assert "cursorremote_check" in pinned
     assert "cursorremote_do" in pinned
     assert "не давай" in pinned.lower() or "Не вызывай" in pinned
+
+
+def test_only_pinned_scheduled_payload_uses_poll_only_path() -> None:
+    message = pin_cursor_followup_message("Проверь Cursor")
+    assert is_cursor_poll_followup(
+        {
+            "source": "scheduled",
+            "message": message,
+            "work_item_id": 42,
+        }
+    )
+    assert not is_cursor_poll_followup(
+        {
+            "source": "employee_heartbeat",
+            "message": message,
+            "work_item_id": 42,
+        }
+    )
+    assert not is_cursor_poll_followup(
+        {
+            "source": "scheduled",
+            "message": "Запусти Cursor в рабочее время",
+            "work_item_id": 42,
+        }
+    )
 
 
 def test_summarize_cursor_state_uses_assistant_text() -> None:
