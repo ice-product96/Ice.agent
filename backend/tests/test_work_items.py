@@ -12,6 +12,7 @@ from app.work_items import (
     add_event,
     after_agent_run,
     bind_work_item,
+    build_watchdog_instruction,
     handle_run_failure,
     is_operational_admin_command,
     list_events_page,
@@ -351,6 +352,21 @@ def test_operational_admin_command_detection() -> None:
     assert is_operational_admin_command(text, is_admin=True)
     assert not is_operational_admin_command(text, is_admin=False)
     assert not is_operational_admin_command("удали кнопку из шапки", is_admin=True)
+
+
+def test_watchdog_tells_ready_tracker_case_to_submit_not_wait_for_pay() -> None:
+    item = WorkItem(
+        id=35,
+        agent_id=1,
+        title="Корзина",
+        status="in_progress",
+        pm_phase="REQUIREMENTS_READY",
+        wait_owner="self",
+        next_action="submit_development_task",
+    )
+    text = build_watchdog_instruction([item])
+    assert "submit_development_task сейчас" in text
+    assert "стоимость" in text
 
 
 @pytest.mark.asyncio

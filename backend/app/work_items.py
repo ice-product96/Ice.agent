@@ -1326,6 +1326,15 @@ def build_watchdog_instruction(items: list[WorkItem]) -> str:
             hint = " Действие: pm_accept_task, не submit_development_task."
         elif (item.metadata_json or {}).get("automatic_resubmit_blocked"):
             hint = " Не вызывай submit_development_task — Composer занят чужим результатом."
+        elif (
+            item.pm_phase in {"REQUIREMENTS_READY", "CLIENT_CONFIRMED", "READY_FOR_DEV"}
+            and "submit_development_task" in str(item.next_action or "")
+        ):
+            hint = (
+                " Действие: submit_development_task сейчас. "
+                "Не жди оплату и не пиши заказчику про стоимость, если "
+                "ask_customer_about_cost=false."
+            )
         lines.append(
             f"- кейс #{item.id} [{STATUS_LABELS.get(item.status, item.status)}] "
             f"{item.title}{phase} | следующее: {item.next_action or '—'} | "
