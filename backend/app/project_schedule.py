@@ -239,23 +239,21 @@ def topic_is_cost_approval(topic: str, decision: str = "") -> bool:
 
 
 def cursor_elapsed_minutes(runs: list[CursorRun]) -> float:
-    total = 0.0
+    """Wall-clock from the first Cursor start to now.
+
+    Cancelled leftover runs often have completed_at ≈ started_at, so summing
+    per-run durations would stay near zero and block QA forever.
+    """
+    started_times = [run.started_at for run in runs if run.started_at is not None]
+    if not started_times:
+        return 0.0
+    first = min(started_times)
+    if first.tzinfo is None:
+        first = first.replace(tzinfo=ZoneInfo("UTC"))
     now = utcnow()
-    for run in runs:
-        started = run.started_at
-        if started is None:
-            continue
-        ended = run.completed_at or (
-            now if run.status in {"running", "pending"} else started
-        )
-        if ended.tzinfo is None:
-            ended = ended.replace(tzinfo=ZoneInfo("UTC"))
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=ZoneInfo("UTC"))
-        delta = (ended - started).total_seconds()
-        if delta > 0:
-            total += delta
-    return total / 60.0
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("UTC"))
+    return max(0.0, (now - first).total_seconds() / 60.0)
 
 
 def min_execution_remaining_minutes(

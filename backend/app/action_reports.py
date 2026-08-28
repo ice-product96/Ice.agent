@@ -215,6 +215,38 @@ def should_suppress_manager_status(
     )
 
 
+def pm_accept_succeeded(audit: list[dict[str, Any]] | None) -> bool:
+    return any(
+        isinstance(call, dict)
+        and call.get("tool") == "pm_accept_task"
+        and call.get("status") == "success"
+        for call in audit or []
+    )
+
+
+def tracker_tool_closes_card(tool: str, arguments: dict[str, Any] | None) -> bool:
+    name = str(tool or "").strip().lower()
+    if name in {"complete_task", "complete_card"}:
+        return True
+    if name not in {
+        "move_task",
+        "move_card",
+        "update_task",
+        "update_card",
+        "set_task_status",
+    }:
+        return False
+    args = arguments if isinstance(arguments, dict) else {}
+    status = str(
+        args.get("status")
+        or args.get("to_status")
+        or args.get("new_status")
+        or args.get("column")
+        or ""
+    ).strip().lower()
+    return status in {"completed", "done", "closed", "cancelled", "canceled"}
+
+
 def should_redirect_customer_outbound(
     context: dict[str, Any] | None,
     audit: list[dict[str, Any]] | None,
@@ -226,6 +258,8 @@ def should_redirect_customer_outbound(
         return False
     if not is_customer_origin_peer(entity, context, admin_ids):
         return False
+    if (context or {}).get("_pm_mode") and not pm_accept_succeeded(audit):
+        return True
     return not cursor_result_ready_for_customer(
         audit,
         cursor_was_in_flight=bool((context or {}).get("_cursor_was_in_flight")),

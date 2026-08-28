@@ -390,6 +390,83 @@ def is_leftover_cursor_idle(result: Mapping[str, Any] | None) -> bool:
     return bool(result.get("done"))
 
 
+def _norm_criterion(text: Any) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def _evidence_row_passed(row: Mapping[str, Any] | None) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    return row.get("passed") is True and bool(str(row.get("evidence") or "").strip())
+
+
+def match_acceptance_evidence(
+    criterion: str,
+    rows: list[Any] | None,
+) -> dict[str, Any] | None:
+    """Match one stored criterion to Cursor evidence, allowing whitespace/case drift."""
+    want = _norm_criterion(criterion)
+    if not want:
+        return None
+    mapped: dict[str, dict[str, Any]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        key = _norm_criterion(row.get("criterion"))
+        if key:
+            mapped[key] = row
+    if want in mapped:
+        return mapped[want]
+    for key, row in mapped.items():
+        if want in key or key in want:
+            return row
+    return None
+
+
+def cursor_run_satisfies_acceptance(item: WorkItem, run: CursorRun | None) -> bool:
+    """True when a completed Cursor run has passing evidence for every criterion."""
+    if run is None or run.status != "completed":
+        return False
+    payload = run.result_json if isinstance(run.result_json, dict) else {}
+    verification = payload.get("verification")
+    if not isinstance(verification, dict):
+        return False
+    if (
+        verification.get("tests_passed") is not True
+        or verification.get("lint_passed") is not True
+    ):
+        return False
+    criteria = [
+        str(value).strip()
+        for value in list(item.acceptance_criteria or [])
+        if str(value or "").strip()
+    ]
+    if not criteria:
+        return False
+    rows = verification.get("acceptance_criteria")
+    if not isinstance(rows, list):
+        return False
+    return all(
+        _evidence_row_passed(match_acceptance_evidence(criterion, rows))
+        for criterion in criteria
+    )
+
+
+async def latest_completed_cursor_run(
+    db: AsyncSession,
+    item: WorkItem,
+) -> CursorRun | None:
+    return await db.scalar(
+        select(CursorRun)
+        .where(
+            CursorRun.work_item_id == item.id,
+            CursorRun.status == "completed",
+        )
+        .order_by(CursorRun.attempt.desc(), CursorRun.id.desc())
+        .limit(1)
+    )
+
+
 def recover_truncated_cursor_result(
     text: str,
     *,

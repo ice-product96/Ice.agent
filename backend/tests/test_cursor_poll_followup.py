@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from datetime import timedelta
 
@@ -7,7 +8,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import Agent, Base, CronJob, CursorRun, WorkItem, utcnow
 from app.employee import EmployeeService
-from app.runtime import AgentRuntime, _apply_pm_cursor_result
+from app.runtime import (
+    AgentRuntime,
+    _apply_pm_cursor_result,
+    _auto_accept_pm_qa,
+    _tick_focus_item,
+)
 
 
 class FakeScheduler:
@@ -58,7 +64,7 @@ async def test_poll_only_reschedules_without_llm(
     scheduler = FakeScheduler()
     runtime = make_runtime(object(), scheduler)
 
-    async def running(_session):
+    async def running(_session, **_kwargs):
         return {
             "ok": True,
             "done": False,
@@ -119,7 +125,7 @@ async def test_poll_only_delivers_once_when_cursor_finishes(
     scheduler = FakeScheduler()
     runtime = make_runtime(object(), scheduler)
 
-    async def completed(_session):
+    async def completed(_session, **_kwargs):
         return {
             "ok": True,
             "done": True,
@@ -267,6 +273,276 @@ async def test_pm_poll_parser_moves_completed_run_to_qa(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pm_mismatched_cursor_result_blocks_without_resubmit(
+    tmp_path: Path,
+) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-mismatch.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="project",
+            title="Current task",
+            status="waiting_external",
+            wait_owner="external",
+            pm_phase="IN_DEVELOPMENT",
+            metadata_json={"cursor_in_flight": True},
+        )
+        db.add(item)
+        await db.flush()
+        run = CursorRun(
+            work_item_id=item.id,
+            project_id="project",
+            attempt=1,
+            idempotency_key="pm-mismatch-test",
+            status="running",
+        )
+        db.add(run)
+        await db.flush()
+        item.active_cursor_run_id = run.id
+        await db.commit()
+
+        result = await _apply_pm_cursor_result(
+            db,
+            item,
+            run,
+            {
+                "done": True,
+                "result": {
+                    "task_id": str(item.id + 100),
+                    "status": "completed",
+                    "implementation": {},
+                    "verification": {},
+                },
+            },
+        )
+
+        assert result["leftover"] is True
+        assert result["resubmit"] is False
+        assert item.pm_phase == "READY_FOR_DEV"
+        assert item.status == "waiting_manager"
+        assert item.wait_owner == "manager"
+        assert item.active_cursor_run_id is None
+        assert "submit_development_task" in (item.next_action or "")
+        assert run.status == "cancelled"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_evidenced_pm_qa_is_closed_without_another_llm_turn(
+    tmp_path: Path,
+) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-auto-accept.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        criterion = "Cancellation tests pass"
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="project",
+            title="Current task",
+            status="in_progress",
+            wait_owner="self",
+            pm_phase="QA",
+            acceptance_criteria=[criterion],
+            metadata_json={"cursor_in_flight": False},
+        )
+        db.add(item)
+        await db.flush()
+        structured = {
+            "task_id": str(item.id),
+            "status": "completed",
+            "implementation": {"summary": "Готово"},
+            "verification": {
+                "tests_passed": True,
+                "lint_passed": True,
+                "acceptance_criteria": [
+                    {
+                        "criterion": criterion,
+                        "passed": True,
+                        "evidence": "pytest passed",
+                    }
+                ],
+            },
+            "customer_response": "Исправление готово.",
+        }
+        run = CursorRun(
+            work_item_id=item.id,
+            project_id="project",
+            attempt=1,
+            idempotency_key="pm-auto-accept-test",
+            status="completed",
+            result_json=structured,
+        )
+        db.add(run)
+        await db.flush()
+        item.active_cursor_run_id = run.id
+        item.last_cursor_summary = json.dumps(structured, ensure_ascii=False)
+        await db.commit()
+
+        result = await _auto_accept_pm_qa(db, item)
+        await db.commit()
+
+        assert result is not None
+        assert result["deliver_origin"] is True
+        assert result["result"] == "Исправление готово."
+        assert item.pm_phase == "DONE"
+        assert item.status == "done"
+        assert item.active_cursor_run_id is None
+    await engine.dispose()
+
+
+def test_tick_focus_prefers_older_qa_case() -> None:
+    older = WorkItem(id=31, title="old", status="in_progress", pm_phase="QA")
+    newer = WorkItem(id=32, title="new", status="in_progress", pm_phase="READY_FOR_DEV")
+    assert _tick_focus_item([newer, older]).id == 31
+
+
+@pytest.mark.asyncio
+async def test_pm_leftover_keeps_completed_run_in_qa(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-reuse.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        criterion = "List layout matches mockup"
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="project",
+            title="Current task",
+            status="waiting_external",
+            wait_owner="external",
+            pm_phase="IN_DEVELOPMENT",
+            acceptance_criteria=[criterion],
+            metadata_json={"cursor_in_flight": True},
+        )
+        db.add(item)
+        await db.flush()
+        completed = CursorRun(
+            work_item_id=item.id,
+            project_id="project",
+            attempt=1,
+            idempotency_key="pm-reuse-completed",
+            status="completed",
+            result_json={
+                "task_id": str(item.id),
+                "status": "completed",
+                "implementation": {"summary": "Готово"},
+                "verification": {
+                    "tests_passed": True,
+                    "lint_passed": True,
+                    "acceptance_criteria": [
+                        {
+                            "criterion": criterion,
+                            "passed": True,
+                            "evidence": "screenshot",
+                        }
+                    ],
+                },
+            },
+        )
+        stray = CursorRun(
+            work_item_id=item.id,
+            project_id="project",
+            attempt=2,
+            idempotency_key="pm-reuse-stray",
+            status="running",
+        )
+        db.add_all([completed, stray])
+        await db.flush()
+        item.active_cursor_run_id = stray.id
+        await db.commit()
+
+        result = await _apply_pm_cursor_result(
+            db,
+            item,
+            stray,
+            {
+                "done": True,
+                "result": {
+                    "task_id": str(item.id + 100),
+                    "status": "completed",
+                    "implementation": {},
+                    "verification": {},
+                },
+            },
+        )
+
+        assert result["reused_completed_run"] is True
+        assert result["done"] is True
+        assert item.pm_phase == "QA"
+        assert item.status == "in_progress"
+        assert item.active_cursor_run_id == completed.id
+        assert stray.status == "cancelled"
+        assert not (item.metadata_json or {}).get("automatic_resubmit_blocked")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_auto_accept_uses_latest_completed_run_when_active_cleared(
+    tmp_path: Path,
+) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-accept-latest.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        criterion = "Cancellation tests pass"
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="project",
+            title="Current task",
+            status="in_progress",
+            wait_owner="self",
+            pm_phase="QA",
+            acceptance_criteria=[criterion],
+            metadata_json={"cursor_in_flight": False},
+        )
+        db.add(item)
+        await db.flush()
+        run = CursorRun(
+            work_item_id=item.id,
+            project_id="project",
+            attempt=1,
+            idempotency_key="pm-accept-latest",
+            status="completed",
+            result_json={
+                "task_id": str(item.id),
+                "status": "completed",
+                "implementation": {"summary": "Готово"},
+                "verification": {
+                    "tests_passed": True,
+                    "lint_passed": True,
+                    "acceptance_criteria": [
+                        {
+                            "criterion": "cancellation tests pass",
+                            "passed": True,
+                            "evidence": "pytest passed",
+                        }
+                    ],
+                },
+                "customer_response": "Исправление готово.",
+            },
+        )
+        db.add(run)
+        await db.flush()
+        item.active_cursor_run_id = None
+        await db.commit()
+
+        result = await _auto_accept_pm_qa(db, item)
+        await db.commit()
+
+        assert result is not None
+        assert result["deliver_origin"] is True
+        assert item.pm_phase == "DONE"
+        assert item.status == "done"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_stale_poll_job_does_not_replay_completion(tmp_path: Path) -> None:
     engine, sessions = await sessions_for(tmp_path / "stale-poll.db")
     scheduler = FakeScheduler()
@@ -376,4 +652,77 @@ async def test_poll_job_is_scoped_to_cursor_assignment(tmp_path: Path) -> None:
         assert outcome["skipped"] is True
         assert outcome["reason"] == "stale_cursor_assignment"
         assert not scheduler.ids
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pm_leftover_poll_does_not_fall_back_to_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-leftover-poll.db")
+    scheduler = FakeScheduler()
+    runtime = make_runtime(object(), scheduler)
+    runtime.telegram = None
+
+    async def foreign(_session, **_kwargs):
+        return {
+            "done": True,
+            "result": {
+                "task_id": "31",
+                "status": "completed",
+                "implementation": {"summary": "other task"},
+                "verification": {
+                    "tests_passed": True,
+                    "lint_passed": True,
+                    "acceptance_criteria": [],
+                },
+            },
+        }
+
+    monkeypatch.setattr("app.cursorremote_drive.check_and_drive", foreign)
+    monkeypatch.setattr("app.runtime.pm_mode_enabled", lambda _profile: True)
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="project",
+            title="Current task",
+            status="waiting_external",
+            wait_owner="external",
+            pm_phase="IN_DEVELOPMENT",
+            metadata_json={"cursor_in_flight": True},
+        )
+        db.add(item)
+        await db.flush()
+        run = CursorRun(
+            work_item_id=item.id,
+            project_id="project",
+            attempt=1,
+            idempotency_key="pm-leftover-poll",
+            status="running",
+        )
+        db.add(run)
+        await db.flush()
+        item.active_cursor_run_id = run.id
+        await db.commit()
+
+        outcome = await runtime.poll_cursor_followup(
+            db,
+            agent,
+            {
+                "source": "scheduled",
+                "work_item_id": item.id,
+                "cursor_assignment_seq": 0,
+            },
+        )
+
+        assert outcome["skipped_llm"] is True
+        assert outcome.get("fallback_llm") is not True
+        assert outcome["leftover"] is True
+        assert item.pm_phase == "READY_FOR_DEV"
+        assert item.status == "waiting_manager"
+        assert item.wait_owner == "manager"
     await engine.dispose()

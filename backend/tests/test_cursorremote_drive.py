@@ -228,6 +228,38 @@ def test_drive_returns_done_after_busy_then_idle() -> None:
     assert "Do NOT call schedule_self" in result["next"]
 
 
+def test_drive_rejects_unchanged_pre_prompt_summary() -> None:
+    stale = "Previous assignment completed."
+    session = ScriptSession(
+        {
+            "get_status": [
+                {"agentStatus": "thinking", "pendingApprovalCount": 0},
+                {"agentStatus": "thinking", "pendingApprovalCount": 0},
+            ]
+            + [{"agentStatus": "idle", "pendingApprovalCount": 0}] * 12,
+            "wait": [{"status": "needs_input", "pendingApprovalCount": 0}],
+            "get_state": [
+                {"messages": [{"type": "assistant", "text": stale}]}
+            ]
+            * 6,
+        }
+    )
+
+    result = asyncio.run(
+        drive_until_done(
+            session,
+            timeout_ms=2000,
+            start_grace_ms=0,
+            idle_debounce_ms=0,
+            require_busy=True,
+            baseline_summary=stale,
+        )
+    )
+
+    assert result["done"] is False
+    assert result["status"] == "awaiting_result"
+
+
 def test_drive_timeout_while_working() -> None:
     busy = {"agentStatus": "generating", "pendingApprovalCount": 0, "agentActivityLive": True}
     session = ScriptSession({"wait": [{"status": "timeout"} for _ in range(20)]}, default=busy)

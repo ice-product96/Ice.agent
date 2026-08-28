@@ -6,6 +6,7 @@ from app.action_reports import (
     is_internal_execution,
     should_redirect_customer_outbound,
     should_suppress_manager_status,
+    tracker_tool_closes_card,
 )
 
 
@@ -86,6 +87,35 @@ def test_progress_to_customer_is_redirected_on_internal_runs() -> None:
     )
 
 
+def test_pm_customer_message_requires_successful_qa_acceptance() -> None:
+    context = {
+        "source": "employee_tick",
+        "chat_id": 777,
+        "_pm_mode": True,
+        "_cursor_was_in_flight": True,
+    }
+    completed = [
+        {
+            "tool": "cursorremote_check",
+            "status": "success",
+            "result": {"done": True, "summary": "готово"},
+        }
+    ]
+    assert should_redirect_customer_outbound(
+        context, completed, 777, admin_ids={1}
+    )
+    completed.append(
+        {
+            "tool": "pm_accept_task",
+            "status": "success",
+            "result": {"ok": True},
+        }
+    )
+    assert not should_redirect_customer_outbound(
+        context, completed, 777, admin_ids={1}
+    )
+
+
 def test_manager_status_is_labeled_for_flush() -> None:
     text = format_manager_status(
         agent_name="Макс",
@@ -137,3 +167,10 @@ def test_manager_status_is_not_silent_for_completion_or_blocker() -> None:
         metadata_json={"cursor_in_flight": False},
     )
     assert not should_suppress_manager_status(context, [], blocked)
+
+
+def test_tracker_completion_tools_are_detected() -> None:
+    assert tracker_tool_closes_card("complete_task", {"task_id": "abc"})
+    assert tracker_tool_closes_card("move_task", {"task_id": "abc", "status": "completed"})
+    assert not tracker_tool_closes_card("move_task", {"task_id": "abc", "status": "in_progress"})
+    assert not tracker_tool_closes_card("get_task", {"task_id": "abc"})

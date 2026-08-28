@@ -32,6 +32,7 @@ from .action_reports import (
     format_admin_action_report,
     format_manager_status,
     is_internal_execution,
+    pm_accept_succeeded,
     should_redirect_customer_outbound,
     should_suppress_manager_status,
 )
@@ -135,6 +136,7 @@ async def _pm_cursor_leftover(
     reason: str,
 ) -> dict[str, Any]:
     from .pm_state import transition_pm_phase, update_cursor_run
+    from .work_items import add_event
 
     await update_cursor_run(
         db,
@@ -147,15 +149,24 @@ async def _pm_cursor_leftover(
         await transition_pm_phase(db, item, "READY_FOR_DEV", detail=detail)
     meta = dict(item.metadata_json or {})
     meta["cursor_in_flight"] = False
+    meta["automatic_resubmit_blocked"] = True
     item.metadata_json = meta
     item.active_cursor_run_id = None
-    item.status = "in_progress"
-    item.wait_owner = "self"
+    item.status = "waiting_manager"
+    item.wait_owner = "manager"
     item.next_action = (
-        "Cursor returned another job's leftover. "
-        "Resubmit with submit_development_task when Composer is free."
+        "Composer показал чужой или неструктурированный результат. "
+        "Не вызывай submit_development_task, пока Composer не свободен от другого задания."
     )
-    item.last_error = None
+    item.last_error = error[:2000]
+    await add_event(
+        db,
+        item,
+        kind="blocked",
+        title="Cursor вернул результат другого задания",
+        detail=detail,
+        payload={"run_id": run.id, "automatic_resubmit_blocked": True},
+    )
     await db.commit()
     return {
         "task_id": str(item.id),
@@ -165,6 +176,222 @@ async def _pm_cursor_leftover(
         "leftover": True,
         "reason": reason,
         "result": result,
+        "resubmit": False,
+    }
+
+
+def _pm_item_is_closed(item: WorkItem | None) -> bool:
+    if item is None:
+        return False
+    return item.status == "done" or item.pm_phase in {"DONE", "CANCELLED"}
+
+
+def _tick_focus_item(pending: list[WorkItem]) -> WorkItem:
+    """Prefer an older QA case over a newer in_progress leftover."""
+    qa = [
+        item
+        for item in pending
+        if item.pm_phase in {"QA", "CLIENT_REVIEW"}
+    ]
+    if qa:
+        return sorted(qa, key=lambda item: item.id)[0]
+    return pending[0]
+
+
+def _cursor_payload_task_id(result: dict[str, Any] | None) -> str:
+    from .pm_state import extract_json_object
+
+    if not isinstance(result, dict):
+        return ""
+    blobs: list[Any] = [result.get("result"), result.get("summary")]
+    if isinstance(result.get("messages"), list):
+        blobs.extend(reversed(result.get("messages") or []))
+    for blob in blobs:
+        if isinstance(blob, dict):
+            tid = str(blob.get("task_id") or "").strip()
+            if tid:
+                return tid
+            blob = blob.get("content") or blob.get("text") or blob.get("summary") or blob
+        if not isinstance(blob, str):
+            continue
+        parsed = extract_json_object(blob)
+        if isinstance(parsed, dict):
+            tid = str(parsed.get("task_id") or "").strip()
+            if tid:
+                return tid
+    return ""
+
+
+async def _reuse_completed_pm_run(
+    db: AsyncSession,
+    item: WorkItem,
+    stray: CursorRun,
+    result: dict[str, Any],
+    completed: CursorRun,
+) -> dict[str, Any]:
+    """Keep a finished assignment in QA instead of leftover-resubmitting."""
+    from .pm_state import transition_pm_phase, update_cursor_run
+    from .work_items import add_event
+
+    await update_cursor_run(
+        db,
+        stray,
+        status="cancelled",
+        result=result,
+        error="Leftover Cursor idle after this assignment already completed",
+    )
+    item.active_cursor_run_id = completed.id
+    meta = dict(item.metadata_json or {})
+    meta["cursor_in_flight"] = False
+    meta.pop("automatic_resubmit_blocked", None)
+    item.metadata_json = meta
+    if item.pm_phase in {"IN_DEVELOPMENT", "BLOCKED"}:
+        await transition_pm_phase(
+            db, item, "DEV_COMPLETE", detail="Reuse completed Cursor run"
+        )
+        await transition_pm_phase(
+            db, item, "QA", detail="Result awaits acceptance checks"
+        )
+    item.status = "in_progress"
+    item.wait_owner = "self"
+    item.next_action = "Verify acceptance criteria and explicitly accept QA"
+    item.last_error = None
+    item.last_cursor_summary = json.dumps(
+        completed.result_json or {}, ensure_ascii=False
+    )
+    await add_event(
+        db,
+        item,
+        kind="progress",
+        title="Сохранён завершённый Cursor run",
+        detail="Новый опрос вернул чужой idle; это задание уже выполнено.",
+        payload={"run_id": completed.id, "ignored_run_id": stray.id},
+    )
+    await db.commit()
+    return {
+        "task_id": str(item.id),
+        "run_id": completed.id,
+        "status": "completed",
+        "done": True,
+        "qa_required": True,
+        "reused_completed_run": True,
+        "result": completed.result_json,
+    }
+
+
+def _pm_acceptance_issues(
+    item: WorkItem,
+    run: CursorRun | None,
+) -> list[str]:
+    from .pm_state import cursor_run_satisfies_acceptance
+
+    issues: list[str] = []
+    if item.pm_phase not in {"QA", "CLIENT_REVIEW"}:
+        issues.append("task is not in QA")
+    if item.status == "waiting_external":
+        issues.append("task is still waiting for an external run")
+    if not cursor_run_satisfies_acceptance(item, run):
+        issues.append("Cursor completion lacks passing evidence")
+    return issues
+
+
+async def _auto_accept_pm_qa(
+    db: AsyncSession,
+    item: WorkItem,
+    mcp_manager: Any = None,
+    scheduler: Any = None,
+) -> dict[str, Any] | None:
+    """Close a fully evidenced QA item without relying on another LLM turn."""
+    from .pm_state import (
+        cursor_run_satisfies_acceptance,
+        latest_completed_cursor_run,
+        transition_pm_phase,
+    )
+    from .project_schedule import min_execution_remaining_minutes
+    from .work_items import add_event, cancel_work_item_schedules
+
+    run = (
+        await db.get(CursorRun, item.active_cursor_run_id)
+        if item.active_cursor_run_id
+        else None
+    )
+    if not cursor_run_satisfies_acceptance(item, run):
+        run = await latest_completed_cursor_run(db, item)
+    if _pm_acceptance_issues(item, run):
+        return None
+    all_runs = list(
+        await db.scalars(
+            select(CursorRun)
+            .where(CursorRun.work_item_id == item.id)
+            .order_by(CursorRun.attempt)
+        )
+    )
+    if min_execution_remaining_minutes(item, all_runs) > 0:
+        return None
+    from .tracker_poll import work_item_tracker_task_id
+
+    tracker_id = work_item_tracker_task_id(item)
+    tracker_error = None
+    if tracker_id and mcp_manager is not None:
+        from .cursorremote_drive import mcp_call
+        from .tracker_poll import find_ice_tracker_session
+
+        tracker_session, _ = find_ice_tracker_session(mcp_manager)
+        if tracker_session is not None:
+            try:
+                await mcp_call(
+                    tracker_session,
+                    "complete_task",
+                    {"task_id": tracker_id},
+                )
+            except Exception as exc:
+                tracker_error = f"Tracker completion failed: {exc}"[:2000]
+    await transition_pm_phase(
+        db,
+        item,
+        "DONE",
+        detail="QA accepted automatically from verified Cursor evidence",
+    )
+    item.status = "done"
+    item.active_cursor_run_id = None
+    item.wait_owner = "none"
+    item.next_action = ""
+    item.last_error = tracker_error
+    meta = dict(item.metadata_json or {})
+    meta["cursor_in_flight"] = False
+    meta.pop("cursor_baseline_summary", None)
+    meta.pop("automatic_resubmit_blocked", None)
+    item.metadata_json = meta
+    await add_event(
+        db,
+        item,
+        kind="completed",
+        title="QA принято автоматически",
+        detail=str(
+            (run.result_json or {}).get("customer_response")
+            or ((run.result_json or {}).get("implementation") or {}).get("summary")
+            or getattr(item, "last_cursor_summary", None)
+            or ""
+        )[:1000],
+        payload={"automatic": True, "tracker_error": tracker_error},
+    )
+    await cancel_work_item_schedules(db, item, scheduler, mark_aborted=False)
+    completion = run.result_json or {}
+    customer_result = str(
+        completion.get("customer_response")
+        or (completion.get("implementation") or {}).get("summary")
+        or getattr(item, "last_cursor_summary", None)
+        or f"Задача «{item.title}» выполнена."
+    ).strip()
+    return {
+        "ok": True,
+        "work_item_id": item.id,
+        "status": "done",
+        "pm_phase": "DONE",
+        "result": customer_result,
+        "deliver_origin": True,
+        "reply_phone": item.reply_phone,
+        "reply_chat_id": item.chat_id,
     }
 
 
@@ -295,17 +522,22 @@ async def _apply_pm_cursor_result(
         except (TypeError, ValueError):
             continue
     if structured is None:
-        criteria: list[str] = []
-        ctx = item.context_json if isinstance(item.context_json, dict) else {}
-        for key in ("acceptance_criteria", "acceptance"):
-            raw_criteria = ctx.get(key) or (item.metadata_json or {}).get(key)
-            if isinstance(raw_criteria, list):
-                criteria = [
-                    str(value)
-                    for value in raw_criteria
-                    if str(value or "").strip()
-                ]
-                break
+        criteria = [
+            str(value).strip()
+            for value in list(item.acceptance_criteria or [])
+            if str(value or "").strip()
+        ]
+        if not criteria:
+            ctx = item.context_json if isinstance(item.context_json, dict) else {}
+            for key in ("acceptance_criteria", "acceptance"):
+                raw_criteria = ctx.get(key) or (item.metadata_json or {}).get(key)
+                if isinstance(raw_criteria, list):
+                    criteria = [
+                        str(value)
+                        for value in raw_criteria
+                        if str(value or "").strip()
+                    ]
+                    break
         for candidate in candidates:
             text = candidate
             if isinstance(text, dict):
@@ -324,45 +556,52 @@ async def _apply_pm_cursor_result(
             )
             if structured is not None:
                 break
+    leftover_reason: tuple[str, str, str] | None = None
     task_id = str(item.id)
     if structured is not None:
         got_id = str(structured.get("task_id") or "").strip()
         if got_id and got_id != task_id:
-            return await _pm_cursor_leftover(
-                db,
-                item,
-                run,
-                result,
-                error="Cursor result task_id mismatch",
-                detail="Cursor result belonged to another task",
-                reason="Cursor result task_id mismatch — resubmit",
+            leftover_reason = (
+                "Cursor result task_id mismatch",
+                "Cursor result belonged to another task",
+                (
+                    "Cursor result belonged to another task. "
+                    "Do not call submit_development_task. Wait until Composer is free."
+                ),
             )
     elif is_leftover_cursor_idle(result):
-        return await _pm_cursor_leftover(
-            db,
-            item,
-            run,
-            result,
-            error="Leftover idle Cursor summary — prompt was not for this assignment",
-            detail="Leftover Cursor idle; resubmit when Composer is free",
-            reason=(
+        leftover_reason = (
+            "Leftover idle Cursor summary — prompt was not for this assignment",
+            "Leftover Cursor idle; wait until Composer is free",
+            (
                 "Leftover idle from another Cursor job — not this task. "
-                "Do not consult the manager. Wait until Composer is free, then "
-                "call submit_development_task again."
+                "Do not consult the manager and do not resubmit now."
             ),
         )
     else:
+        leftover_reason = (
+            "Cursor returned no valid structured completion payload",
+            "No structured Cursor payload; wait, do not resubmit automatically",
+            (
+                "No structured completion for this task — leftover or incomplete. "
+                "Do not consult the manager. Do not call submit_development_task yet."
+            ),
+        )
+    if leftover_reason is not None:
+        from .pm_state import latest_completed_cursor_run
+
+        completed = await latest_completed_cursor_run(db, item)
+        if completed is not None and completed.id != run.id:
+            return await _reuse_completed_pm_run(db, item, run, result, completed)
+        error, detail, reason = leftover_reason
         return await _pm_cursor_leftover(
             db,
             item,
             run,
             result,
-            error="Cursor returned no valid structured completion payload",
-            detail="No structured Cursor payload; resubmit when free",
-            reason=(
-                "No structured completion for this task — leftover or incomplete. "
-                "Do not consult the manager. Resubmit submit_development_task."
-            ),
+            error=error,
+            detail=detail,
+            reason=reason,
         )
 
     await update_cursor_run(
@@ -378,8 +617,11 @@ async def _apply_pm_cursor_result(
     )
     meta = dict(item.metadata_json or {})
     meta["cursor_in_flight"] = False
+    meta.pop("automatic_resubmit_blocked", None)
     item.metadata_json = meta
     if structured["status"] == "completed":
+        item.last_cursor_summary = json.dumps(structured, ensure_ascii=False)
+        item.evidence_json = dict(structured.get("verification") or {})
         await transition_pm_phase(
             db, item, "DEV_COMPLETE", detail="Cursor development complete"
         )
@@ -436,6 +678,18 @@ async def _poll_pm_cursor_item(
         else None
     )
     if run is None or run.status in {"cancelled", "failed"}:
+        if item.pm_phase in {"QA", "CLIENT_REVIEW", "DONE", "CANCELLED"} or item.status == "done":
+            return {
+                "task": work_item_json(item),
+                "status": run.status if run is not None else "no_active_run",
+                "done": item.pm_phase in {"QA", "CLIENT_REVIEW", "DONE"}
+                or item.status == "done",
+                "qa_required": item.pm_phase in {"QA", "CLIENT_REVIEW"},
+                "reason": (
+                    "This assignment already finished development. "
+                    "Call pm_accept_task if still in QA; do not start a new Cursor run."
+                ),
+            }
         live = await check_and_drive(cursor_session)
         if live.get("done") or live.get("seen_busy") or live.get("started"):
             attempt = int(
@@ -492,7 +746,12 @@ async def _poll_pm_cursor_item(
         db,
         item,
         run,
-        await check_and_drive(cursor_session),
+        await check_and_drive(
+            cursor_session,
+            baseline_summary=str(
+                (run.result_json or {}).get("baseline_summary") or ""
+            ),
+        ),
     )
 
 
@@ -736,6 +995,64 @@ class AgentRuntime:
     def bind_scheduler(self, scheduler: Any) -> None:
         self.scheduler = scheduler
         self.employee.scheduler = scheduler
+
+    def _wrap_pm_tracker_completion_guard(
+        self,
+        registry: ToolRegistry,
+        db: AsyncSession,
+        agent: Agent,
+        context: dict[str, Any] | None,
+    ) -> None:
+        """Do not close ice_tracker cards until this case passed pm_accept_task."""
+        import inspect
+
+        from .action_reports import tracker_tool_closes_card
+        from .tracker_poll import find_work_item_for_tracker_task, work_item_tracker_task_id
+        from .work_items import get_work_item
+
+        for name, tool in list(registry.tools.items()):
+            lowered = name.lower()
+            if not lowered.startswith("mcp_") or not lowered.endswith("_run"):
+                continue
+            if "tracker" not in lowered.replace("-", "_"):
+                continue
+            inner = tool.function
+
+            async def run_tool(
+                tool: str,
+                arguments: dict[str, Any] | None = None,
+                *,
+                _inner=inner,
+            ) -> Any:
+                args = dict(arguments or {})
+                if tracker_tool_closes_card(tool, args):
+                    accepted = pm_accept_succeeded(registry.audit)
+                    item = await get_work_item(db, (context or {}).get("work_item_id"))
+                    current_done = bool(item is not None and item.pm_phase == "DONE")
+                    tracker_id = str(args.get("task_id") or args.get("id") or "").strip()
+                    if tracker_id:
+                        owner = await find_work_item_for_tracker_task(
+                            db, agent.id, tracker_id
+                        )
+                        if owner is not None and (item is None or owner.id != item.id):
+                            raise PermissionError(
+                                f"ice_tracker card belongs to case #{owner.id}. "
+                                "Do not complete another case's card."
+                            )
+                        if item is not None:
+                            own_id = work_item_tracker_task_id(item)
+                            if own_id and tracker_id != own_id:
+                                raise PermissionError(
+                                    "This case is bound to a different ice_tracker card."
+                                )
+                    if not accepted and not current_done:
+                        raise PermissionError(
+                            "Do not complete ice_tracker until pm_accept_task succeeds."
+                        )
+                result = _inner(tool, args)
+                return await result if inspect.isawaitable(result) else result
+
+            registry.register(run_tool, name, tool.description, tool.parameters)
 
     def _guard_internal_customer_telegram(
         self,
@@ -1779,6 +2096,10 @@ class AgentRuntime:
                     lowered = tool_name.lower()
                     if lowered in {"mcp_cursorremote_tools", "mcp_cursorremote_run"}:
                         registry.tools.pop(tool_name, None)
+                if db is not None:
+                    self._wrap_pm_tracker_completion_guard(
+                        registry, db, agent, context
+                    )
             cursor_session = next(
                 (
                     session
@@ -1895,6 +2216,18 @@ class AgentRuntime:
                     from .work_items import cursor_prompt_already_active, get_work_item
 
                     item = await get_work_item(db, (context or {}).get("work_item_id"))
+                    if item is not None and (
+                        item.status == "done" or item.pm_phase in {"DONE", "CANCELLED"}
+                    ):
+                        return {
+                            "ok": False,
+                            "done": True,
+                            "skipped_prompt": True,
+                            "prompt_sent": False,
+                            "reason": (
+                                "This case is already closed. Do not send another Cursor prompt."
+                            ),
+                        }
                     if (context or {}).get("_intake_collecting") or (
                         item is not None and item.status == "collecting"
                     ):
@@ -1917,7 +2250,15 @@ class AgentRuntime:
                         already_sent=already_sent,
                         is_fresh_assignment=is_fresh_assignment,
                     ):
-                        result = await check_and_drive(cursor_session)
+                        result = await check_and_drive(
+                            cursor_session,
+                            baseline_summary=str(
+                                (item.metadata_json or {}).get(
+                                    "cursor_baseline_summary"
+                                )
+                                or ""
+                            ),
+                        )
                         result = {
                             **result,
                             "skipped_prompt": True,
@@ -1964,7 +2305,20 @@ class AgentRuntime:
 
                 async def cursorremote_check() -> dict[str, Any]:
                     """Poll Cursor for an already sent task: click Allow if needed, return done=true only when idle after work."""
-                    result = await check_and_drive(cursor_session)
+                    item = await get_work_item(
+                        db,
+                        (context or {}).get("work_item_id"),
+                    )
+                    result = await check_and_drive(
+                        cursor_session,
+                        baseline_summary=str(
+                            (item.metadata_json or {}).get(
+                                "cursor_baseline_summary"
+                            )
+                            if item is not None
+                            else ""
+                        ),
+                    )
                     if result.get("done"):
                         cursor_state["finished"] = True
                     return result
@@ -1998,6 +2352,10 @@ class AgentRuntime:
                         *,
                         fix_request: str = "",
                     ) -> dict[str, Any]:
+                        if _pm_item_is_closed(item):
+                            raise ValueError(
+                                "Task is already closed. Do not call submit_development_task."
+                            )
                         if not is_task_ready(item):
                             raise ValueError("Task requirements and acceptance criteria are incomplete")
                         project = await get_or_create_project_state(
@@ -2129,6 +2487,63 @@ class AgentRuntime:
                             raise ValueError(
                                 f"Task phase {item.pm_phase} cannot be submitted for development"
                             )
+                        other_cursor_item = await db.scalar(
+                            select(WorkItem)
+                            .where(
+                                WorkItem.agent_id == agent.id,
+                                WorkItem.id != item.id,
+                                WorkItem.status == "waiting_external",
+                                WorkItem.active_cursor_run_id.is_not(None),
+                            )
+                            .order_by(WorkItem.id)
+                            .limit(1)
+                        )
+                        if other_cursor_item is not None:
+                            return {
+                                "task_id": str(item.id),
+                                "status": "cursor_busy",
+                                "done": False,
+                                "prompt_sent": False,
+                                "blocked_by_work_item_id": other_cursor_item.id,
+                                "reason": (
+                                    "Cursor already has another tracked assignment. "
+                                    "Wait for that assignment to finish; do not resubmit."
+                                ),
+                            }
+                        if item.pm_phase in {"QA", "CLIENT_REVIEW"}:
+                            raise ValueError(
+                                "Task is in QA. Call pm_accept_task, not submit_development_task."
+                            )
+                        try:
+                            live = await check_and_drive(cursor_session)
+                        except Exception:
+                            live = {}
+                        if live.get("seen_busy") or (
+                            live.get("started") and not live.get("done")
+                        ):
+                            return {
+                                "task_id": str(item.id),
+                                "status": "cursor_busy",
+                                "done": False,
+                                "prompt_sent": False,
+                                "reason": (
+                                    "Composer is still working. Wait; do not submit another prompt."
+                                ),
+                            }
+                        foreign_id = _cursor_payload_task_id(live)
+                        if foreign_id and foreign_id != str(item.id):
+                            return {
+                                "task_id": str(item.id),
+                                "status": "leftover_idle",
+                                "done": False,
+                                "prompt_sent": False,
+                                "leftover": True,
+                                "resubmit": False,
+                                "reason": (
+                                    f"Composer still shows task_id {foreign_id}. "
+                                    "Do not call submit_development_task until that result is gone."
+                                ),
+                            }
                         attempt = int(
                             await db.scalar(
                                 select(func.count())
@@ -2229,6 +2644,10 @@ class AgentRuntime:
                         )
                         if item is None or item.agent_id != agent.id:
                             raise ValueError("PM task not found")
+                        if _pm_item_is_closed(item):
+                            raise ValueError(
+                                "Task is already closed. Do not request another Cursor fix."
+                            )
                         if item.pm_phase in {"QA", "CLIENT_REVIEW"}:
                             await transition_pm_phase(
                                 db, item, "CHANGES_REQUESTED", detail=fix_request
@@ -2253,6 +2672,12 @@ class AgentRuntime:
                             if item.active_cursor_run_id
                             else None
                         )
+                        if run is None or run.status != "completed":
+                            from .pm_state import latest_completed_cursor_run
+
+                            completed = await latest_completed_cursor_run(db, item)
+                            if completed is not None:
+                                run = completed
                         if run is None:
                             return {
                                 "task_id": str(item.id),
@@ -2284,28 +2709,22 @@ class AgentRuntime:
                             or item.pm_phase not in {"QA", "CLIENT_REVIEW"}
                         ):
                             raise ValueError("Task is not ready for QA acceptance")
-                        run = await db.get(CursorRun, item.active_cursor_run_id)
-                        verification = (run.result_json or {}).get("verification", {}) if run else {}
-                        evidence_rows = verification.get("acceptance_criteria", [])
-                        evidence = {
-                            str(row.get("criterion") or ""): row
-                            for row in evidence_rows
-                            if isinstance(row, dict)
-                        }
-                        criteria_passed = all(
-                            criterion in evidence
-                            and evidence[criterion].get("passed") is True
-                            and bool(str(evidence[criterion].get("evidence") or "").strip())
-                            for criterion in list(item.acceptance_criteria or [])
+                        run = (
+                            await db.get(CursorRun, item.active_cursor_run_id)
+                            if item.active_cursor_run_id
+                            else None
                         )
-                        if (
-                            run is None
-                            or run.status != "completed"
-                            or verification.get("tests_passed") is not True
-                            or verification.get("lint_passed") is not True
-                            or not item.acceptance_criteria
-                            or not criteria_passed
-                        ):
+                        from .pm_state import (
+                            cursor_run_satisfies_acceptance,
+                            latest_completed_cursor_run,
+                        )
+
+                        if not cursor_run_satisfies_acceptance(item, run):
+                            completed = await latest_completed_cursor_run(db, item)
+                            if cursor_run_satisfies_acceptance(item, completed):
+                                run = completed
+                                item.active_cursor_run_id = completed.id
+                        if not cursor_run_satisfies_acceptance(item, run):
                             raise ValueError(
                                 "Latest Cursor run lacks passing evidence for every acceptance criterion"
                             )
@@ -2358,8 +2777,14 @@ class AgentRuntime:
                             )
                         await transition_pm_phase(db, item, "DONE", detail="QA accepted")
                         item.status = "done"
+                        item.active_cursor_run_id = None
                         item.wait_owner = "none"
                         item.next_action = ""
+                        meta = dict(item.metadata_json or {})
+                        meta["cursor_in_flight"] = False
+                        meta.pop("cursor_baseline_summary", None)
+                        meta.pop("automatic_resubmit_blocked", None)
+                        item.metadata_json = meta
                         await add_event(
                             db,
                             item,
@@ -2367,7 +2792,11 @@ class AgentRuntime:
                             title="QA accepted",
                             detail="Acceptance criteria verified",
                         )
-                        await db.commit()
+                        from .work_items import cancel_work_item_schedules
+
+                        await cancel_work_item_schedules(
+                            db, item, self.scheduler, mark_aborted=False
+                        )
                         return {"ok": True, "task": work_item_json(item)}
 
                     registry.register(submit_development_task)
@@ -2808,7 +3237,15 @@ class AgentRuntime:
                 else:
                     from .cursorremote_drive import check_and_drive
 
-                    result = await check_and_drive(cursor_session)
+                    result = await check_and_drive(
+                        cursor_session,
+                        baseline_summary=str(
+                            (item.metadata_json or {}).get(
+                                "cursor_baseline_summary"
+                            )
+                            or ""
+                        ),
+                    )
                     audit = [
                         {
                             "tool": "cursorremote_check",
@@ -2868,6 +3305,15 @@ class AgentRuntime:
                 meta.pop("cursor_poll_alerted", None)
                 item.metadata_json = meta
                 await db.commit()
+            if result.get("leftover"):
+                return {
+                    "ok": True,
+                    "poll_only": True,
+                    "done": False,
+                    "skipped_llm": True,
+                    "leftover": True,
+                    "reason": str(result.get("reason") or "leftover_idle"),
+                }
             if result.get("status") == "no_active_run":
                 return {
                     "ok": True,
@@ -2880,6 +3326,20 @@ class AgentRuntime:
             done = bool(result.get("done"))
             if done:
                 pm_qa = bool(context["_pm_mode"] and item.pm_phase == "QA")
+                if pm_qa:
+                    accepted = await _auto_accept_pm_qa(
+                        db, item, self.mcp, scheduler=self.scheduler
+                    )
+                    if accepted is not None:
+                        await db.commit()
+                        accepted.update(
+                            {
+                                "poll_only": True,
+                                "skipped_llm": True,
+                                "reason": "pm_qa_auto_accepted",
+                            }
+                        )
+                        return accepted
                 structured_result = (
                     result.get("result")
                     if isinstance(result.get("result"), dict)
@@ -2967,6 +3427,22 @@ class AgentRuntime:
                             db, self.mcp, agent.id
                         )
             claimable_count = int((tracker_backlog or {}).get("count_claimable") or 0)
+            for candidate in sorted(pending, key=lambda value: value.id):
+                if candidate.pm_phase != "QA":
+                    continue
+                accepted = await _auto_accept_pm_qa(
+                    db, candidate, self.mcp, scheduler=self.scheduler
+                )
+                if accepted is not None:
+                    await db.commit()
+                    accepted.update(
+                        {
+                            "skipped": False,
+                            "reason": "pm_qa_auto_accepted",
+                            "pending_count": max(0, len(pending) - 1),
+                        }
+                    )
+                    return accepted
             cursor_wait_only = bool(pending) and all(
                 item.status == "waiting_external"
                 and bool((item.metadata_json or {}).get("cursor_in_flight"))
@@ -3053,7 +3529,7 @@ class AgentRuntime:
             if extra.get("work_item_id"):
                 context["work_item_id"] = extra["work_item_id"]
             elif pending:
-                context["work_item_id"] = pending[0].id
+                context["work_item_id"] = _tick_focus_item(pending).id
             from .work_items import get_work_item, work_item_aborted
 
             tick_item = await get_work_item(db, context.get("work_item_id"))
@@ -3743,12 +4219,7 @@ class AgentRuntime:
                 cursor_was_in_flight=bool(context.get("_cursor_was_in_flight")),
             )
             if context.get("_pm_mode"):
-                result_ready = any(
-                    isinstance(call, dict)
-                    and call.get("tool") == "pm_accept_task"
-                    and call.get("status") == "success"
-                    for call in registry.audit
-                )
+                result_ready = pm_accept_succeeded(registry.audit)
             if result_ready and not suppressed:
                 context["_deliver_origin_reply"] = True
             elif (

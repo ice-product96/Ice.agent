@@ -522,6 +522,7 @@ async def drive_until_done(
     start_grace_ms: int = 25_000,
     idle_debounce_ms: int = 3_000,
     require_busy: bool = True,
+    baseline_summary: str = "",
 ) -> dict[str, Any]:
     """Poll Cursor until it has actually worked and then gone idle.
 
@@ -597,6 +598,20 @@ async def drive_until_done(
             seen_busy = True
             last = status
             continue
+        if (
+            baseline_summary.strip()
+            and summary.strip() == baseline_summary.strip()
+        ):
+            return _result(
+                done=False,
+                status="awaiting_result",
+                last=status or confirm,
+                state=state,
+                summary=summary,
+                approvals=approvals,
+                seen_busy=seen_busy,
+                hint=FOLLOW_UP_HINT,
+            )
         return _result(
             done=True,
             status="idle",
@@ -709,6 +724,10 @@ async def send_prompt_and_drive(
     if inline_attachments:
         send_payload["attachments"] = inline_attachments
     try:
+        _, _, baseline_summary = await _snapshot(session)
+    except Exception:
+        baseline_summary = ""
+    try:
         sent = await mcp_call(session, "send_prompt", send_payload)
     except Exception as exc:
         return {
@@ -725,10 +744,16 @@ async def send_prompt_and_drive(
             "workspace": ensure.get("workspace"),
             "windows": ensure.get("windows") or [],
         }
-    driven = await drive_until_done(session, timeout_ms=timeout_ms, require_busy=True)
+    driven = await drive_until_done(
+        session,
+        timeout_ms=timeout_ms,
+        require_busy=True,
+        baseline_summary=baseline_summary,
+    )
     result = {
         "sent": sent,
         "prompt_sent": True,
+        "baseline_summary": baseline_summary,
         **driven,
         "file_delivery": {
             "method": delivery.get("method"),
@@ -763,12 +788,17 @@ async def check_and_drive(
     *,
     timeout_ms: int = 90_000,
     idle_debounce_ms: int = 3_000,
+    baseline_summary: str = "",
 ) -> dict[str, Any]:
     """Poll an already-running Cursor job. Idle without prior activity is a real finish here."""
-    return await drive_until_done(
+    result = await drive_until_done(
         session,
         timeout_ms=timeout_ms,
         require_busy=False,
         start_grace_ms=0,
         idle_debounce_ms=idle_debounce_ms,
+        baseline_summary=baseline_summary,
     )
+    if baseline_summary:
+        result["baseline_summary"] = baseline_summary
+    return result

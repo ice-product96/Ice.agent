@@ -180,6 +180,47 @@ async def test_leftover_idle_unsticks_waiting_external(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pm_leftover_idle_does_not_auto_resubmit(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-leftover-idle.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="Catalog page",
+            goal="fix catalog",
+            status="waiting_external",
+            pm_phase="IN_DEVELOPMENT",
+            metadata_json={"cursor_in_flight": False},
+        )
+        db.add(item)
+        await db.commit()
+        await after_agent_run(
+            db,
+            agent,
+            {"work_item_id": item.id, "_pm_mode": True},
+            "Cursor idle leftover",
+            [
+                {
+                    "tool": "get_development_status",
+                    "status": "success",
+                    "result": {
+                        "done": True,
+                        "leftover": True,
+                        "skipped_prompt": True,
+                        "prompt_sent": False,
+                        "summary": "idle leftover from task 31",
+                    },
+                }
+            ],
+        )
+        assert item.status == "waiting_external"
+        assert item.pm_phase == "IN_DEVELOPMENT"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_handle_run_failure_retries_then_consults(tmp_path: Path) -> None:
     engine, sessions = await sessions_for(tmp_path / "fail.db")
     scheduler = FakeScheduler()

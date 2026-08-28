@@ -418,3 +418,33 @@ def test_brief_and_result_parsing_are_canonical() -> None:
     assert "master" in recovered["implementation"]["summary"]
     assert recovered["verification"]["acceptance_criteria"][0]["passed"] is True
     assert recover_truncated_cursor_result(truncated, expected_task_id="99") is None
+
+    from app.pm_state import cursor_run_satisfies_acceptance
+
+    fuzzy_item = WorkItem(
+        id=1,
+        agent_id=1,
+        title="t",
+        acceptance_criteria=["Cancellation tests pass"],
+    )
+    fuzzy_run = CursorRun(
+        work_item_id=1,
+        project_id="p",
+        attempt=1,
+        idempotency_key="fuzzy",
+        status="completed",
+        result_json={
+            "verification": {
+                "tests_passed": True,
+                "lint_passed": True,
+                "acceptance_criteria": [
+                    {
+                        "criterion": "cancellation tests pass",
+                        "passed": True,
+                        "evidence": "pytest",
+                    }
+                ],
+            }
+        },
+    )
+    assert cursor_run_satisfies_acceptance(fuzzy_item, fuzzy_run)

@@ -55,3 +55,30 @@ def test_estimate_sets_min_duration_and_cost() -> None:
     assert snap["estimated_cost"] == 3000.0
     assert topic_is_cost_approval("Согласование стоимости", "ок 3000")
     assert not topic_is_cost_approval("Цвета кнопок", "синий")
+
+
+def test_elapsed_uses_wall_clock_from_first_start() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from app.db import CursorRun
+    from app.project_schedule import cursor_elapsed_minutes, min_execution_remaining_minutes
+
+    start = datetime.now(timezone.utc) - timedelta(minutes=90)
+    cancelled = CursorRun(
+        work_item_id=1,
+        project_id="p",
+        attempt=1,
+        idempotency_key="cancelled",
+        status="cancelled",
+        started_at=start,
+        completed_at=start,
+    )
+    item = WorkItem(
+        id=1,
+        agent_id=1,
+        title="t",
+        goal="g",
+        context_json={"min_execution_minutes": 60},
+    )
+    assert cursor_elapsed_minutes([cancelled]) >= 89
+    assert min_execution_remaining_minutes(item, [cancelled]) == 0

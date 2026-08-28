@@ -874,6 +874,10 @@ async def after_agent_run(
                 )
                 meta = dict(item.metadata_json or {})
                 meta["cursor_in_flight"] = cursor_busy
+                if payload.get("baseline_summary") is not None:
+                    meta["cursor_baseline_summary"] = str(
+                        payload.get("baseline_summary") or ""
+                    )
                 item.metadata_json = meta
             if tool == "schedule_self" and payload.get("run_at"):
                 try:
@@ -962,6 +966,9 @@ async def after_agent_run(
         return item
 
     if context.get("_pm_mode") and item.pm_phase == "BLOCKED":
+        if item.wait_owner == "manager":
+            await db.commit()
+            return item
         await set_status(
             db,
             item,
@@ -1036,6 +1043,7 @@ async def after_agent_run(
         and not cursor_done
         and not scheduled_at
         and cursor_called
+        and not context.get("_pm_mode")
     )
     if leftover_idle:
         meta = dict(item.metadata_json or {})
@@ -1058,6 +1066,7 @@ async def after_agent_run(
     if cursor_done:
         meta = dict(item.metadata_json or {})
         meta["cursor_in_flight"] = False
+        meta.pop("cursor_baseline_summary", None)
         item.metadata_json = meta
         if context.get("_pm_mode") and item.pm_phase != "DONE":
             await set_status(
@@ -1257,13 +1266,24 @@ def build_watchdog_instruction(items: list[WorkItem]) -> str:
         "Если кейс «Коплю задание» и wait ещё не вышел — не выполняй и не зови Cursor.",
         "Если кейс «Коплю задание» уже просрочен — выполни сводку сообщений заказчика. "
         "Не пиши ему про таймер или что ждали.",
+        "Если кейс в QA — вызови pm_accept_task. Не вызывай submit_development_task "
+        "и не пиши заказчику, пока QA не принята.",
+        "Если Cursor вернул чужой task_id или leftover idle — не вызывай "
+        "submit_development_task повторно.",
     ]
     for item in items[:12]:
         wait = f" до {item.wait_until.isoformat()}" if item.wait_until else ""
         error = f" Ошибка: {item.last_error[:180]}" if item.last_error else ""
+        phase = f" | фаза {item.pm_phase}" if item.pm_phase else ""
+        hint = ""
+        if item.pm_phase in {"QA", "CLIENT_REVIEW"}:
+            hint = " Действие: pm_accept_task, не submit_development_task."
+        elif (item.metadata_json or {}).get("automatic_resubmit_blocked"):
+            hint = " Не вызывай submit_development_task — Composer занят чужим результатом."
         lines.append(
             f"- кейс #{item.id} [{STATUS_LABELS.get(item.status, item.status)}] "
-            f"{item.title} | следующее: {item.next_action or '—'} | ждёт {item.wait_owner}{wait}.{error}"
+            f"{item.title}{phase} | следующее: {item.next_action or '—'} | "
+            f"ждёт {item.wait_owner}{wait}.{error}{hint}"
         )
     return "\n".join(lines)
 
@@ -1479,7 +1499,12 @@ async def sync_cursor_work_items(
             continue
         seen.add(item.id)
         try:
-            result = await check_and_drive(cursor_session)
+            result = await check_and_drive(
+                cursor_session,
+                baseline_summary=str(
+                    (item.metadata_json or {}).get("cursor_baseline_summary") or ""
+                ),
+            )
         except Exception as exc:
             logger.warning("cursor poll failed for work item %s: %s", item.id, exc)
             continue

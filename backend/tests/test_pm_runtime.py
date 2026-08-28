@@ -41,6 +41,13 @@ class FakeCursorSession:
         return SimpleNamespace(content=[])
 
 
+def stub_idle_composer(monkeypatch) -> None:
+    async def fake_check(*args, **kwargs):
+        return {"done": True, "status": "idle"}
+
+    monkeypatch.setattr("app.cursorremote_drive.check_and_drive", fake_check)
+
+
 @pytest.mark.asyncio
 async def test_pm_registry_hides_raw_cursor_and_blocks_incomplete_task(
     tmp_path: Path,
@@ -174,6 +181,7 @@ async def test_customer_decision_unlocks_development_without_manager(
         return {"done": False, "prompt_sent": True, "status": "working"}
 
     monkeypatch.setattr("app.cursorremote_drive.send_prompt_and_drive", fake_send)
+    stub_idle_composer(monkeypatch)
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{(tmp_path / 'pm-customer-confirm.db').as_posix()}"
     )
@@ -296,6 +304,7 @@ async def test_structured_cursor_result_requires_and_then_passes_qa(
         }
 
     monkeypatch.setattr("app.cursorremote_drive.send_prompt_and_drive", fake_send)
+    stub_idle_composer(monkeypatch)
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{(tmp_path / 'pm-cursor.db').as_posix()}"
     )
