@@ -138,6 +138,7 @@ async def _pm_cursor_leftover(
     error: str,
     detail: str,
     reason: str,
+    allow_resubmit: bool = False,
 ) -> dict[str, Any]:
     from .pm_state import transition_pm_phase, update_cursor_run
     from .work_items import add_event
@@ -151,27 +152,51 @@ async def _pm_cursor_leftover(
     )
     if item.pm_phase in {"IN_DEVELOPMENT", "BLOCKED"}:
         await transition_pm_phase(db, item, "READY_FOR_DEV", detail=detail)
+    elif allow_resubmit and item.pm_phase in {
+        "REQUIREMENTS_READY",
+        "CLIENT_CONFIRMED",
+        "CHANGES_REQUESTED",
+    }:
+        await transition_pm_phase(db, item, "READY_FOR_DEV", detail=detail)
     meta = dict(item.metadata_json or {})
     meta["cursor_in_flight"] = False
-    meta["automatic_resubmit_blocked"] = True
+    if allow_resubmit:
+        meta.pop("automatic_resubmit_blocked", None)
+    else:
+        meta["automatic_resubmit_blocked"] = True
     item.metadata_json = meta
     item.active_cursor_run_id = None
-    item.status = "waiting_manager"
-    item.wait_owner = "manager"
-    item.next_action = (
-        "Composer показал чужой или неструктурированный результат. "
-        "Не вызывай submit_development_task, пока Composer не свободен от другого задания."
-    )
-    item.last_error = error[:2000]
+    if allow_resubmit:
+        item.status = "in_progress"
+        item.wait_owner = "self"
+        item.next_action = "submit_development_task"
+        item.last_error = None
+    else:
+        item.status = "waiting_manager"
+        item.wait_owner = "manager"
+        item.next_action = (
+            "Composer показал чужой или неструктурированный результат. "
+            "Не вызывай submit_development_task, пока Composer не свободен от другого задания."
+        )
+        item.last_error = error[:2000]
     await add_event(
         db,
         item,
         kind="blocked",
         title="Cursor вернул результат другого задания",
         detail=detail,
-        payload={"run_id": run.id, "automatic_resubmit_blocked": True},
+        payload={
+            "run_id": run.id,
+            "automatic_resubmit_blocked": not allow_resubmit,
+            "allow_resubmit": allow_resubmit,
+        },
     )
     await db.commit()
+    if allow_resubmit:
+        reason = (
+            "Composer was idle with leftover from another assignment. "
+            "Call submit_development_task now."
+        )
     return {
         "task_id": str(item.id),
         "run_id": run.id,
@@ -180,7 +205,7 @@ async def _pm_cursor_leftover(
         "leftover": True,
         "reason": reason,
         "result": result,
-        "resubmit": False,
+        "resubmit": allow_resubmit,
     }
 
 
@@ -410,7 +435,12 @@ async def _apply_pm_cursor_result(
     )
     from .work_items import add_event, stamp_cursor_prompt_sent
 
-    if not prompt_actually_started(result) and not result.get("done"):
+    started = prompt_actually_started(result)
+    status_name = str(result.get("status") or "").strip().lower()
+    composer_busy = status_name == "cursor_busy" or (
+        bool(result.get("skipped_prompt")) and bool(result.get("seen_busy"))
+    )
+    if not started and not result.get("done"):
         reason = str(
             result.get("reason")
             or result.get("summary")
@@ -611,6 +641,7 @@ async def _apply_pm_cursor_result(
             error=error,
             detail=detail,
             reason=reason,
+            allow_resubmit=not started and not composer_busy,
         )
 
     await update_cursor_run(
@@ -3563,6 +3594,7 @@ class AgentRuntime:
                     "done": False,
                     "skipped_llm": True,
                     "leftover": True,
+                    "resubmit": bool(result.get("resubmit")),
                     "reason": str(result.get("reason") or "leftover_idle"),
                 }
             if result.get("status") == "no_active_run":

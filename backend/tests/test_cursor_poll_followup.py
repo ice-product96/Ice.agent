@@ -273,7 +273,7 @@ async def test_pm_poll_parser_moves_completed_run_to_qa(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pm_mismatched_cursor_result_blocks_without_resubmit(
+async def test_pm_mismatched_idle_cursor_result_allows_resubmit(
     tmp_path: Path,
 ) -> None:
     engine, sessions = await sessions_for(tmp_path / "pm-mismatch.db")
@@ -320,13 +320,14 @@ async def test_pm_mismatched_cursor_result_blocks_without_resubmit(
         )
 
         assert result["leftover"] is True
-        assert result["resubmit"] is False
+        assert result["resubmit"] is True
         assert item.pm_phase == "READY_FOR_DEV"
-        assert item.status == "waiting_manager"
-        assert item.wait_owner == "manager"
+        assert item.status == "in_progress"
+        assert item.wait_owner == "self"
         assert item.active_cursor_run_id is None
-        assert "submit_development_task" in (item.next_action or "")
+        assert item.next_action == "submit_development_task"
         assert run.status == "cancelled"
+        assert not (item.metadata_json or {}).get("automatic_resubmit_blocked")
     await engine.dispose()
 
 
@@ -731,6 +732,66 @@ async def test_pm_leftover_poll_does_not_fall_back_to_llm(
         assert outcome.get("fallback_llm") is not True
         assert outcome["leftover"] is True
         assert item.pm_phase == "READY_FOR_DEV"
-        assert item.status == "waiting_manager"
-        assert item.wait_owner == "manager"
+        assert item.status == "in_progress"
+        assert item.wait_owner == "self"
+        assert item.next_action == "submit_development_task"
+        assert not (item.metadata_json or {}).get("automatic_resubmit_blocked")
+        assert outcome.get("resubmit") is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_idle_foreign_json_allows_resubmit(
+    tmp_path: Path,
+) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-idle-foreign.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="uraltrade",
+            title="Mobile bottom nav",
+            status="waiting_external",
+            wait_owner="external",
+            pm_phase="IN_DEVELOPMENT",
+            metadata_json={"cursor_in_flight": True},
+        )
+        db.add(item)
+        await db.flush()
+        run = CursorRun(
+            work_item_id=item.id,
+            project_id="uraltrade",
+            attempt=1,
+            idempotency_key="pm-idle-foreign",
+            status="running",
+        )
+        db.add(run)
+        await db.flush()
+        item.active_cursor_run_id = run.id
+        await db.commit()
+
+        result = await _apply_pm_cursor_result(
+            db,
+            item,
+            run,
+            {
+                "done": True,
+                "started": True,
+                "status": "idle",
+                "prompt_sent": False,
+                "summary": '{  "task_id": 35,  "status": "completed",',
+            },
+        )
+
+        assert result["leftover"] is True
+        assert result["resubmit"] is True
+        assert item.pm_phase == "READY_FOR_DEV"
+        assert item.status == "in_progress"
+        assert item.wait_owner == "self"
+        assert item.next_action == "submit_development_task"
+        assert item.last_error is None
+        assert not (item.metadata_json or {}).get("automatic_resubmit_blocked")
+        assert run.status == "cancelled"
     await engine.dispose()

@@ -367,6 +367,7 @@ def test_watchdog_tells_ready_tracker_case_to_submit_not_wait_for_pay() -> None:
     text = build_watchdog_instruction([item])
     assert "submit_development_task сейчас" in text
     assert "стоимость" in text
+    assert "leftover idle чужого" in text
 
 
 @pytest.mark.asyncio

@@ -1314,8 +1314,10 @@ def build_watchdog_instruction(items: list[WorkItem]) -> str:
         "Не пиши ему про таймер или что ждали.",
         "Если кейс в QA — вызови pm_accept_task. Не вызывай submit_development_task "
         "и не пиши заказчику, пока QA не принята.",
-        "Если Cursor вернул чужой task_id или leftover idle — не вызывай "
-        "submit_development_task повторно.",
+        "Если Composer занят чужим заданием (automatic_resubmit_blocked) — "
+        "не вызывай submit_development_task. Если next_action = "
+        "submit_development_task и Composer свободен — leftover idle чужого "
+        "кейса не считается результатом: вызови submit_development_task сейчас.",
     ]
     for item in items[:12]:
         wait = f" до {item.wait_until.isoformat()}" if item.wait_until else ""
