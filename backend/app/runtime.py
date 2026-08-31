@@ -4470,21 +4470,15 @@ class AgentRuntime:
                 except Exception:
                     pass
             if suppressed:
-                db.add(
-                    MessageLog(
-                        agent_id=agent.id,
-                        account_id=account.id if account else None,
-                        direction="suppressed",
-                        chat_id=str(context.get("chat_id") or "") or None,
-                        user_id=str(context.get("sender_id") or "") or None,
-                        message_id=str(context.get("message_id") or "") or None,
-                        message_at=outbound_at,
-                        text=str(context.get("_suppress_telegram_reason") or ""),
-                        metadata_json={"source": "telegram", "suppressed": True},
-                        work_item_id=context.get("work_item_id"),
-                    )
+                await self.conversations.record_suppressed_reply(
+                    db,
+                    agent_id=agent.id,
+                    account_id=account.id if account else None,
+                    context=context,
+                    reason=str(context.get("_suppress_telegram_reason") or ""),
+                    at=outbound_at,
+                    work_item_id=context.get("work_item_id"),
                 )
-                await db.commit()
             elif state is not None:
                 await self.conversations.record_outbound(
                     db, state, result, context, at=outbound_at

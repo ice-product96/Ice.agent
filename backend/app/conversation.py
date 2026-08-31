@@ -6,6 +6,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import ConversationState, MessageLog, RuntimeSettings, utcnow
@@ -422,6 +423,43 @@ class ConversationContextService:
         context["_outbound_log_id"] = log.id
         await self._refresh_state(db, state)
         await db.commit()
+        return log
+
+    async def record_suppressed_reply(
+        self,
+        db: AsyncSession,
+        *,
+        agent_id: int,
+        account_id: int | None,
+        context: dict[str, Any],
+        reason: str,
+        at: datetime | None = None,
+        work_item_id: int | None = None,
+    ) -> MessageLog | None:
+        """Audit a no-reply without reusing the inbound Telegram message_id."""
+        inbound_message_id = str(context.get("message_id") or "").strip() or None
+        log = MessageLog(
+            agent_id=agent_id,
+            account_id=account_id,
+            direction="suppressed",
+            chat_id=str(context.get("chat_id") or "") or None,
+            user_id=str(context.get("sender_id") or "") or None,
+            message_id=None,
+            message_at=as_utc(at),
+            text=reason,
+            metadata_json={
+                "source": str(context.get("source") or "runtime"),
+                "suppressed": True,
+                "inbound_message_id": inbound_message_id,
+            },
+            work_item_id=work_item_id or context.get("work_item_id"),
+        )
+        db.add(log)
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            return None
         return log
 
     async def update_outbound_delivery(

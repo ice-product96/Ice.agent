@@ -285,3 +285,47 @@ def test_conversation_list_and_detail_api(
     )
     assert detail.status_code == 200
     assert detail.json()["messages"][0]["message_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_suppressed_reply_does_not_reuse_inbound_telegram_id(
+    conversation_db: Any,
+) -> None:
+    db, account, first, _second = conversation_db
+    service = ConversationContextService()
+    context = {
+        "source": "telegram",
+        "chat_id": "183432854",
+        "sender_id": "183432854",
+        "message_id": "3039",
+        "message_at": "2026-08-31T06:44:49Z",
+        "telegram_history": [],
+    }
+    await service.prepare(
+        db,
+        agent_id=first.id,
+        account_id=account.id,
+        message="ping",
+        context=context,
+        settings=runtime_settings(summarization_enabled=False),
+    )
+    log = await service.record_suppressed_reply(
+        db,
+        agent_id=first.id,
+        account_id=account.id,
+        context=context,
+        reason="Agent returned the no-reply marker",
+        work_item_id=39,
+    )
+    assert log is not None
+    assert log.direction == "suppressed"
+    assert log.message_id is None
+    assert log.metadata_json["inbound_message_id"] == "3039"
+    inbound = await db.scalar(
+        select(MessageLog).where(
+            MessageLog.agent_id == first.id,
+            MessageLog.message_id == "3039",
+        )
+    )
+    assert inbound is not None
+    assert inbound.direction == "in"
