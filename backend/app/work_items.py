@@ -451,6 +451,7 @@ async def reset_cursor_assignment(
     meta = dict(item.metadata_json or {})
     meta["cursor_in_flight"] = False
     meta["cursor_assignment_seq"] = int(meta.get("cursor_assignment_seq") or 0) + 1
+    meta.pop("cursor_remote_task_id", None)
     item.metadata_json = meta
     item.paused = False
     item.last_error = None
@@ -465,12 +466,19 @@ async def reset_cursor_assignment(
     )
 
 
-async def stamp_cursor_prompt_sent(db: AsyncSession, item: WorkItem | None) -> None:
+async def stamp_cursor_prompt_sent(
+    db: AsyncSession,
+    item: WorkItem | None,
+    result: dict[str, Any] | None = None,
+) -> None:
     if item is None:
         return
+    from .cursorremote_drive import remember_cursor_worker
+
     meta = dict(item.metadata_json or {})
     meta["cursor_in_flight"] = True
     item.metadata_json = meta
+    remember_cursor_worker(item, result)
     await db.commit()
     await db.refresh(item)
 
@@ -1605,7 +1613,7 @@ async def sync_cursor_work_items(
     employee: Any | None = None,
 ) -> list[int]:
     """Poll CursorRemote for open cases and refresh work-item status without an LLM round."""
-    from .cursorremote_drive import check_and_drive
+    from .cursorremote_drive import check_and_drive, cursor_worker_kwargs
 
     if items is None:
         items = await list_open_work_items(db, agent.id, include_paused=False)
@@ -1626,6 +1634,7 @@ async def sync_cursor_work_items(
                     (item.metadata_json or {}).get("cursor_baseline_summary") or ""
                 ),
                 work_item_id=item.id,
+                **cursor_worker_kwargs(item),
             )
         except Exception as exc:
             logger.warning("cursor poll failed for work item %s: %s", item.id, exc)

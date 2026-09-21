@@ -459,10 +459,25 @@ export interface ProjectCommerce {
   can_accept_qa?: boolean
 }
 
+export interface ProjectSpec {
+  status: 'missing' | 'draft' | 'confirmed' | string
+  summary?: string
+  goals?: string[]
+  in_scope?: string[]
+  out_of_scope?: string[]
+  constraints?: string[]
+  modules?: string[]
+  version?: number
+  updated_at?: string | null
+  confirmed_at?: string | null
+  confirmed_by?: string
+}
+
 export interface ProjectState {
   project_id: string
   autonomy_level: 'LEVEL_0' | 'LEVEL_1' | 'LEVEL_2' | 'LEVEL_3'
   config?: Record<string, unknown>
+  spec?: ProjectSpec
   schedule?: ProjectSchedule
   commerce?: ProjectCommerce
   created_at?: string | null
@@ -576,6 +591,7 @@ export interface Customer {
   is_default?: boolean
   tracker_project_id?: string
   tracker_poll_enabled?: boolean
+  spec?: ProjectSpec
   prompt_block?: string
   created_at?: string | null
   updated_at?: string | null

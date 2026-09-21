@@ -656,12 +656,14 @@ class ProjectStateBody(BaseModel):
 
 
 def project_state_json(state: ProjectState) -> dict[str, Any]:
+    from .pm_state import read_project_spec
     from .project_schedule import enrich_project_state_payload
 
     payload = {
         "project_id": state.project_id,
         "autonomy_level": state.autonomy_level,
         "config": state.config or {},
+        "spec": read_project_spec(state),
         "created_at": state.created_at.isoformat() if state.created_at else None,
         "updated_at": state.updated_at.isoformat() if state.updated_at else None,
     }
@@ -751,13 +753,27 @@ async def update_pm_project(
     if payload.autonomy_level is not None:
         state.autonomy_level = normalize_autonomy_level(payload.autonomy_level)
     if payload.config is not None:
+        from .pm_state import apply_spec_update
+
         merged = dict(state.config or {})
+        spec_patch = None
         for key, value in dict(payload.config).items():
+            if key == "spec":
+                spec_patch = value
+                continue
             if value is None:
                 merged.pop(key, None)
             else:
                 merged[key] = value
         state.config = merged
+        if isinstance(spec_patch, dict):
+            confirm = str(spec_patch.get("status") or "").strip().lower() == "confirmed"
+            apply_spec_update(
+                state,
+                spec_patch,
+                confirm=confirm,
+                confirmed_by="manager" if confirm else "",
+            )
     await db.commit()
     return project_state_json(state)
 

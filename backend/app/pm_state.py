@@ -170,6 +170,452 @@ def is_task_ready(item: WorkItem) -> bool:
 
 task_is_ready = is_task_ready
 
+SPEC_STATUSES = ("missing", "draft", "confirmed")
+EXECUTION_VERDICTS = ("execute", "discuss", "draft_spec")
+FEATURE_EXECUTE_MAX_MINUTES = 480
+SPEC_SCOPE_FIELDS = ("in_scope", "out_of_scope", "modules", "goals")
+WHOLE_PRODUCT_RE = re.compile(
+    r"(построить|создать|разработать|сделать)\s+"
+    r"(ai[- ]?систем|систем[уыае]|платформ|продукт|маркетплейс|сервис)|"
+    r"(ai[- ]?систем[аыуе].{0,60}для\s+работы)|"
+    r"(весь\s+продукт|продукт\s+целиком|с\s+нуля|"
+    r"end[- ]to[- ]end\s+platform)",
+    re.IGNORECASE,
+)
+SCENARIO_RE = re.compile(
+    r"(когда|если|пользователь\s+может|when\b|if\b|user\s+can|"
+    r"given\b|после того|должен\s+видеть|shows|returns|persists|"
+    r"отображ|visible|swipe|hover|tap|expand|scroll|pass)",
+    re.IGNORECASE,
+)
+OUTCOME_RE = re.compile(
+    r"(persist|pass|change|visible|scroll|expand|return|show|open|"
+    r"cancel|fix|work|отображ|открыв|закрыв|виден|видима|сохраня|"
+    r"не\s+перекрыв|раскрыв|swipe|hover|tap)",
+    re.IGNORECASE,
+)
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _uniq(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def topic_is_spec_approval(topic: str, decision: str = "") -> bool:
+    blob = f"{topic} {decision}".strip().casefold()
+    tokens = {part for part in re.split(r"[\s/_,.;:]+", blob) if part}
+    if tokens & {"tz", "spec", "тз"}:
+        return True
+    return any(marker in blob for marker in ("техническ", "спецификац", "тз проект"))
+
+
+def normalize_project_spec(raw: Any) -> dict[str, Any]:
+    data = dict(raw) if isinstance(raw, Mapping) else {}
+    status = str(data.get("status") or "missing").strip().lower()
+    if status not in SPEC_STATUSES:
+        status = "missing"
+    try:
+        version = int(data.get("version") or 0)
+    except (TypeError, ValueError):
+        version = 0
+    return {
+        "status": status,
+        "summary": str(data.get("summary") or "").strip(),
+        "goals": _string_list(data.get("goals")),
+        "in_scope": _string_list(data.get("in_scope")),
+        "out_of_scope": _string_list(data.get("out_of_scope")),
+        "constraints": _string_list(data.get("constraints")),
+        "modules": _string_list(data.get("modules")),
+        "version": max(0, version),
+        "updated_at": data.get("updated_at"),
+        "confirmed_at": data.get("confirmed_at"),
+        "confirmed_by": str(data.get("confirmed_by") or "").strip(),
+    }
+
+
+def spec_is_empty(spec: Mapping[str, Any] | None) -> bool:
+    data = spec or {}
+    return not any(
+        [
+            str(data.get("summary") or "").strip(),
+            data.get("goals"),
+            data.get("in_scope"),
+            data.get("out_of_scope"),
+            data.get("modules"),
+        ]
+    )
+
+
+def read_project_spec(state: ProjectState | Mapping[str, Any] | None) -> dict[str, Any]:
+    if state is None:
+        return normalize_project_spec({"status": "missing"})
+    if isinstance(state, Mapping):
+        config = dict(state.get("config") or {}) if "config" in state else dict(state)
+        raw = config.get("spec") if "spec" in config else state.get("spec")
+        if raw is None and not any(key in state for key in ("status", "in_scope", "summary")):
+            return normalize_project_spec({"status": "missing"})
+        return normalize_project_spec(raw if raw is not None else state)
+    config = dict(state.config or {})
+    raw = config.get("spec")
+    if raw is None or raw == {}:
+        return normalize_project_spec({"status": "missing"})
+    return normalize_project_spec(raw)
+
+
+def apply_spec_update(
+    state: ProjectState,
+    patch: Mapping[str, Any] | None,
+    *,
+    confirm: bool = False,
+    confirmed_by: str = "",
+    force_draft: bool = False,
+) -> dict[str, Any]:
+    current = read_project_spec(state)
+    incoming = dict(patch or {})
+    next_spec = dict(current)
+    scope_changed = False
+    changed = bool(confirm or force_draft)
+    if incoming.get("summary") is not None:
+        summary = str(incoming.get("summary") or "").strip()
+        if summary != current.get("summary"):
+            changed = True
+        next_spec["summary"] = summary
+    for key in ("goals", "in_scope", "out_of_scope", "constraints", "modules"):
+        if key not in incoming or incoming[key] is None:
+            continue
+        new_list = _string_list(incoming[key])
+        if new_list != list(current.get(key) or []):
+            changed = True
+            if key in SPEC_SCOPE_FIELDS:
+                scope_changed = True
+        next_spec[key] = new_list
+    if not changed:
+        return current
+    now = utcnow().isoformat()
+    next_spec["updated_at"] = now
+    next_spec["version"] = int(current.get("version") or 0) + 1
+    if confirm:
+        next_spec["status"] = "confirmed"
+        next_spec["confirmed_at"] = now
+        next_spec["confirmed_by"] = str(confirmed_by or "").strip()
+    elif force_draft or (scope_changed and current.get("status") == "confirmed"):
+        next_spec["status"] = "draft"
+        next_spec["confirmed_at"] = None
+        next_spec["confirmed_by"] = ""
+    elif spec_is_empty(next_spec):
+        next_spec["status"] = "missing"
+        next_spec["confirmed_at"] = None
+        next_spec["confirmed_by"] = ""
+    elif current.get("status") == "missing":
+        next_spec["status"] = "draft"
+    else:
+        next_spec["status"] = current.get("status") or "draft"
+    config = dict(state.config or {})
+    config["spec"] = next_spec
+    state.config = config
+    return next_spec
+
+
+def confirm_project_spec(
+    state: ProjectState,
+    *,
+    confirmed_by: str = "",
+) -> dict[str, Any]:
+    return apply_spec_update(state, {}, confirm=True, confirmed_by=confirmed_by)
+
+
+def revert_spec_to_draft(state: ProjectState) -> dict[str, Any]:
+    current = read_project_spec(state)
+    if current.get("status") != "confirmed":
+        return current
+    return apply_spec_update(state, {}, force_draft=True)
+
+
+def seed_draft_spec_from_item(state: ProjectState, item: WorkItem) -> dict[str, Any]:
+    current = read_project_spec(state)
+    if current.get("status") != "missing" and not spec_is_empty(current):
+        return current
+    return apply_spec_update(
+        state,
+        {
+            "summary": str(item.goal or item.title or "").strip(),
+            "goals": list(item.requirements or [])[:8],
+            "constraints": list(item.constraints or []),
+        },
+    )
+
+
+def _norm_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.split(r"[^\wа-яё]+", str(text or "").casefold())
+        if len(token) > 2
+    }
+
+
+def texts_overlap(left: str, right: str) -> bool:
+    a = str(left or "").strip().casefold()
+    b = str(right or "").strip().casefold()
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    left_tokens = _norm_tokens(a)
+    right_tokens = _norm_tokens(b)
+    if left_tokens & right_tokens:
+        return True
+    for x in left_tokens:
+        for y in right_tokens:
+            if len(x) >= 4 and len(y) >= 4 and (x.startswith(y) or y.startswith(x)):
+                return True
+    return False
+
+
+def item_blob(item: WorkItem) -> str:
+    parts = [
+        str(item.title or ""),
+        str(item.goal or ""),
+        *list(item.requirements or []),
+        *list(item.acceptance_criteria or []),
+    ]
+    return " ".join(part for part in parts if str(part).strip())
+
+
+def item_intersects_scope(
+    item: WorkItem,
+    spec: Mapping[str, Any] | None,
+) -> tuple[bool, bool]:
+    blob = item_blob(item)
+    data = spec or {}
+    in_hit = any(
+        texts_overlap(blob, phrase)
+        for phrase in list(data.get("in_scope") or []) + list(data.get("modules") or [])
+    )
+    out_hit = any(
+        texts_overlap(blob, phrase) for phrase in list(data.get("out_of_scope") or [])
+    )
+    return in_hit, out_hit
+
+
+def requirements_expand_spec(
+    item: WorkItem,
+    spec: Mapping[str, Any] | None,
+    previous_requirements: list[str] | None,
+) -> bool:
+    previous = {str(value).strip().casefold() for value in (previous_requirements or [])}
+    added = [
+        requirement
+        for requirement in list(item.requirements or [])
+        if str(requirement).strip().casefold() not in previous
+    ]
+    if not added:
+        return False
+    scope = list((spec or {}).get("in_scope") or []) + list(
+        (spec or {}).get("modules") or []
+    )
+    if not scope:
+        return True
+    return any(
+        not any(texts_overlap(requirement, phrase) for phrase in scope)
+        for requirement in added
+    )
+
+
+def looks_like_whole_product(item: WorkItem) -> bool:
+    blob = item_blob(item)
+    if not WHOLE_PRODUCT_RE.search(blob):
+        return False
+    criteria = [str(value).strip() for value in list(item.acceptance_criteria or []) if str(value).strip()]
+    specific = sum(1 for value in criteria if len(value) > 18 and OUTCOME_RE.search(value))
+    return specific < 2
+
+
+def has_testable_criteria(item: WorkItem) -> bool:
+    criteria = [
+        str(value).strip()
+        for value in list(item.acceptance_criteria or [])
+        if str(value).strip()
+    ]
+    if not criteria:
+        return False
+    if any(SCENARIO_RE.search(value) or OUTCOME_RE.search(value) for value in criteria):
+        return True
+    if str(item.task_type or "").strip().lower() == "bug" and any(
+        len(value) >= 12 for value in criteria
+    ):
+        return True
+    return len(criteria) >= 2 and all(len(value) >= 12 for value in criteria[:2])
+
+
+def assess_execution(
+    item: WorkItem,
+    spec: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    spec_norm = normalize_project_spec(spec)
+    reasons: list[str] = []
+    questions: list[str] = []
+    verdict = "execute"
+    status = str(spec_norm.get("status") or "missing")
+
+    def demote(next_verdict: str) -> None:
+        nonlocal verdict
+        rank = {"execute": 0, "discuss": 1, "draft_spec": 2}
+        if rank.get(next_verdict, 0) > rank.get(verdict, 0):
+            verdict = next_verdict
+
+    if spec_is_empty(spec_norm) or status == "missing":
+        demote("draft_spec")
+        reasons.append("Project spec is missing")
+        questions.append(
+            "Какие цели продукта, что входит в in_scope и что явно вне scope?"
+        )
+    elif status != "confirmed":
+        demote("discuss")
+        reasons.append("Project spec is not confirmed")
+        questions.append(
+            "Подтвердите ТЗ проекта (цели, in_scope, out_of_scope), "
+            "затем pm_record_decision с темой тз/spec/tz."
+        )
+
+    issues = readiness_issues(item)
+    if issues:
+        demote("discuss")
+        reasons.extend(issues)
+        questions.append("Уточните цель, требования и проверяемые критерии приёмки.")
+
+    if looks_like_whole_product(item):
+        demote("draft_spec" if status in {"missing", "draft"} else "discuss")
+        reasons.append("Request describes the whole product rather than a slice")
+        questions.append(
+            "Какой конкретный срез делаем сейчас (модуль, сценарий, актор)?"
+        )
+
+    if not has_testable_criteria(item) and list(item.acceptance_criteria or []):
+        demote("discuss")
+        reasons.append(
+            "Acceptance criteria are not testable (need when/if/user-can scenarios)"
+        )
+        questions.append(
+            "Добавьте проверяемые критерии: когда / если / пользователь может …"
+        )
+
+    minutes = estimated_duration_minutes(item)
+    if (
+        str(item.task_type or "").strip().lower() == "feature"
+        and minutes is not None
+        and minutes > FEATURE_EXECUTE_MAX_MINUTES
+    ):
+        demote("discuss")
+        reasons.append("Feature estimate exceeds one working day")
+        questions.append(
+            "Можно ли сузить срез до одного рабочего дня, или это несколько этапов?"
+        )
+
+    in_hit, out_hit = item_intersects_scope(item, spec_norm)
+    if status == "confirmed":
+        if out_hit:
+            demote("discuss")
+            reasons.append("Request matches spec out_of_scope")
+            questions.append("Это сознательное расширение ТЗ или задача вне продукта?")
+        elif not in_hit and (
+            spec_norm.get("in_scope") or spec_norm.get("modules")
+        ):
+            demote("discuss")
+            reasons.append("Request does not intersect spec.in_scope")
+            questions.append(
+                "Уточните срез внутри in_scope или расширьте ТЗ и согласуйте заново."
+            )
+
+    return {
+        "verdict": verdict,
+        "reasons": _uniq(reasons),
+        "questions": _uniq(questions),
+        "spec_version": int(spec_norm.get("version") or 0),
+        "spec_status": status,
+    }
+
+
+def stamp_execution_verdict(
+    item: WorkItem,
+    verdict: Mapping[str, Any],
+) -> dict[str, Any]:
+    ctx = dict(item.context_json or {}) if isinstance(item.context_json, dict) else {}
+    payload = {
+        "verdict": str(verdict.get("verdict") or "discuss"),
+        "reasons": list(verdict.get("reasons") or []),
+        "questions": list(verdict.get("questions") or []),
+        "spec_version": int(verdict.get("spec_version") or 0),
+        "spec_status": str(verdict.get("spec_status") or "missing"),
+    }
+    if verdict.get("drafted"):
+        payload["drafted"] = True
+    ctx["execution"] = payload
+    item.context_json = ctx
+    return payload
+
+
+def apply_execution_assessment(
+    item: WorkItem,
+    spec: Mapping[str, Any] | None = None,
+    *,
+    project_state: ProjectState | None = None,
+    draft_if_missing: bool = True,
+) -> dict[str, Any]:
+    spec_norm = normalize_project_spec(
+        spec if spec is not None else read_project_spec(project_state)
+    )
+    verdict = assess_execution(item, spec_norm)
+    if (
+        draft_if_missing
+        and verdict.get("verdict") == "draft_spec"
+        and project_state is not None
+        and (spec_norm.get("status") == "missing" or spec_is_empty(spec_norm))
+    ):
+        spec_norm = seed_draft_spec_from_item(project_state, item)
+        verdict = assess_execution(item, spec_norm)
+        if verdict.get("verdict") == "discuss" and spec_norm.get("status") == "draft":
+            verdict["verdict"] = "draft_spec"
+        verdict["drafted"] = True
+        verdict["spec_version"] = int(spec_norm.get("version") or 0)
+        verdict["spec_status"] = str(spec_norm.get("status") or "draft")
+    return stamp_execution_verdict(item, verdict)
+
+
+def execution_verdict_of(item: WorkItem | None) -> str:
+    if item is None:
+        return ""
+    ctx = item.context_json if isinstance(item.context_json, dict) else {}
+    execution = ctx.get("execution") if isinstance(ctx.get("execution"), dict) else {}
+    return str(execution.get("verdict") or "").strip().lower()
+
+
+def execution_gate_error(verdict: Mapping[str, Any]) -> str:
+    reasons = "; ".join(str(item) for item in list(verdict.get("reasons") or []) if item)
+    questions = " ".join(str(item) for item in list(verdict.get("questions") or []) if item)
+    parts = [
+        "Task is not ready for Cursor.",
+        reasons or f"verdict={verdict.get('verdict') or 'discuss'}",
+    ]
+    if questions:
+        parts.append(f"Ask the customer: {questions}")
+    parts.append("Do not call submit_development_task until verdict is execute.")
+    return " ".join(parts)
+
 
 def normalize_autonomy_level(level: str | int) -> str:
     if isinstance(level, int):
@@ -289,8 +735,10 @@ def infer_inside_agreed_scope(
 ) -> bool:
     if item is None:
         return bool(client_confirmed)
-    if work_item_is_tracker_sourced(item):
+    if execution_verdict_of(item) == "execute":
         return True
+    if work_item_is_tracker_sourced(item):
+        return False
     ctx = item.context_json if isinstance(item.context_json, dict) else {}
     if "inside_agreed_scope" in ctx:
         return bool(ctx.get("inside_agreed_scope"))

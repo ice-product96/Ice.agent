@@ -8,11 +8,13 @@ from app.cursorremote_drive import (
     composer_is_actively_working,
     cursor_has_active_work,
     cursor_is_busy,
+    cursor_worker_kwargs,
     drive_until_done,
     is_cursor_poll_followup,
     parse_mcp_payload,
     pin_cursor_followup_message,
     send_prompt_and_drive,
+    status_from_worker_task,
     summarize_cursor_state,
 )
 
@@ -539,5 +541,168 @@ def test_prompt_actually_started_requires_busy() -> None:
             "done": False,
         }
     )
+
+
+def test_cursor_worker_kwargs_from_item_and_context() -> None:
+    class _Item:
+        id = 42
+        chat_id = "777"
+        project_id = "lavve"
+        metadata_json = {
+            "cursor_session_id": "sess-1",
+            "cursor_remote_task_id": "remote-9",
+        }
+
+    kwargs = cursor_worker_kwargs(_Item())
+    assert kwargs["task_id"] == "42"
+    assert kwargs["chat_id"] == "777"
+    assert kwargs["project_id"] == "lavve"
+    assert kwargs["session_id"] == "sess-1"
+    assert kwargs["remote_task_id"] == "remote-9"
+    from_context = cursor_worker_kwargs(None, {"chat_id": "100", "work_item_id": 7})
+    assert from_context["chat_id"] == "100"
+    assert from_context["task_id"] == "7"
+
+
+def test_status_from_worker_task_maps_succeeded() -> None:
+    mapped = status_from_worker_task(
+        {
+            "ok": True,
+            "done": True,
+            "agentStatus": "idle",
+            "pendingApprovalCount": 0,
+            "agentActivityLive": False,
+            "result": '{"task_id":"42","status":"completed"}',
+            "summary": "wrap-up",
+            "task": {"id": "remote-9", "status": "succeeded", "taskId": "42", "chatId": "777"},
+        }
+    )
+    assert mapped is not None
+    assert mapped["agentStatus"] == "idle"
+    assert mapped["done"] is True
+    assert "task_id" in str(mapped["result"])
+
+
+def test_send_task_passes_task_id_and_chat_id() -> None:
+    idle = {"agentStatus": "idle", "pendingApprovalCount": 0, "agentActivityLive": False}
+    thinking = {
+        "agentStatus": "thinking",
+        "pendingApprovalCount": 0,
+        "agentActivityLive": True,
+    }
+    prompt = "Fix header dropdown now please"
+    done_task = {
+        "ok": True,
+        "done": True,
+        "agentStatus": "idle",
+        "agentActivityLive": False,
+        "pendingApprovalCount": 0,
+        "needsInput": False,
+        "result": '{"task_id":"42","status":"completed"}',
+        "summary": "Header fixed",
+        "task": {"id": "remote-9", "sessionId": "sess-1", "status": "succeeded"},
+    }
+    running_task = {
+        "ok": True,
+        "done": False,
+        "agentStatus": "thinking",
+        "agentActivityLive": True,
+        "pendingApprovalCount": 0,
+        "task": {"id": "remote-9", "sessionId": "sess-1", "status": "running"},
+    }
+    session = ScriptSession(
+        {
+            "get_status": [idle, idle],
+            "create_session": [
+                {"ok": True, "session": {"id": "sess-1", "composerId": "cmp-1"}}
+            ],
+            "send_task": [
+                {
+                    "ok": True,
+                    "task": {
+                        "id": "remote-9",
+                        "sessionId": "sess-1",
+                        "taskId": "42",
+                        "chatId": "777",
+                        "status": "running",
+                    },
+                }
+            ],
+            "get_task": [running_task, running_task, done_task, done_task, done_task],
+            "get_messages": [
+                {
+                    "ok": True,
+                    "messages": [
+                        {"type": "human", "text": prompt},
+                        {"type": "assistant", "text": '{"task_id":"42","status":"completed"}'},
+                    ],
+                }
+            ],
+            "wait": [{"status": "timeout"} for _ in range(8)],
+        },
+        default=thinking,
+        tool_names=[
+            "create_session",
+            "send_task",
+            "get_task",
+            "get_messages",
+            "get_status",
+            "list_windows",
+        ],
+    )
+    result = asyncio.run(
+        send_prompt_and_drive(
+            session,
+            prompt,
+            timeout_ms=400,
+            task_id="42",
+            chat_id="777",
+            project_id="lavve",
+        )
+    )
+    sent = next(args for tool, args in session.calls if tool == "send_task")
+    assert sent["task_id"] == "42"
+    assert sent["taskId"] == "42"
+    assert sent["chat_id"] == "777"
+    assert sent["chatId"] == "777"
+    assert sent["sessionId"] == "sess-1"
+    assert sent["project_id"] == "lavve"
+    assert not any(tool == "send_prompt" for tool, _ in session.calls)
+    assert result["cursor_session_id"] == "sess-1"
+    assert result["cursor_remote_task_id"] == "remote-9"
+    assert result["prompt_sent"] is True
+
+
+def test_check_and_drive_polls_get_task() -> None:
+    done_task = {
+        "ok": True,
+        "done": True,
+        "agentStatus": "idle",
+        "agentActivityLive": False,
+        "pendingApprovalCount": 0,
+        "result": "finished",
+        "summary": "finished",
+        "task": {"id": "remote-9", "status": "succeeded"},
+    }
+    session = ScriptSession(
+        {
+            "get_task": [done_task] * 8,
+            "get_messages": [
+                {"ok": True, "messages": [{"type": "assistant", "text": "finished"}]}
+            ],
+        },
+        tool_names=["get_task", "get_messages", "get_status"],
+    )
+    result = asyncio.run(
+        check_and_drive(
+            session,
+            timeout_ms=500,
+            idle_debounce_ms=0,
+            remote_task_id="remote-9",
+        )
+    )
+    assert any(tool == "get_task" for tool, args in session.calls if args.get("task_id") == "remote-9")
+    assert result["done"] is True
+    assert "finished" in str(result.get("summary") or "")
 
 

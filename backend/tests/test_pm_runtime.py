@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.config import Settings
 from app.db import Agent, Base, WorkItem
 from app.integrations import McpManager
+from app.pm_state import apply_spec_update, confirm_project_spec, get_or_create_project_state
 from app.runtime import AgentRuntime
 
 
@@ -52,6 +53,37 @@ def stub_idle_composer(monkeypatch) -> None:
     monkeypatch.setattr("app.cursorremote_drive.peek_composer", fake_peek)
 
 
+async def seed_confirmed_spec(db, project_id: str, in_scope: list[str] | None = None):
+    state = await get_or_create_project_state(db, project_id)
+    apply_spec_update(
+        state,
+        {
+            "summary": f"Confirmed product scope for {project_id}",
+            "goals": ["Deliver agreed product slices"],
+            "in_scope": in_scope
+            or [
+                "orders",
+                "order",
+                "cancellation",
+                "cancel",
+                "carousel",
+                "catalog",
+                "checkout",
+                "header",
+                "menu",
+                "корзина",
+                "каталог",
+                "оформить заказ",
+            ],
+            "out_of_scope": ["unrelated new products"],
+            "modules": ["web"],
+        },
+    )
+    confirm_project_spec(state, confirmed_by="customer")
+    await db.flush()
+    return state
+
+
 @pytest.mark.asyncio
 async def test_pm_registry_hides_raw_cursor_and_blocks_incomplete_task(
     tmp_path: Path,
@@ -89,6 +121,7 @@ async def test_pm_registry_hides_raw_cursor_and_blocks_incomplete_task(
             pm_phase="CLARIFICATION",
         )
         db.add(item)
+        await seed_confirmed_spec(db, "orders")
         await db.commit()
         runtime_context = {
             "_pm_mode": True,
@@ -216,6 +249,7 @@ async def test_customer_decision_unlocks_development_without_manager(
             pm_phase="DISCUSSION",
         )
         db.add(item)
+        await seed_confirmed_spec(db, "lavve", in_scope=["carousel", "карусель"])
         await db.commit()
         runtime_context = {
             "_pm_mode": True,
@@ -342,6 +376,7 @@ async def test_structured_cursor_result_requires_and_then_passes_qa(
             context_json={"inside_agreed_scope": True, "small_fix": True},
         )
         db.add(item)
+        await seed_confirmed_spec(db, "orders")
         await db.commit()
         registry = await runtime.registry(
             agent,
@@ -518,6 +553,7 @@ async def test_submit_sends_when_composer_is_idle_with_old_task_json(
             context_json={"inside_agreed_scope": True, "small_fix": True},
         )
         db.add(item)
+        await seed_confirmed_spec(db, "uraltrade")
         await db.commit()
         registry = await runtime.registry(
             agent,
@@ -647,6 +683,7 @@ async def test_tracker_bug_submits_without_cost_confirmation(
             },
         )
         db.add(item)
+        await seed_confirmed_spec(db, "uraltrade")
         await db.commit()
         registry = await runtime.registry(
             agent,
@@ -662,4 +699,276 @@ async def test_tracker_bug_submits_without_cost_confirmation(
         assert item.pm_phase == "IN_DEVELOPMENT"
         assert item.context_json.get("inside_agreed_scope") is True
         assert item.context_json.get("small_fix") is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_broad_ozon_request_blocks_submit_and_drafts_spec(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'pm-ozon.db').as_posix()}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    mcp = McpManager()
+    mcp.sessions = {"cursorremote": FakeCursorSession()}
+    runtime = AgentRuntime(
+        Settings(mem0_enabled=False),
+        SimpleNamespace(),
+        FakeSearch(),
+        FakeEvents(),
+        mcp=mcp,
+    )
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="Построить AI систему для работы на Ozon",
+            goal="Построить AI систему для работы на Ozon",
+            project_id="ozon",
+            task_type="feature",
+            requirements=["Сделать AI для селлера на Ozon"],
+            acceptance_criteria=["Система работает на Ozon"],
+            priority="normal",
+            pm_phase="DISCUSSION",
+        )
+        db.add(item)
+        await db.commit()
+        registry = await runtime.registry(
+            agent,
+            mcp_server_names={"cursorremote"},
+            memory_enabled=False,
+            db=db,
+            context={
+                "_pm_mode": True,
+                "work_item_id": item.id,
+                "source": "telegram",
+                "chat_id": "c1",
+                "client_id": "c1",
+                "message_id": "m-ozon",
+            },
+        )
+        stored = await registry.call(
+            "pm_structure_task",
+            {
+                "project_id": "ozon",
+                "task_type": "feature",
+                "title": "Построить AI систему для работы на Ozon",
+                "requirements": ["Сделать AI для селлера на Ozon"],
+                "acceptance_criteria": ["Система работает на Ozon"],
+            },
+        )
+        assert stored["execution"]["verdict"] in {"draft_spec", "discuss"}
+        assert stored["task"]["pm_phase"] in {"DISCUSSION", "CLARIFICATION"}
+        assert stored["spec"]["status"] in {"draft", "missing"}
+        with pytest.raises(PermissionError, match="not ready for Cursor"):
+            await registry.call("submit_development_task", {})
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_scope_bug_executes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def fake_send(*args, **kwargs):
+        return {"done": False, "prompt_sent": True, "status": "working"}
+
+    monkeypatch.setattr("app.cursorremote_drive.send_prompt_and_drive", fake_send)
+    stub_idle_composer(monkeypatch)
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'pm-bug-exec.db').as_posix()}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    mcp = McpManager()
+    mcp.sessions = {"cursorremote": FakeCursorSession()}
+    runtime = AgentRuntime(
+        Settings(mem0_enabled=False),
+        SimpleNamespace(),
+        FakeSearch(),
+        FakeEvents(),
+        mcp=mcp,
+    )
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="Кнопка логина не нажимается",
+            goal="Починить кнопку входа",
+            project_id="cabinet",
+            task_type="bug",
+            requirements=["Кнопка логина открывает форму входа"],
+            acceptance_criteria=["Когда пользователь нажимает Войти, форма открывается"],
+            priority="normal",
+            pm_phase="REQUIREMENTS_READY",
+            context_json={"estimated_duration_minutes": 30, "small_fix": True},
+        )
+        db.add(item)
+        await seed_confirmed_spec(
+            db, "cabinet", in_scope=["логин", "кабинет", "вход", "auth"]
+        )
+        await db.commit()
+        registry = await runtime.registry(
+            agent,
+            mcp_server_names={"cursorremote"},
+            memory_enabled=False,
+            db=db,
+            context={"_pm_mode": True, "work_item_id": item.id},
+        )
+        assessed = await registry.call("pm_assess_execution", {})
+        assert assessed["execution"]["verdict"] == "execute"
+        result = await registry.call("submit_development_task", {})
+        assert result.get("prompt_sent") is True or result.get("status") in {
+            "in_progress",
+            "running",
+            "working",
+        }
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_spec_module_update_requires_tz_decision(tmp_path: Path) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'pm-spec-tz.db').as_posix()}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    mcp = McpManager()
+    mcp.sessions = {"cursorremote": FakeCursorSession()}
+    runtime = AgentRuntime(
+        Settings(mem0_enabled=False),
+        SimpleNamespace(),
+        FakeSearch(),
+        FakeEvents(),
+        mcp=mcp,
+    )
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="Pricing alerts",
+            goal="Alert on price changes",
+            project_id="cabinet",
+            task_type="feature",
+            requirements=["Show price alerts in cabinet"],
+            acceptance_criteria=["When price drops, user can see an alert"],
+            priority="normal",
+            pm_phase="CLARIFICATION",
+        )
+        db.add(item)
+        await seed_confirmed_spec(db, "cabinet", in_scope=["кабинет", "логин"])
+        await db.commit()
+        registry = await runtime.registry(
+            agent,
+            mcp_server_names={"cursorremote"},
+            memory_enabled=False,
+            db=db,
+            context={
+                "_pm_mode": True,
+                "work_item_id": item.id,
+                "source": "telegram",
+                "chat_id": "c1",
+                "client_id": "c1",
+                "message_id": "m-tz",
+            },
+        )
+        updated = await registry.call(
+            "pm_update_spec",
+            {
+                "project_id": "cabinet",
+                "modules": ["auth", "pricing"],
+                "in_scope": ["кабинет", "логин", "pricing"],
+            },
+        )
+        assert updated["spec"]["status"] == "draft"
+        with pytest.raises(PermissionError, match="not ready for Cursor"):
+            await registry.call("submit_development_task", {})
+        recorded = await registry.call(
+            "pm_record_decision",
+            {
+                "project_id": "cabinet",
+                "topic": "тз",
+                "decision": "Согласовали модуль pricing",
+                "confirmed_by": "заказчик",
+            },
+        )
+        assert recorded["spec"]["status"] == "confirmed"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_tracker_broad_card_is_not_auto_in_scope(tmp_path: Path) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'pm-tracker-broad.db').as_posix()}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    mcp = McpManager()
+    mcp.sessions = {"cursorremote": FakeCursorSession()}
+    runtime = AgentRuntime(
+        Settings(mem0_enabled=False),
+        SimpleNamespace(),
+        FakeSearch(),
+        FakeEvents(),
+        mcp=mcp,
+    )
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="Построить платформу для Ozon",
+            goal="Построить платформу для Ozon",
+            project_id="uraltrade",
+            task_type="feature",
+            requirements=["Сделать платформу"],
+            acceptance_criteria=["Платформа готова"],
+            priority="normal",
+            pm_phase="DISCUSSION",
+            context_json={"tracker_task_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+        )
+        db.add(item)
+        await db.commit()
+        registry = await runtime.registry(
+            agent,
+            mcp_server_names={"cursorremote"},
+            memory_enabled=False,
+            db=db,
+            context={
+                "_pm_mode": True,
+                "work_item_id": item.id,
+                "source": "employee_tick",
+                "message_id": "tracker:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            },
+        )
+        stored = await registry.call(
+            "pm_structure_task",
+            {
+                "project_id": "uraltrade",
+                "task_type": "feature",
+                "title": "Построить платформу для Ozon",
+                "requirements": ["Сделать платформу"],
+                "acceptance_criteria": ["Платформа готова"],
+                "context_json": {
+                    "tracker_task_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                },
+            },
+        )
+        assert stored["execution"]["verdict"] in {"draft_spec", "discuss"}
+        assert stored["task"]["context"].get("inside_agreed_scope") is not True
+        with pytest.raises(PermissionError):
+            await registry.call("submit_development_task", {})
     await engine.dispose()

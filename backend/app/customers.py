@@ -105,12 +105,15 @@ def customer_prompt_block(customer: Customer | None, *, tracker: dict[str, Any] 
 
 async def customer_json(customer: Customer, db: AsyncSession | None = None) -> dict[str, Any]:
     tracker = {"tracker_project_id": "", "tracker_poll_enabled": False}
+    spec: dict[str, Any] = {"status": "missing"}
     if db is not None and (customer.project_id or "").strip():
+        from .pm_state import read_project_spec
         from .tracker_poll import tracker_settings
 
         state = await db.get(ProjectState, customer.project_id.strip())
         if state is not None:
             tracker = tracker_settings(state.config)
+            spec = read_project_spec(state)
     return {
         "id": customer.id,
         "name": customer.name,
@@ -122,6 +125,7 @@ async def customer_json(customer: Customer, db: AsyncSession | None = None) -> d
         "is_default": bool(customer.is_default),
         "tracker_project_id": tracker.get("tracker_project_id") or "",
         "tracker_poll_enabled": bool(tracker.get("tracker_poll_enabled")),
+        "spec": spec,
         "prompt_block": customer_prompt_block(customer, tracker=tracker),
         "created_at": customer.created_at.isoformat() if customer.created_at else None,
         "updated_at": customer.updated_at.isoformat() if customer.updated_at else None,

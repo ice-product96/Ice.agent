@@ -82,6 +82,7 @@ def test_resolve_tool_permissions_grants_cursorremote() -> None:
         {"tools": ["mcp"], "tool_permissions": ["cursorremote"]}
     )
     assert "mcp_cursorremote_send_prompt" in by_flag
+    assert "mcp_cursorremote_send_task" in by_flag
     assert "mcp_cursorremote_approve" in by_flag
     by_attach = resolve_tool_permissions(
         {"tools": ["mcp"], "tool_permissions": []},

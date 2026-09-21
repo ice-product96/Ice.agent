@@ -12,6 +12,7 @@ import type {
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, RuntimeSettings,
   Customer, CursorProjectOption, EmployeePolicy, EmployeePolicyCatalog,
   PromptSectionRevision, SipAccount, SipCall, Status, TelegramAccount, WorkItem, WorkItemEvent, WorkItemEventsPage, EmployeeNeedsPage,
+  ProjectSpec,
 } from './types'
 
 type Page = 'dashboard' | 'agents' | 'connections' | 'runtime' | 'telegram' | 'sip' | 'calls' | 'conversations' | 'employee' | 'customers' | 'memory' | 'mcp' | 'cron' | 'settings' | 'logs' | 'tasks'
@@ -1797,6 +1798,12 @@ function EmployeeScreen() {
                 />
               </div>
             </div>
+            <ProjectSpecEditor
+              spec={(selected.project?.spec || (selected.project?.config?.spec as ProjectSpec | undefined) || null)}
+              onSave={async next => {
+                await patchProject({ spec: next })
+              }}
+            />
           </div>
         })()}
         </> : null}
@@ -1984,6 +1991,90 @@ function EmployeeScreen() {
   </>
 }
 
+function specLines(value: unknown): string {
+  return Array.isArray(value) ? value.filter(Boolean).join('\n') : String(value || '')
+}
+
+function parseSpecLines(text: string): string[] {
+  return text.split('\n').map(item => item.trim()).filter(Boolean)
+}
+
+function specStatusLabel(status?: string) {
+  if (status === 'confirmed') return 'согласовано'
+  if (status === 'draft') return 'черновик'
+  return 'нет ТЗ'
+}
+
+function ProjectSpecEditor({
+  spec,
+  onSave,
+  disabled,
+}: {
+  spec?: ProjectSpec | null
+  onSave: (next: ProjectSpec) => Promise<void>
+  disabled?: boolean
+}) {
+  const [summary, setSummary] = useState(spec?.summary || '')
+  const [goals, setGoals] = useState(specLines(spec?.goals))
+  const [inScope, setInScope] = useState(specLines(spec?.in_scope))
+  const [outOfScope, setOutOfScope] = useState(specLines(spec?.out_of_scope))
+  const [modules, setModules] = useState(specLines(spec?.modules))
+  const [constraints, setConstraints] = useState(specLines(spec?.constraints))
+  const [saving, setSaving] = useState(false)
+  useEffect(() => {
+    setSummary(spec?.summary || '')
+    setGoals(specLines(spec?.goals))
+    setInScope(specLines(spec?.in_scope))
+    setOutOfScope(specLines(spec?.out_of_scope))
+    setModules(specLines(spec?.modules))
+    setConstraints(specLines(spec?.constraints))
+  }, [spec?.version, spec?.status, spec?.summary, spec?.updated_at])
+  const payload = (status?: string): ProjectSpec => ({
+    status: status || spec?.status || 'draft',
+    summary: summary.trim(),
+    goals: parseSpecLines(goals),
+    in_scope: parseSpecLines(inScope),
+    out_of_scope: parseSpecLines(outOfScope),
+    modules: parseSpecLines(modules),
+    constraints: parseSpecLines(constraints),
+  })
+  const save = async (status?: string) => {
+    setSaving(true)
+    try {
+      await onSave(payload(status))
+    } finally {
+      setSaving(false)
+    }
+  }
+  const status = spec?.status || 'missing'
+  return (
+    <div className="form-section wide" style={{ marginTop: 12 }}>
+      <div className="head-actions" style={{ justifyContent: 'space-between' }}>
+        <strong>ТЗ проекта</strong>
+        <span className="chip">{specStatusLabel(status)}</span>
+      </div>
+      <small>Границы продукта, не кейс. Широкая идея сначала сюда, в Cursor только согласованный срез.</small>
+      <Field label="Кратко" hint="Зачем продукт и для кого">
+        <textarea rows={2} value={summary} onChange={e => setSummary(e.target.value)} placeholder="AI-помощник селлера на Ozon: карточки, цены, отзывы"/>
+      </Field>
+      <div className="grid-2" style={{ gap: 8, marginTop: 8 }}>
+        <Field label="Цели"><textarea rows={3} value={goals} onChange={e => setGoals(e.target.value)} placeholder="по одной на строку"/></Field>
+        <Field label="Модули"><textarea rows={3} value={modules} onChange={e => setModules(e.target.value)} placeholder="по одному на строку"/></Field>
+        <Field label="In scope"><textarea rows={4} value={inScope} onChange={e => setInScope(e.target.value)} placeholder="что входит"/></Field>
+        <Field label="Out of scope"><textarea rows={4} value={outOfScope} onChange={e => setOutOfScope(e.target.value)} placeholder="что не делаем"/></Field>
+      </div>
+      <Field label="Ограничения" hint="Стек, сроки, интеграции">
+        <textarea rows={2} value={constraints} onChange={e => setConstraints(e.target.value)}/>
+      </Field>
+      {spec?.confirmed_at && <small>Согласовано {new Date(spec.confirmed_at).toLocaleString('ru-RU')}{spec.confirmed_by ? ` · ${spec.confirmed_by}` : ''}</small>}
+      <div className="head-actions" style={{ marginTop: 8 }}>
+        <button type="button" className="secondary compact" disabled={disabled || saving} onClick={() => void save()}>Сохранить черновик</button>
+        <button type="button" className="primary compact" disabled={disabled || saving} onClick={() => void save('confirmed')}>Согласовано</button>
+      </div>
+    </div>
+  )
+}
+
 function CustomerForm({
   value,
   agents,
@@ -2005,6 +2096,7 @@ function CustomerForm({
     workday_end?: string
     tracker_project_id?: string
     tracker_poll_enabled?: boolean
+    spec?: ProjectSpec
   }) => Promise<void>
   refreshingProjects?: boolean
   onRefreshProjects?: () => void
@@ -2017,6 +2109,7 @@ function CustomerForm({
   const [workdayEnd, setWorkdayEnd] = useState('18:00')
   const [trackerProjectId, setTrackerProjectId] = useState('')
   const [trackerPollEnabled, setTrackerPollEnabled] = useState(true)
+  const [specDraft, setSpecDraft] = useState<ProjectSpec | undefined>(value.spec)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [loadingProject, setLoadingProject] = useState(false)
@@ -2042,6 +2135,7 @@ function CustomerForm({
           ? Boolean(cfg.tracker_project_id || value.tracker_project_id)
           : Boolean(cfg.tracker_poll_enabled),
       )
+      setSpecDraft(project.spec || (cfg.spec as ProjectSpec | undefined) || value.spec)
     }).catch(() => {
       /* new project — keep defaults */
       setTrackerProjectId(String(value.tracker_project_id || ''))
@@ -2065,6 +2159,7 @@ function CustomerForm({
           workday_end: workdayEnd,
           tracker_project_id: trackerProjectId.trim(),
           tracker_poll_enabled: trackerPollEnabled,
+          spec: specDraft,
         })
         onClose()
       } catch (err) {
@@ -2165,6 +2260,15 @@ function CustomerForm({
         </div>
         <div className="toggle-box wide"><Toggle label="Заказчик по умолчанию для выбранного сотрудника" checked={Boolean(form.is_default)} onChange={v => patch({ is_default: v })}/></div>
 
+        <ProjectSpecEditor
+          spec={specDraft}
+          onSave={async next => {
+            setSpecDraft(next)
+            const projectId = (form.project_id || form.id || '').trim()
+            if (projectId) await api.pm.updateProject(projectId, { config: { spec: next } })
+          }}
+        />
+
         <Field label="Заметки" wide><textarea rows={3} value={form.notes || ''} onChange={e => patch({ notes: e.target.value })} placeholder="Контакты, договорённости, нюансы"/></Field>
       </div>
       {(form.name || form.project_id || form.cursor_workspace) && (
@@ -2222,7 +2326,7 @@ function CustomersScreen() {
           <span><Briefcase size={13}/>{agentName(item.agent_id)}</span>
           <span><ServerCog size={13}/>{item.project_id || '—'}</span>
         </div>
-        <div className="entity-meta"><span>{item.cursor_workspace || 'Cursor workspace не задан'}</span><span>id={item.id}</span><span>{item.tracker_project_id ? (item.tracker_poll_enabled === false ? 'трекер выкл.' : 'трекер опрос') : 'без трекера'}</span></div>
+        <div className="entity-meta"><span>{item.cursor_workspace || 'Cursor workspace не задан'}</span><span>id={item.id}</span><span>{item.tracker_project_id ? (item.tracker_poll_enabled === false ? 'трекер выкл.' : 'трекер опрос') : 'без трекера'}</span><span>ТЗ: {specStatusLabel(item.spec?.status)}</span></div>
         {item.prompt_block && <pre className="customer-prompt-inline">{item.prompt_block}</pre>}
         <div className="card-actions">
           <button className="secondary" onClick={() => setEditing(item)}>Изменить</button>
@@ -2266,6 +2370,7 @@ function CustomersScreen() {
               currency: 'RUB',
               tracker_project_id: value.tracker_project_id || '',
               tracker_poll_enabled: value.tracker_poll_enabled !== false,
+              spec: value.spec,
             },
           })
         }

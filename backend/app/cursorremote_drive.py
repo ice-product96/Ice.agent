@@ -10,6 +10,18 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+WORKER_TOOLS = frozenset({"create_session", "send_task", "get_task"})
+WORKER_TASK_STATUS_MAP = {
+    "succeeded": "idle",
+    "completed": "idle",
+    "success": "idle",
+    "waiting_approval": "waiting_approval",
+    "failed": "error",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
+    "running": "generating",
+}
+
 APPROVE_LABELS = (
     "allow",
     "accept",
@@ -340,6 +352,174 @@ async def mcp_call(session: Any, tool: str, arguments: dict[str, Any] | None = N
     return parse_mcp_payload(content)
 
 
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _omit_empty(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if value not in (None, "")}
+
+
+async def list_mcp_tool_names(session: Any) -> set[str]:
+    try:
+        result = await session.list_tools()
+        return {str(item.name) for item in list(getattr(result, "tools", None) or [])}
+    except Exception as exc:
+        logger.info("CursorRemote list_tools failed: %s", exc)
+        return set()
+
+
+def worker_tools_available(names: set[str] | None) -> bool:
+    return WORKER_TOOLS <= set(names or ())
+
+
+def cursor_worker_kwargs(item: Any | None, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    """IDs ice.agent should send to CursorRemote worker tools."""
+    kwargs: dict[str, Any] = {}
+    meta: dict[str, Any] = {}
+    if item is not None:
+        meta = item.metadata_json if isinstance(getattr(item, "metadata_json", None), dict) else {}
+        session_id = _first_text(meta.get("cursor_session_id"))
+        remote_task_id = _first_text(meta.get("cursor_remote_task_id"))
+        if session_id:
+            kwargs["session_id"] = session_id
+        if remote_task_id:
+            kwargs["remote_task_id"] = remote_task_id
+        task_id = _first_text(getattr(item, "id", None))
+        if task_id:
+            kwargs["task_id"] = task_id
+        chat_id = _first_text(getattr(item, "chat_id", None))
+        if chat_id:
+            kwargs["chat_id"] = chat_id
+        project_id = _first_text(getattr(item, "project_id", None))
+        if project_id:
+            kwargs["project_id"] = project_id
+    if not kwargs.get("chat_id") and isinstance(context, dict):
+        chat = _first_text(
+            context.get("chat_id"),
+            context.get("reply_chat_id"),
+            context.get("conversation_id"),
+        )
+        if chat:
+            kwargs["chat_id"] = chat
+    if not kwargs.get("project_id") and isinstance(context, dict):
+        project_id = _first_text(context.get("project_id"))
+        if project_id:
+            kwargs["project_id"] = project_id
+    if not kwargs.get("task_id") and isinstance(context, dict):
+        task_id = _first_text(context.get("work_item_id"), context.get("task_id"))
+        if task_id:
+            kwargs["task_id"] = task_id
+    return kwargs
+
+
+def remember_cursor_worker(item: Any | None, result: dict[str, Any] | None) -> None:
+    if item is None or not isinstance(result, dict):
+        return
+    meta = dict(getattr(item, "metadata_json", None) or {})
+    changed = False
+    for key in ("cursor_session_id", "cursor_remote_task_id", "cursor_composer_id"):
+        value = _first_text(result.get(key))
+        if value and meta.get(key) != value:
+            meta[key] = value
+            changed = True
+    if changed:
+        item.metadata_json = meta
+
+
+def _worker_task_dict(payload: Any) -> dict[str, Any]:
+    data = parse_mcp_payload(payload)
+    if isinstance(data, dict) and isinstance(data.get("task"), dict):
+        return data["task"]
+    return data if isinstance(data, dict) else {}
+
+
+def status_from_worker_task(payload: Any) -> dict[str, Any] | None:
+    data = parse_mcp_payload(payload)
+    if not isinstance(data, dict):
+        return None
+    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+    raw_status = _first_text(
+        data.get("agentStatus"),
+        task.get("status"),
+        data.get("status"),
+    ).lower()
+    mapped = WORKER_TASK_STATUS_MAP.get(raw_status, raw_status)
+    pending = int(data.get("pendingApprovalCount") or 0)
+    if data.get("needsInput"):
+        pending = max(pending, 1)
+        mapped = mapped or "waiting_approval"
+    live = bool(data.get("agentActivityLive"))
+    if data.get("done") is True and not data.get("needsInput"):
+        mapped = "idle"
+        live = False
+    return {
+        "agentStatus": mapped or "unknown",
+        "pendingApprovalCount": pending,
+        "agentActivityLive": live,
+        "done": bool(data.get("done")),
+        "needsInput": bool(data.get("needsInput") or pending),
+        "summary": data.get("summary") or task.get("summary") or "",
+        "result": data.get("result") or task.get("result") or "",
+        "task": task,
+        "connected": data.get("connected"),
+        "extractorStatus": data.get("extractorStatus"),
+        "hasQuestionnaire": data.get("hasQuestionnaire"),
+        "files": data.get("files") or [],
+    }
+
+
+async def _poll_cursor_status(
+    session: Any,
+    *,
+    remote_task_id: str | None = None,
+) -> Any:
+    if remote_task_id:
+        try:
+            payload = await mcp_call(
+                session,
+                "get_task",
+                {"taskId": remote_task_id, "task_id": remote_task_id},
+            )
+            mapped = status_from_worker_task(payload)
+            if mapped is not None:
+                return mapped
+        except Exception as exc:
+            logger.info("CursorRemote get_task failed: %s", exc)
+    return await mcp_call(session, "get_status")
+
+
+def _worker_ids_from_create(payload: Any) -> dict[str, str]:
+    data = parse_mcp_payload(payload)
+    session_blob = data.get("session") if isinstance(data, dict) else None
+    if not isinstance(session_blob, dict):
+        session_blob = data if isinstance(data, dict) else {}
+    return {
+        "cursor_session_id": _first_text(session_blob.get("id")),
+        "cursor_composer_id": _first_text(
+            session_blob.get("composerId"),
+            session_blob.get("composer_id"),
+        ),
+    }
+
+
+def _worker_ids_from_task(payload: Any, *, session_id: str = "") -> dict[str, str]:
+    task = _worker_task_dict(payload)
+    return {
+        "cursor_session_id": _first_text(
+            task.get("sessionId"),
+            task.get("session_id"),
+            session_id,
+        ),
+        "cursor_remote_task_id": _first_text(task.get("id")),
+        "cursor_composer_id": "",
+    }
+
+
 def _as_status_dict(status: Any) -> dict[str, Any] | None:
     data = parse_mcp_payload(status)
     if isinstance(data, list) and data:
@@ -568,18 +748,35 @@ async def click_pending_approvals(session: Any) -> list[dict[str, Any]]:
     return clicked
 
 
-async def _snapshot(session: Any) -> tuple[Any, Any, str]:
+async def _snapshot(
+    session: Any,
+    *,
+    remote_task_id: str | None = None,
+) -> tuple[Any, Any, str]:
     status: Any = None
     state: Any = None
+    worker_result = ""
+    worker_summary = ""
     try:
-        status = await mcp_call(session, "get_status")
+        status = await _poll_cursor_status(session, remote_task_id=remote_task_id)
     except Exception as exc:
         logger.info("CursorRemote get_status failed: %s", exc)
+    if isinstance(status, dict):
+        worker_result = str(status.get("result") or "").strip()
+        worker_summary = str(status.get("summary") or "").strip()
     try:
-        state = await mcp_call(session, "get_state", {"messageLimit": 8})
+        if remote_task_id:
+            state = await mcp_call(
+                session,
+                "get_messages",
+                {"taskId": remote_task_id, "task_id": remote_task_id, "messageLimit": 8},
+            )
+        else:
+            state = await mcp_call(session, "get_state", {"messageLimit": 8})
     except Exception as exc:
         logger.info("CursorRemote get_state failed: %s", exc)
-    return status, state, summarize_cursor_state(state)
+    summary = worker_result or summarize_cursor_state(state) or worker_summary
+    return status, state, summary
 
 
 def _result(
@@ -617,6 +814,7 @@ async def drive_until_done(
     require_busy: bool = True,
     baseline_summary: str = "",
     work_item_id: Any = None,
+    remote_task_id: str | None = None,
 ) -> dict[str, Any]:
     """Poll Cursor until it has actually worked and then gone idle.
 
@@ -639,9 +837,14 @@ async def drive_until_done(
     )
 
     while time.monotonic() < deadline:
+        if remote_task_id:
+            try:
+                await _poll_cursor_status(session, remote_task_id=remote_task_id)
+            except Exception:
+                pass
         approvals.extend(await click_pending_approvals(session))
         try:
-            last = await mcp_call(session, "get_status")
+            last = await _poll_cursor_status(session, remote_task_id=remote_task_id)
         except Exception as exc:
             last = {"error": str(exc)}
             await asyncio.sleep(2)
@@ -668,7 +871,18 @@ async def drive_until_done(
 
         if require_busy and not seen_busy:
             try:
-                peek_state = await mcp_call(session, "get_state", {"messageLimit": 8})
+                if remote_task_id:
+                    peek_state = await mcp_call(
+                        session,
+                        "get_messages",
+                        {
+                            "taskId": remote_task_id,
+                            "task_id": remote_task_id,
+                            "messageLimit": 8,
+                        },
+                    )
+                else:
+                    peek_state = await mcp_call(session, "get_state", {"messageLimit": 8})
             except Exception:
                 peek_state = None
             if cursor_has_active_work(peek_state):
@@ -678,7 +892,7 @@ async def drive_until_done(
             if (time.monotonic() - start) * 1000 < start_grace_ms:
                 await asyncio.sleep(2)
                 continue
-            status, state, summary = await _snapshot(session)
+            status, state, summary = await _snapshot(session, remote_task_id=remote_task_id)
             log_cursor_stage(
                 "wait_not_started",
                 work_item_id=work_item_id,
@@ -699,7 +913,7 @@ async def drive_until_done(
         if debounce_s:
             await asyncio.sleep(debounce_s)
         try:
-            confirm = await mcp_call(session, "get_status")
+            confirm = await _poll_cursor_status(session, remote_task_id=remote_task_id)
         except Exception:
             confirm = last
         if cursor_is_busy(confirm):
@@ -707,7 +921,7 @@ async def drive_until_done(
             last = confirm
             continue
 
-        status, state, summary = await _snapshot(session)
+        status, state, summary = await _snapshot(session, remote_task_id=remote_task_id)
         if cursor_is_busy(status):
             seen_busy = True
             last = status
@@ -749,7 +963,7 @@ async def drive_until_done(
             hint=None,
         )
 
-    status, state, summary = await _snapshot(session)
+    status, state, summary = await _snapshot(session, remote_task_id=remote_task_id)
     name = "working" if cursor_is_busy(status or last) else _status_name(status or last)
     if name in {"idle", "unknown"} and seen_busy:
         name = "timeout"
@@ -787,10 +1001,11 @@ async def peek_composer(
     session: Any,
     *,
     work_item_id: Any = None,
+    remote_task_id: str | None = None,
 ) -> dict[str, Any]:
     """Cheap get_status probe: do not wait, do not treat leftover idle as busy."""
     try:
-        status = await mcp_call(session, "get_status")
+        status = await _poll_cursor_status(session, remote_task_id=remote_task_id)
     except Exception as exc:
         log_cursor_stage("peek_failed", work_item_id=work_item_id, error=str(exc)[:500])
         return {"ok": False, "busy": False, "error": str(exc)[:500], "last": None}
@@ -807,6 +1022,7 @@ async def wait_for_prompt_to_land(
     baseline_summary: str = "",
     grace_ms: int = 12_000,
     work_item_id: Any = None,
+    remote_task_id: str | None = None,
 ) -> dict[str, Any]:
     """After send_prompt: confirm Composer actually took this assignment."""
     deadline = time.monotonic() + max(50, int(grace_ms)) / 1000
@@ -817,7 +1033,7 @@ async def wait_for_prompt_to_land(
     while True:
         ticks += 1
         try:
-            status, state, summary = await _snapshot(session)
+            status, state, summary = await _snapshot(session, remote_task_id=remote_task_id)
         except Exception as exc:
             log_cursor_stage(
                 "verify_failed",
@@ -867,6 +1083,213 @@ async def wait_for_prompt_to_land(
         await asyncio.sleep(min(1.5, remaining))
 
 
+async def _ensure_worker_session(
+    session: Any,
+    *,
+    session_id: str | None,
+    expected_workspace: str | None,
+    expected_window_id: str | None,
+    work_item_id: Any = None,
+) -> dict[str, str]:
+    sid = _first_text(session_id)
+    if sid:
+        return {"cursor_session_id": sid, "cursor_composer_id": ""}
+    created = await mcp_call(
+        session,
+        "create_session",
+        _omit_empty(
+            {
+                "workspaceId": expected_window_id,
+                "workspace_id": expected_window_id,
+                "workspacePath": expected_workspace,
+                "workspace_path": expected_workspace,
+            }
+        ),
+    )
+    ids = _worker_ids_from_create(created)
+    log_cursor_stage(
+        "create_session",
+        work_item_id=work_item_id,
+        session_id=ids.get("cursor_session_id"),
+        composer_id=ids.get("cursor_composer_id"),
+        mcp=str(created)[:400],
+    )
+    if not ids.get("cursor_session_id"):
+        raise RuntimeError(f"create_session did not return a session id: {created}")
+    return ids
+
+
+async def _send_worker_task(
+    session: Any,
+    prompt: str,
+    *,
+    timeout_ms: int,
+    work_item_id: Any,
+    expected_workspace: str | None,
+    expected_window_id: str | None,
+    task_id: str | None,
+    chat_id: str | None,
+    project_id: str | None,
+    session_id: str | None,
+    attachments: list[dict[str, Any]] | None,
+    delivery: dict[str, Any],
+    workspace_info: dict[str, Any],
+) -> dict[str, Any]:
+    ids = await _ensure_worker_session(
+        session,
+        session_id=session_id,
+        expected_workspace=expected_workspace,
+        expected_window_id=expected_window_id,
+        work_item_id=work_item_id,
+    )
+    sid = ids["cursor_session_id"]
+    send_payload = _omit_empty(
+        {
+            "sessionId": sid,
+            "session_id": sid,
+            "prompt": prompt,
+            "projectId": project_id,
+            "project_id": project_id,
+            "taskId": str(task_id or work_item_id or ""),
+            "task_id": str(task_id or work_item_id or ""),
+            "chatId": chat_id,
+            "chat_id": chat_id,
+        }
+    )
+    if attachments:
+        send_payload["attachments"] = attachments
+    log_cursor_stage(
+        "send_task",
+        work_item_id=work_item_id,
+        session_id=sid,
+        task_id=send_payload.get("task_id"),
+        chat_id=chat_id,
+        project_id=project_id,
+        prompt_chars=len(prompt),
+    )
+    try:
+        sent = await mcp_call(session, "send_task", send_payload)
+    except Exception as exc:
+        if session_id and "not found" in str(exc).lower():
+            ids = await _ensure_worker_session(
+                session,
+                session_id=None,
+                expected_workspace=expected_workspace,
+                expected_window_id=expected_window_id,
+                work_item_id=work_item_id,
+            )
+            sid = ids["cursor_session_id"]
+            send_payload["sessionId"] = sid
+            send_payload["session_id"] = sid
+            sent = await mcp_call(session, "send_task", send_payload)
+        else:
+            log_cursor_stage(
+                "send_task_failed",
+                work_item_id=work_item_id,
+                error=str(exc)[:800],
+            )
+            return {
+                "ok": False,
+                "done": False,
+                "sent": False,
+                "prompt_sent": False,
+                "started": False,
+                "seen_busy": False,
+                "status": "cursor_unavailable",
+                "reason": f"send_task failed: {exc}",
+                "summary": f"send_task failed: {exc}",
+                "next": CURSOR_UNAVAILABLE_HINT,
+                "workspace": workspace_info.get("workspace"),
+                "windows": workspace_info.get("windows") or [],
+            }
+    task_ids = _worker_ids_from_task(sent, session_id=sid)
+    remote_id = task_ids.get("cursor_remote_task_id") or ""
+    composer_id = ids.get("cursor_composer_id") or task_ids.get("cursor_composer_id") or ""
+    log_cursor_stage(
+        "send_task_ok",
+        work_item_id=work_item_id,
+        session_id=sid,
+        remote_task_id=remote_id,
+        mcp=str(sent)[:500],
+    )
+    landed = await wait_for_prompt_to_land(
+        session,
+        prompt=prompt,
+        grace_ms=min(12_000, max(int(timeout_ms), 50)),
+        work_item_id=work_item_id,
+        remote_task_id=remote_id or None,
+    )
+    if not landed.get("landed") and remote_id:
+        # send_task already created a running worker task — treat as delivered.
+        landed = {**landed, "landed": True, "busy": True}
+    if not landed.get("landed"):
+        reason = (
+            "send_task returned, but Composer did not start this assignment."
+        )
+        return {
+            "ok": False,
+            "done": False,
+            "sent": sent,
+            "prompt_sent": False,
+            "started": False,
+            "seen_busy": False,
+            "status": "not_started",
+            "reason": reason,
+            "summary": landed.get("summary") or "",
+            "next": NOT_STARTED_HINT,
+            "workspace": workspace_info.get("workspace"),
+            "windows": workspace_info.get("windows") or [],
+            "last": landed.get("status"),
+            "cursor_session_id": sid,
+            "cursor_remote_task_id": remote_id,
+            "cursor_composer_id": composer_id,
+            "file_delivery": {
+                "method": delivery.get("method"),
+                "paths": delivery.get("paths") or [],
+            },
+        }
+    driven = await drive_until_done(
+        session,
+        timeout_ms=timeout_ms,
+        require_busy=True,
+        work_item_id=work_item_id,
+        remote_task_id=remote_id or None,
+    )
+    result = {
+        **driven,
+        "sent": sent,
+        "prompt_sent": True,
+        "started": True,
+        "seen_busy": bool(driven.get("seen_busy") or landed.get("busy")),
+        "prompt_visible": bool(landed.get("visible")),
+        "cursor_session_id": sid,
+        "cursor_remote_task_id": remote_id,
+        "cursor_composer_id": composer_id,
+        "task_id": str(task_id or work_item_id or ""),
+        "chat_id": chat_id,
+        "file_delivery": {
+            "method": delivery.get("method"),
+            "paths": delivery.get("paths") or [],
+        },
+    }
+    if str(result.get("status") or "") == "not_started":
+        result["status"] = "working" if result.get("seen_busy") else "awaiting_result"
+        result["ok"] = True
+        result["done"] = False
+    if delivery.get("paths"):
+        result["images"] = delivery["paths"]
+    log_cursor_stage(
+        "waiting" if not result.get("done") else "finished",
+        work_item_id=work_item_id,
+        status=result.get("status"),
+        done=bool(result.get("done")),
+        session_id=sid,
+        remote_task_id=remote_id,
+        summary_chars=len(str(result.get("summary") or "")),
+    )
+    return result
+
+
 async def send_prompt_and_drive(
     session: Any,
     text: str,
@@ -878,6 +1301,11 @@ async def send_prompt_and_drive(
     secret_key: str = "",
     expected_workspace: str | None = None,
     expected_window_id: str | None = None,
+    task_id: str | None = None,
+    chat_id: str | None = None,
+    project_id: str | None = None,
+    session_id: str | None = None,
+    remote_task_id: str | None = None,
 ) -> dict[str, Any]:
     log_cursor_stage(
         "send_begin",
@@ -885,6 +1313,10 @@ async def send_prompt_and_drive(
         prompt_chars=len(text or ""),
         expected_workspace=expected_workspace,
         expected_window_id=expected_window_id,
+        task_id=task_id,
+        chat_id=chat_id,
+        session_id=session_id,
+        remote_task_id=remote_task_id,
     )
     ensure = await ensure_cursor_workspace(
         session,
@@ -916,6 +1348,8 @@ async def send_prompt_and_drive(
             "windows": ensure.get("windows") or [],
             "last": ensure.get("last"),
         }
+    tool_names = await list_mcp_tool_names(session)
+    use_worker = worker_tools_available(tool_names)
     try:
         current = await mcp_call(session, "get_status")
     except Exception as exc:
@@ -926,8 +1360,8 @@ async def send_prompt_and_drive(
             error=str(exc)[:500],
         )
     before = status_snapshot(current)
-    log_cursor_stage("status_before", work_item_id=work_item_id, **before)
-    if cursor_is_explicitly_busy(current):
+    log_cursor_stage("status_before", work_item_id=work_item_id, use_worker=use_worker, **before)
+    if not use_worker and cursor_is_explicitly_busy(current):
         log_cursor_stage(
             "skip_busy",
             work_item_id=work_item_id,
@@ -977,6 +1411,22 @@ async def send_prompt_and_drive(
     inline_attachments = delivery.get("send_prompt_attachments") or []
     if inline_attachments:
         send_payload["attachments"] = inline_attachments
+    if use_worker:
+        return await _send_worker_task(
+            session,
+            prompt,
+            timeout_ms=timeout_ms,
+            work_item_id=work_item_id,
+            expected_workspace=expected_workspace,
+            expected_window_id=expected_window_id,
+            task_id=task_id,
+            chat_id=chat_id,
+            project_id=project_id,
+            session_id=session_id,
+            attachments=inline_attachments,
+            delivery=delivery,
+            workspace_info=ensure,
+        )
     try:
         _, _, baseline_summary = await _snapshot(session)
     except Exception as exc:
@@ -1131,9 +1581,20 @@ async def check_and_drive(
     idle_debounce_ms: int = 3_000,
     baseline_summary: str = "",
     work_item_id: Any = None,
+    remote_task_id: str | None = None,
+    session_id: str | None = None,
+    task_id: str | None = None,
+    chat_id: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Poll an already-running Cursor job. Idle without prior activity is a real finish here."""
-    log_cursor_stage("poll_begin", work_item_id=work_item_id, timeout_ms=timeout_ms)
+    del session_id, task_id, chat_id, project_id
+    log_cursor_stage(
+        "poll_begin",
+        work_item_id=work_item_id,
+        timeout_ms=timeout_ms,
+        remote_task_id=remote_task_id,
+    )
     result = await drive_until_done(
         session,
         timeout_ms=timeout_ms,
@@ -1142,7 +1603,10 @@ async def check_and_drive(
         idle_debounce_ms=idle_debounce_ms,
         baseline_summary=baseline_summary,
         work_item_id=work_item_id,
+        remote_task_id=remote_task_id,
     )
+    if remote_task_id:
+        result["cursor_remote_task_id"] = remote_task_id
     if baseline_summary:
         result["baseline_summary"] = baseline_summary
     log_cursor_stage(

@@ -386,8 +386,10 @@ def build_tracker_poll_instruction(backlog: dict[str, Any]) -> str:
         "в context_json обязательно tracker_task_id + tracker_project_id) → "
         "pm_estimate_task (оценка внутренняя) → смотри ask_customer_about_cost: "
         "если false — сразу submit_development_task, не пиши заказчику про оплату; "
-        "если true — согласуй сумму, затем submit.",
-        "Карточка на доске уже есть запрос заказчика: не проси подтвердить старт. "
+        "если true — согласуй сумму, затем submit. "
+        "Сначала pm_get_spec / pm_assess_execution: широкая карточка — обсудить ТЗ, "
+        "не submit. Мелкий bug внутри confirmed in_scope — без «можно начинать?». "
+        "Карточка на доске — запрос посмотреть работу, не разрешение строить продукт. "
         "Не дублируй задачи, которые уже в already_tracked. Не пиши заказчику про "
         "сам факт проверки трекера. Карточку двигает платформа по фазе PM; "
         "не вызывай move_task/complete_task вручную.",

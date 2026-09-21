@@ -48,6 +48,12 @@ CURSORREMOTE_OPERATIONAL_PERMISSIONS = {
     "mcp_cursorremote_tools",
     "mcp_cursorremote_run",
     "mcp_cursorremote_send_prompt",
+    "mcp_cursorremote_send_task",
+    "mcp_cursorremote_create_session",
+    "mcp_cursorremote_get_task",
+    "mcp_cursorremote_list_workspaces",
+    "mcp_cursorremote_get_messages",
+    "mcp_cursorremote_cancel",
     "mcp_cursorremote_approve",
     "mcp_cursorremote_reject",
     "mcp_cursorremote_approve_all",
@@ -117,20 +123,33 @@ class ToolPolicy:
         "change_permissions", "schedule_self", "sip_dial", "sip_hangup",
         "request_approval", "self_configure",
         # CursorRemote MCP mutating tools (matched as substrings of mcp_cursorremote_*)
-        "cursorremote_send_prompt", "cursorremote_approve", "cursorremote_reject",
+        "cursorremote_send_prompt", "cursorremote_send_task", "cursorremote_create_session",
+        "cursorremote_cancel",
+        "cursorremote_approve", "cursorremote_reject",
         "cursorremote_approve_all", "cursorremote_click_action", "cursorremote_new_chat",
         "cursorremote_switch_tab", "cursorremote_switch_window",
         "cursorremote_set_mode", "cursorremote_set_model", "cursorremote_set_plan_model",
     }
 
+    def _matches_dangerous(self, normalized: str) -> bool:
+        for part in self.dangerous_names:
+            if (
+                part == "exec"
+                and "execution" in normalized
+                and "exec" not in normalized.replace("execution", "")
+            ):
+                continue
+            if part in normalized:
+                return True
+        return False
+
     def is_dangerous(self, tool_name: str) -> bool:
-        normalized = tool_name.lower()
-        return any(part in normalized for part in self.dangerous_names)
+        return self._matches_dangerous(tool_name.lower())
 
     def check(self, tool_name: str, arguments: dict[str, Any], allowed: set[str] | None = None) -> None:
         effective = effective_tool_name(tool_name, arguments)
         normalized = effective.lower()
-        dangerous = any(part in normalized for part in self.dangerous_names)
+        dangerous = self._matches_dangerous(normalized)
         if dangerous and (allowed is None or effective not in allowed):
             raise DangerousActionError(f"Tool '{effective}' requires explicit permission")
         if any(key in arguments for key in ("password", "secret", "token")) and "use_secrets" not in (allowed or set()):

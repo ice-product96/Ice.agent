@@ -8,7 +8,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.db import Agent, Base, CursorRun, DecisionRecord, WorkItem, WorkItemEvent
 from app.pm_state import (
     InvalidPhaseTransition,
+    apply_spec_update,
+    assess_execution,
     autonomy_gate,
+    confirm_project_spec,
     development_is_client_confirmed,
     get_or_create_cursor_run,
     get_or_create_project_state,
@@ -18,12 +21,14 @@ from app.pm_state import (
     is_task_ready,
     item_has_client_confirmation,
     parse_cursor_result,
+    read_project_spec,
     readiness_issues,
     record_decision,
     record_scope_change,
     render_task_brief,
     stamp_autonomy_flags,
     submission_requires_approval,
+    topic_is_spec_approval,
     transition_pm_phase,
     work_item_is_tracker_sourced,
 )
@@ -134,7 +139,7 @@ def test_project_autonomy_submission_rules() -> None:
     assert submission_requires_approval("LEVEL_3", high_risk=True, **common)
 
 
-def test_tracker_bug_is_in_scope_small_fix_without_llm_flags() -> None:
+def test_tracker_bug_is_not_auto_in_scope_without_execute_verdict() -> None:
     item = WorkItem(
         agent_id=1,
         task_type="bug",
@@ -146,11 +151,27 @@ def test_tracker_bug_is_in_scope_small_fix_without_llm_flags() -> None:
         metadata_json={},
     )
     assert work_item_is_tracker_sourced(item) is True
-    assert infer_inside_agreed_scope(item, client_confirmed=False) is True
+    assert infer_inside_agreed_scope(item, client_confirmed=False) is False
     assert infer_small_fix(item) is True
     stamp_autonomy_flags(item)
-    assert item.context_json["inside_agreed_scope"] is True
+    assert item.context_json["inside_agreed_scope"] is False
     assert item.context_json["small_fix"] is True
+
+
+def test_tracker_bug_with_execute_verdict_is_in_scope() -> None:
+    item = WorkItem(
+        agent_id=1,
+        task_type="bug",
+        context_json={
+            "tracker_task_id": "3a44b9e7-65ab-4263-a4fb-3ca6a65e3e96",
+            "estimated_duration_minutes": 30,
+            "execution": {"verdict": "execute"},
+        },
+        metadata_json={},
+    )
+    assert infer_inside_agreed_scope(item, client_confirmed=False) is True
+    stamp_autonomy_flags(item)
+    assert item.context_json["inside_agreed_scope"] is True
     assert not submission_requires_approval(
         "LEVEL_1",
         task_type="bug",
@@ -158,6 +179,72 @@ def test_tracker_bug_is_in_scope_small_fix_without_llm_flags() -> None:
         inside_agreed_scope=True,
         small_fix=True,
     )
+
+
+def test_broad_product_request_drafts_spec() -> None:
+    item = WorkItem(
+        agent_id=1,
+        title="Построить AI систему для работы на Ozon",
+        goal="Построить AI систему для работы на Ozon",
+        task_type="feature",
+        requirements=["Сделать AI для селлера"],
+        acceptance_criteria=["Система работает"],
+        context_json={},
+    )
+    verdict = assess_execution(item, {"status": "missing"})
+    assert verdict["verdict"] in {"draft_spec", "discuss"}
+    assert any("spec" in reason.lower() or "product" in reason.lower() for reason in verdict["reasons"])
+
+
+def test_bug_inside_confirmed_scope_executes() -> None:
+    item = WorkItem(
+        agent_id=1,
+        title="Кнопка логина не нажимается",
+        goal="Починить кнопку входа",
+        task_type="bug",
+        requirements=["Кнопка логина открывает форму входа"],
+        acceptance_criteria=["Когда пользователь нажимает Войти, форма открывается"],
+        priority="normal",
+        context_json={"estimated_duration_minutes": 40},
+    )
+    spec = {
+        "status": "confirmed",
+        "summary": "Кабинет селлера",
+        "in_scope": ["логин", "кабинет", "вход"],
+        "out_of_scope": ["маркетплейс Ozon"],
+        "modules": ["auth"],
+        "version": 1,
+    }
+    verdict = assess_execution(item, spec)
+    assert verdict["verdict"] == "execute"
+
+
+def test_topic_is_spec_approval() -> None:
+    assert topic_is_spec_approval("тз")
+    assert topic_is_spec_approval("spec")
+    assert topic_is_spec_approval("tz")
+    assert not topic_is_spec_approval("стоимость")
+
+
+@pytest.mark.asyncio
+async def test_spec_module_change_resets_confirmed_to_draft(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "spec-draft.db")
+    async with sessions() as db:
+        state = await get_or_create_project_state(db, "ozon-ai")
+        apply_spec_update(
+            state,
+            {
+                "summary": "AI for Ozon seller",
+                "in_scope": ["карточки"],
+                "modules": ["listings"],
+            },
+        )
+        confirm_project_spec(state, confirmed_by="заказчик")
+        assert read_project_spec(state)["status"] == "confirmed"
+        updated = apply_spec_update(state, {"modules": ["listings", "pricing"]})
+        assert updated["status"] == "draft"
+        assert updated["confirmed_at"] in (None, "")
+    await engine.dispose()
 
 
 def test_feature_without_scope_still_needs_confirmation() -> None:

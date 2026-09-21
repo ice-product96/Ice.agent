@@ -1217,7 +1217,7 @@ class McpManager:
             if getattr(response, "isError", False):
                 detail = "; ".join(str(item.get("text") or item) for item in content)
                 raise RuntimeError(detail or f"MCP tool {tool_name} failed")
-            if "cursorremote" in server_name.lower() and tool_name == "send_prompt":
+            if "cursorremote" in server_name.lower() and tool_name in {"send_prompt", "send_task"}:
                 from .cursorremote_drive import FOLLOW_UP_HINT, click_pending_approvals, parse_mcp_payload
 
                 approvals: list[dict[str, Any]] = []

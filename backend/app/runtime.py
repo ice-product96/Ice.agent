@@ -529,7 +529,7 @@ async def _apply_pm_cursor_result(
                 "IN_DEVELOPMENT",
                 detail="Cursor job in progress",
             )
-        await stamp_cursor_prompt_sent(db, item)
+        await stamp_cursor_prompt_sent(db, item, result)
         await db.commit()
         return {
             "task_id": str(item.id),
@@ -704,7 +704,7 @@ async def _poll_pm_cursor_item(
     cursor_session: Any,
 ) -> dict[str, Any]:
     """Poll or reattach a PM Cursor run without invoking the agent LLM."""
-    from .cursorremote_drive import check_and_drive
+    from .cursorremote_drive import check_and_drive, cursor_worker_kwargs
     from .pm_state import (
         get_or_create_cursor_run,
         transition_pm_phase,
@@ -730,7 +730,11 @@ async def _poll_pm_cursor_item(
                     "Call pm_accept_task if still in QA; do not start a new Cursor run."
                 ),
             }
-        live = await check_and_drive(cursor_session, work_item_id=item.id)
+        live = await check_and_drive(
+            cursor_session,
+            work_item_id=item.id,
+            **cursor_worker_kwargs(item),
+        )
         if live.get("done") or live.get("seen_busy") or live.get("started"):
             attempt = int(
                 await db.scalar(
@@ -792,6 +796,7 @@ async def _poll_pm_cursor_item(
                 (run.result_json or {}).get("baseline_summary") or ""
             ),
             work_item_id=item.id,
+            **cursor_worker_kwargs(item),
         ),
     )
 
@@ -1464,16 +1469,24 @@ class AgentRuntime:
             from .db import Consultation, CursorRun, DecisionRecord, WorkItem
             from .pm_state import (
                 TaskContract,
+                apply_execution_assessment,
+                apply_spec_update,
                 apply_task_contract,
                 can_transition,
+                confirm_project_spec,
+                execution_gate_error,
                 get_or_create_project_state,
                 is_client_confirmer,
                 is_task_ready,
                 item_has_client_confirmation,
+                read_project_spec,
                 readiness_issues,
                 record_decision,
                 record_scope_change,
+                requirements_expand_spec,
+                revert_spec_to_draft,
                 stamp_autonomy_flags,
+                topic_is_spec_approval,
                 transition_pm_phase,
             )
             from .work_items import (
@@ -1768,6 +1781,8 @@ class AgentRuntime:
                         ),
                         "task": work_item_json(item),
                     }
+                previous_requirements = list(item.requirements or [])
+                previous_phase = item.pm_phase
                 apply_task_contract(item, contract)
                 project_state = await get_or_create_project_state(db, contract.project_id)
                 from .employee import get_or_create_profile
@@ -1793,6 +1808,21 @@ class AgentRuntime:
                         ),
                         currency=str(commerce_settings["currency"]),
                     )
+                spec = read_project_spec(project_state)
+                if previous_phase in {
+                    "CLIENT_CONFIRMED",
+                    "READY_FOR_DEV",
+                    "REQUIREMENTS_READY",
+                } and requirements_expand_spec(item, spec, previous_requirements):
+                    spec = revert_spec_to_draft(project_state)
+                    ctx = dict(item.context_json or {})
+                    ctx.pop("execution", None)
+                    item.context_json = ctx
+                verdict = apply_execution_assessment(
+                    item,
+                    spec,
+                    project_state=project_state,
+                )
                 stamp_autonomy_flags(item)
                 await add_event(
                     db,
@@ -1803,7 +1833,10 @@ class AgentRuntime:
                     f"{len(contract.acceptance_criteria)} acceptance criteria",
                     payload={"source_message_id": source_message_id},
                 )
-                target = "REQUIREMENTS_READY" if is_task_ready(item) else "CLARIFICATION"
+                if verdict.get("verdict") != "execute":
+                    target = "CLARIFICATION"
+                else:
+                    target = "REQUIREMENTS_READY" if is_task_ready(item) else "CLARIFICATION"
                 if item.pm_phase != target:
                     if not can_transition(item.pm_phase, target) and item.pm_phase not in {
                         "DISCUSSION",
@@ -1840,7 +1873,18 @@ class AgentRuntime:
                     commerce_settings["cost_requires_customer_approval"]
                 )
                 next_step = cost_gate["next"]
-                if not is_task_ready(item):
+                if verdict.get("verdict") != "execute":
+                    questions = " ".join(verdict.get("questions") or [])
+                    next_step = (
+                        "Do not call submit_development_task. "
+                        + (
+                            "Draft and agree the project spec with the customer. "
+                            if verdict.get("verdict") == "draft_spec"
+                            else "Discuss the slice and spec with the customer. "
+                        )
+                        + questions
+                    )
+                elif not is_task_ready(item):
                     next_step = (
                         "Ask only the missing requirements. Do not start Cursor "
                         "and do not discuss price."
@@ -1850,6 +1894,8 @@ class AgentRuntime:
                     "duplicate": item.source_message_id == source_message_id
                     and item.id != (context or {}).get("work_item_id"),
                     "task": work_item_json(item),
+                    "execution": dict(verdict),
+                    "spec": read_project_spec(project_state),
                     **cost_gate,
                     "next": next_step,
                 }
@@ -1880,6 +1926,11 @@ class AgentRuntime:
                 ).all()
                 return {
                     "task": work_item_json(item, events=events),
+                    "spec": read_project_spec(
+                        await get_or_create_project_state(
+                            db, item.project_id or f"agent-{agent.id}"
+                        )
+                    ),
                     "decisions": [
                         {
                             "id": row.id,
@@ -1970,8 +2021,53 @@ class AgentRuntime:
                         detail=decision or topic,
                         payload={"decision_id": row.id},
                     )
+                spec_payload: dict[str, Any] | None = None
+                if topic_is_spec_approval(topic, decision) and is_client_confirmer(
+                    confirmed_by,
+                    source_message_id=row.source_message_id,
+                ):
+                    project = await get_or_create_project_state(db, project_id)
+                    spec_payload = confirm_project_spec(
+                        project, confirmed_by=confirmed_by or "customer"
+                    )
+                    verdict = apply_execution_assessment(
+                        target_item,
+                        spec_payload,
+                        project_state=project,
+                        draft_if_missing=False,
+                    )
+                    stamp_autonomy_flags(
+                        target_item,
+                        client_confirmed=True,
+                    )
+                    await add_event(
+                        db,
+                        target_item,
+                        kind="spec",
+                        title="ТЗ проекта согласовано",
+                        detail=decision or topic,
+                        payload={
+                            "decision_id": row.id,
+                            "spec_version": spec_payload.get("version"),
+                        },
+                    )
+                    if (
+                        verdict.get("verdict") == "execute"
+                        and is_task_ready(target_item)
+                        and target_item.pm_phase == "CLARIFICATION"
+                    ):
+                        await transition_pm_phase(
+                            db,
+                            target_item,
+                            "REQUIREMENTS_READY",
+                            detail="Spec confirmed; task slice is ready",
+                            payload={"decision_id": row.id},
+                        )
                 await db.commit()
-                return {"ok": True, "decision_id": row.id, "task": work_item_json(target_item)}
+                result = {"ok": True, "decision_id": row.id, "task": work_item_json(target_item)}
+                if spec_payload is not None:
+                    result["spec"] = spec_payload
+                return result
 
             async def pm_transition_task(
                 to_phase: str,
@@ -1988,6 +2084,19 @@ class AgentRuntime:
                     raise ValueError(
                         f"{to_phase} is controlled by the development/QA adapter"
                     )
+                if to_phase in {"CLIENT_CONFIRMED", "READY_FOR_DEV"}:
+                    project = await get_or_create_project_state(
+                        db, item.project_id or f"agent-{agent.id}"
+                    )
+                    verdict = apply_execution_assessment(
+                        item,
+                        read_project_spec(project),
+                        project_state=project,
+                        draft_if_missing=False,
+                    )
+                    stamp_autonomy_flags(item)
+                    if verdict.get("verdict") != "execute":
+                        raise PermissionError(execution_gate_error(verdict))
                 transition_payload: dict[str, Any] = {}
                 if to_phase == "CLIENT_CONFIRMED":
                     internal_sources = {
@@ -2158,6 +2267,12 @@ class AgentRuntime:
                 from .pm_state import stamp_autonomy_flags
                 from .project_schedule import cost_approval_instruction
 
+                verdict = apply_execution_assessment(
+                    item,
+                    read_project_spec(project),
+                    project_state=project,
+                    draft_if_missing=False,
+                )
                 stamp_autonomy_flags(item)
                 cost_gate = cost_approval_instruction(
                     settings["cost_requires_customer_approval"]
@@ -2166,8 +2281,145 @@ class AgentRuntime:
                 return {
                     "ok": True,
                     "commerce": snap,
+                    "execution": dict(verdict),
                     **cost_gate,
                     "task": work_item_json(item),
+                }
+
+            async def pm_get_spec(project_id: str = "") -> dict[str, Any]:
+                """Read the project technical spec (ТЗ) stored on ProjectState.config.spec."""
+                item = await get_work_item(db, (context or {}).get("work_item_id"))
+                if item is None or item.agent_id != agent.id:
+                    raise ValueError("PM task not found")
+                pid = str(project_id or item.project_id or "").strip()
+                if not pid:
+                    raise ValueError("project_id is required")
+                if str(item.project_id or "") != pid:
+                    raise PermissionError(
+                        "Spec must be read for this agent's current project"
+                    )
+                state = await get_or_create_project_state(db, pid)
+                return {"ok": True, "project_id": pid, "spec": read_project_spec(state)}
+
+            async def pm_update_spec(
+                project_id: str = "",
+                summary: str | None = None,
+                goals: list[str] | None = None,
+                in_scope: list[str] | None = None,
+                out_of_scope: list[str] | None = None,
+                constraints: list[str] | None = None,
+                modules: list[str] | None = None,
+            ) -> dict[str, Any]:
+                """Create or edit the project spec draft. Scope changes require a new tz confirmation."""
+                item = await get_work_item(db, (context or {}).get("work_item_id"))
+                if item is None or item.agent_id != agent.id:
+                    raise ValueError("PM task not found")
+                pid = str(project_id or item.project_id or "").strip()
+                if not pid:
+                    raise ValueError("project_id is required")
+                if str(item.project_id or "") != pid:
+                    raise PermissionError(
+                        "Spec must be updated for this agent's current project"
+                    )
+                state = await get_or_create_project_state(db, pid)
+                patch: dict[str, Any] = {}
+                if summary is not None:
+                    patch["summary"] = summary
+                if goals is not None:
+                    patch["goals"] = goals
+                if in_scope is not None:
+                    patch["in_scope"] = in_scope
+                if out_of_scope is not None:
+                    patch["out_of_scope"] = out_of_scope
+                if constraints is not None:
+                    patch["constraints"] = constraints
+                if modules is not None:
+                    patch["modules"] = modules
+                spec = apply_spec_update(state, patch)
+                verdict = apply_execution_assessment(
+                    item, spec, project_state=state, draft_if_missing=False
+                )
+                stamp_autonomy_flags(item)
+                if verdict.get("verdict") != "execute" and item.pm_phase in {
+                    "REQUIREMENTS_READY",
+                    "CLIENT_CONFIRMED",
+                    "READY_FOR_DEV",
+                }:
+                    if item.pm_phase in {"CLIENT_CONFIRMED", "REQUIREMENTS_READY"}:
+                        if can_transition(item.pm_phase, "CHANGES_REQUESTED"):
+                            await transition_pm_phase(
+                                db,
+                                item,
+                                "CHANGES_REQUESTED",
+                                detail="Spec changed; execution blocked until re-confirmed",
+                            )
+                    if can_transition(item.pm_phase, "CLARIFICATION"):
+                        await transition_pm_phase(
+                            db,
+                            item,
+                            "CLARIFICATION",
+                            detail="Spec draft requires customer confirmation",
+                        )
+                await add_event(
+                    db,
+                    item,
+                    kind="spec",
+                    title="ТЗ проекта обновлено",
+                    detail=spec.get("summary") or f"status={spec.get('status')}",
+                    payload={"spec_version": spec.get("version"), "status": spec.get("status")},
+                )
+                await db.commit()
+                return {
+                    "ok": True,
+                    "spec": spec,
+                    "execution": dict(verdict),
+                    "task": work_item_json(item),
+                    "next": (
+                        "Agree the spec with the customer, then pm_record_decision "
+                        "with topic тз/spec/tz."
+                        if spec.get("status") != "confirmed"
+                        else "Spec is current. Re-assess before Cursor."
+                    ),
+                }
+
+            async def pm_assess_execution(work_item_id: int = 0) -> dict[str, Any]:
+                """Decide execute vs discuss vs draft_spec. Required before submit_development_task."""
+                item = await get_work_item(
+                    db, work_item_id or (context or {}).get("work_item_id")
+                )
+                if item is None or item.agent_id != agent.id:
+                    raise ValueError("PM task not found")
+                project = await get_or_create_project_state(
+                    db, item.project_id or f"agent-{agent.id}"
+                )
+                verdict = apply_execution_assessment(
+                    item, read_project_spec(project), project_state=project
+                )
+                stamp_autonomy_flags(item)
+                if verdict.get("verdict") != "execute" and item.pm_phase in {
+                    "REQUIREMENTS_READY",
+                    "READY_FOR_DEV",
+                }:
+                    if can_transition(item.pm_phase, "CLARIFICATION"):
+                        await transition_pm_phase(
+                            db,
+                            item,
+                            "CLARIFICATION",
+                            detail="Execution verdict is not execute",
+                        )
+                await db.commit()
+                next_step = (
+                    "Call submit_development_task."
+                    if verdict.get("verdict") == "execute"
+                    else "Do not call submit_development_task. "
+                    + " ".join(verdict.get("questions") or [])
+                )
+                return {
+                    "ok": True,
+                    "execution": dict(verdict),
+                    "spec": read_project_spec(project),
+                    "task": work_item_json(item),
+                    "next": next_step,
                 }
 
             registry.register(
@@ -2176,6 +2428,17 @@ class AgentRuntime:
                 "Estimate task duration in minutes; computes cost from project hourly_rate.",
             )
             registry.register(pm_get_task, "pm_get_task")
+            registry.register(pm_get_spec, "pm_get_spec", "Read the project technical spec (ТЗ).")
+            registry.register(
+                pm_update_spec,
+                "pm_update_spec",
+                "Create or edit the project spec draft. Confirm with pm_record_decision topic тз/spec/tz.",
+            )
+            registry.register(
+                pm_assess_execution,
+                "pm_assess_execution",
+                "Decide execute vs discuss vs draft_spec. Call before submit_development_task.",
+            )
             registry.register(pm_record_decision, "pm_record_decision")
             registry.register(pm_transition_task, "pm_transition_task")
 
@@ -2265,6 +2528,7 @@ class AgentRuntime:
                 from .cursorremote_drive import (
                     CURSOR_CHECK_ONLY_MESSAGE,
                     check_and_drive,
+                    cursor_worker_kwargs,
                     log_cursor_stage,
                     peek_composer,
                     prompt_actually_started,
@@ -2412,6 +2676,7 @@ class AgentRuntime:
                                 or ""
                             ),
                             work_item_id=item.id if item is not None else None,
+                            **cursor_worker_kwargs(item, context),
                         )
                         result = {
                             **result,
@@ -2438,6 +2703,7 @@ class AgentRuntime:
                         secret_key=self.settings.secret_key.get_secret_value(),
                         expected_workspace=expected_ws,
                         expected_window_id=expected_window,
+                        **cursor_worker_kwargs(item, context),
                     )
                     if item is not None and not prompt_actually_started(result):
                         return await _rollback_unstarted_cursor(
@@ -2452,7 +2718,7 @@ class AgentRuntime:
                         cursor_state["prompt_sent"] = True
                         from .work_items import stamp_cursor_prompt_sent
 
-                        await stamp_cursor_prompt_sent(db, item)
+                        await stamp_cursor_prompt_sent(db, item, result)
                     if result.get("done"):
                         cursor_state["finished"] = True
                     return result
@@ -2473,6 +2739,7 @@ class AgentRuntime:
                             else ""
                         ),
                         work_item_id=item.id if item is not None else None,
+                        **cursor_worker_kwargs(item, context),
                     )
                     if result.get("done"):
                         cursor_state["finished"] = True
@@ -2481,10 +2748,13 @@ class AgentRuntime:
                 if (context or {}).get("_pm_mode") and db is not None:
                     from .db import CursorRun
                     from .pm_state import (
+                        apply_execution_assessment,
+                        execution_gate_error,
                         get_or_create_cursor_run,
                         get_or_create_project_state,
                         is_task_ready,
                         item_has_client_confirmation,
+                        read_project_spec,
                         render_task_brief,
                         stamp_autonomy_flags,
                         submission_requires_approval,
@@ -2517,6 +2787,14 @@ class AgentRuntime:
                         project = await get_or_create_project_state(
                             db, item.project_id or f"agent-{agent.id}"
                         )
+                        verdict = apply_execution_assessment(
+                            item,
+                            read_project_spec(project),
+                            project_state=project,
+                            draft_if_missing=False,
+                        )
+                        if verdict.get("verdict") != "execute":
+                            raise PermissionError(execution_gate_error(verdict))
                         from .employee import get_or_create_profile
                         from .project_schedule import (
                             is_within_project_workday,
@@ -2682,7 +2960,9 @@ class AgentRuntime:
                             )
                         try:
                             peek = await peek_composer(
-                                cursor_session, work_item_id=item.id
+                                cursor_session,
+                                work_item_id=item.id,
+                                remote_task_id=cursor_worker_kwargs(item).get("remote_task_id"),
                             )
                         except Exception as exc:
                             peek = {
@@ -2823,6 +3103,7 @@ class AgentRuntime:
                                 secret_key=self.settings.secret_key.get_secret_value(),
                                 expected_workspace=expected_ws,
                                 expected_window_id=expected_window,
+                                **cursor_worker_kwargs(item, context),
                             )
                         except Exception as exc:
                             log_cursor_stage(
@@ -3516,7 +3797,7 @@ class AgentRuntime:
                 if context["_pm_mode"]:
                     result = await _poll_pm_cursor_item(db, item, cursor_session)
                 else:
-                    from .cursorremote_drive import check_and_drive
+                    from .cursorremote_drive import check_and_drive, cursor_worker_kwargs
 
                     result = await check_and_drive(
                         cursor_session,
@@ -3527,6 +3808,7 @@ class AgentRuntime:
                             or ""
                         ),
                         work_item_id=item.id,
+                        **cursor_worker_kwargs(item, context),
                     )
                     audit = [
                         {
