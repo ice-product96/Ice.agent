@@ -53,6 +53,7 @@ from .work_items import (
     get_work_item,
     list_open_work_items,
     mark_intake_executing,
+    release_pm_intake,
     sync_cursor_work_items,
     should_collect_customer_intake,
     watchdog_items,
@@ -1300,6 +1301,24 @@ class AgentRuntime:
                 context["project_id"] = normalized_project
                 if customer_id.strip():
                     context["customer_id"] = customer_id.strip()
+                from .customers import ensure_work_item_project
+                from .work_items import get_work_item
+
+                bound = await get_work_item(db, context.get("work_item_id"))
+                if bound is not None and bound.agent_id == agent.id:
+                    await ensure_work_item_project(
+                        db,
+                        agent,
+                        bound,
+                        project_id=normalized_project,
+                        context=context,
+                    )
+                    if bound.project_id:
+                        state.project_id = bound.project_id
+                        context["project_id"] = bound.project_id
+                    if bound.customer_id:
+                        state.customer_id = bound.customer_id
+                        context["customer_id"] = bound.customer_id
                 context["_memory_scope"] = resolve_memory_scope(context, agent, state=state)
                 return {
                     "ok": True,
@@ -1489,13 +1508,22 @@ class AgentRuntime:
                 topic_is_spec_approval,
                 transition_pm_phase,
             )
+            from .customers import ensure_work_item_project
             from .work_items import (
                 add_event,
                 create_work_item,
                 get_work_item,
                 list_events,
+                release_pm_intake,
                 work_item_json,
             )
+
+            async def _disarm_pm_intake(target: WorkItem | None) -> None:
+                await release_pm_intake(
+                    db,
+                    target,
+                    getattr(self.employee, "scheduler", None),
+                )
 
             async def pm_structure_task(
                 project_id: str,
@@ -1866,6 +1894,7 @@ class AgentRuntime:
                         detail="Structured requirements saved",
                         payload={"source_message_id": source_message_id},
                     )
+                await _disarm_pm_intake(item)
                 await db.commit()
                 from .project_schedule import cost_approval_instruction
 
@@ -2063,6 +2092,7 @@ class AgentRuntime:
                             detail="Spec confirmed; task slice is ready",
                             payload={"decision_id": row.id},
                         )
+                await _disarm_pm_intake(target_item)
                 await db.commit()
                 result = {"ok": True, "decision_id": row.id, "task": work_item_json(target_item)}
                 if spec_payload is not None:
@@ -2291,13 +2321,14 @@ class AgentRuntime:
                 item = await get_work_item(db, (context or {}).get("work_item_id"))
                 if item is None or item.agent_id != agent.id:
                     raise ValueError("PM task not found")
-                pid = str(project_id or item.project_id or "").strip()
-                if not pid:
-                    raise ValueError("project_id is required")
-                if str(item.project_id or "") != pid:
-                    raise PermissionError(
-                        "Spec must be read for this agent's current project"
-                    )
+                pid = await ensure_work_item_project(
+                    db,
+                    agent,
+                    item,
+                    project_id=project_id,
+                    context=context,
+                    fallback=f"agent-{agent.id}",
+                )
                 state = await get_or_create_project_state(db, pid)
                 return {"ok": True, "project_id": pid, "spec": read_project_spec(state)}
 
@@ -2314,13 +2345,14 @@ class AgentRuntime:
                 item = await get_work_item(db, (context or {}).get("work_item_id"))
                 if item is None or item.agent_id != agent.id:
                     raise ValueError("PM task not found")
-                pid = str(project_id or item.project_id or "").strip()
-                if not pid:
-                    raise ValueError("project_id is required")
-                if str(item.project_id or "") != pid:
-                    raise PermissionError(
-                        "Spec must be updated for this agent's current project"
-                    )
+                pid = await ensure_work_item_project(
+                    db,
+                    agent,
+                    item,
+                    project_id=project_id,
+                    context=context,
+                    fallback=f"agent-{agent.id}",
+                )
                 state = await get_or_create_project_state(db, pid)
                 patch: dict[str, Any] = {}
                 if summary is not None:
@@ -2368,6 +2400,7 @@ class AgentRuntime:
                     detail=spec.get("summary") or f"status={spec.get('status')}",
                     payload={"spec_version": spec.get("version"), "status": spec.get("status")},
                 )
+                await _disarm_pm_intake(item)
                 await db.commit()
                 return {
                     "ok": True,
@@ -2389,9 +2422,14 @@ class AgentRuntime:
                 )
                 if item is None or item.agent_id != agent.id:
                     raise ValueError("PM task not found")
-                project = await get_or_create_project_state(
-                    db, item.project_id or f"agent-{agent.id}"
+                pid = await ensure_work_item_project(
+                    db,
+                    agent,
+                    item,
+                    context=context,
+                    fallback=f"agent-{agent.id}",
                 )
+                project = await get_or_create_project_state(db, pid)
                 verdict = apply_execution_assessment(
                     item, read_project_spec(project), project_state=project
                 )
@@ -2407,6 +2445,7 @@ class AgentRuntime:
                             "CLARIFICATION",
                             detail="Execution verdict is not execute",
                         )
+                await _disarm_pm_intake(item)
                 await db.commit()
                 next_step = (
                     "Call submit_development_task."
@@ -4412,7 +4451,10 @@ class AgentRuntime:
                     message = compiled
                     context["_user_message"] = message
                 work_item = await mark_intake_executing(
-                    db, work_item, scheduler=self.employee.scheduler
+                    db,
+                    work_item,
+                    scheduler=self.employee.scheduler,
+                    pm_mode=bool(context.get("_pm_mode")),
                 )
                 context["_duplicate_intake_flush"] = duplicate_flush
                 context["_cursor_was_in_flight"] = False
@@ -4432,7 +4474,10 @@ class AgentRuntime:
                     ]
                     context["_attachments"] = attachments
             elif work_item is not None and should_collect_customer_intake(
-                work_item, context, minutes=debounce_minutes
+                work_item,
+                context,
+                minutes=debounce_minutes,
+                pm_mode=bool(context.get("_pm_mode")),
             ):
                 work_item = await begin_customer_intake(
                     db,
@@ -4442,6 +4487,7 @@ class AgentRuntime:
                     scheduler=self.employee.scheduler,
                     agent_id=agent.id,
                     attachments=attachments,
+                    pm_mode=bool(context.get("_pm_mode")),
                 )
                 context["_intake_collecting"] = True
                 context["work_item_id"] = work_item.id
@@ -4559,7 +4605,9 @@ class AgentRuntime:
                 )
             elif is_intake_flush:
                 role_instruction = (
-                    customer_intake_flush_instruction()
+                    customer_intake_flush_instruction(
+                        pm_mode=pm_mode_enabled(employee_profile)
+                    )
                     + "\n"
                     + customer_telegram_instruction()
                 )
@@ -4589,7 +4637,13 @@ class AgentRuntime:
                         if context.get("is_admin")
                         else customer_telegram_instruction()
                     )
-                    + (customer_intake_instruction() if context.get("_intake_collecting") else "")
+                    + (
+                        customer_intake_instruction(
+                            pm_mode=pm_mode_enabled(employee_profile)
+                        )
+                        if context.get("_intake_collecting")
+                        else ""
+                    )
                     + (f"\n{phone_hint}" if phone_hint else "")
                 )
             else:

@@ -99,3 +99,20 @@ def test_pm_mode_is_opt_in_and_has_structured_guards() -> None:
     assert "ice_tracker card is a request" in text.lower()
     assert "the platform moves the card itself" in text.lower()
     assert "pm_reset_project" in text
+    assert "do not wait to 'accumulate the assignment'" in text.lower()
+
+
+def test_pm_intake_instruction_decides_stage_now() -> None:
+    from app.employee_policy import customer_intake_flush_instruction, customer_intake_instruction
+
+    live = customer_intake_instruction(pm_mode=True)
+    assert "Decide the stage NOW" in live
+    assert "pm_update_spec" in live
+    assert "do not wait for a quiet-period timer" in live.lower()
+    assert "The platform will start execution after a quiet period" not in live
+
+    flush = customer_intake_flush_instruction(pm_mode=True)
+    assert "SINGLE cursorremote_do" not in flush
+    assert "ONLY the finished result" not in flush
+    assert "pm_assess_execution" in flush
+    assert "You MAY write the customer now" in flush

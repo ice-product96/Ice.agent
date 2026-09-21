@@ -109,6 +109,9 @@ def pm_system_instruction() -> str:
         "First call pm_get_spec. If the project ТЗ is missing, draft it with pm_update_spec "
         "and agree it with the customer via pm_record_decision (topic тз/spec/tz). "
         "A broad idea such as building a whole product is discussion, not Cursor. "
+        "Do this on the live Telegram message — do not wait to 'accumulate the assignment' "
+        "before asking or drafting ТЗ. Buffer fragments only when the customer is still typing "
+        "one thought. "
         "submit_development_task only when pm_assess_execution / context.execution.verdict "
         "is execute — a confirmed spec plus a testable in-scope slice. "
         "Do not consult_manager to confirm ordinary ТЗ. "
@@ -173,7 +176,22 @@ def pm_system_instruction() -> str:
     )
 
 
-def customer_intake_instruction() -> str:
+def customer_intake_instruction(*, pm_mode: bool = False) -> str:
+    if pm_mode:
+        return (
+            "This is a live customer Telegram message. Decide the stage NOW — "
+            "do not wait for a quiet-period timer to think. "
+            "If they are still sending fragments of one thought, acknowledge briefly "
+            "and wait for the rest. "
+            "If the request is a whole product or project ТЗ is missing/draft, "
+            "call pm_get_spec, draft with pm_update_spec, and ask the customer to agree "
+            "(pm_record_decision topic тз/spec/tz). "
+            "If it is a concrete in-scope slice, pm_structure_task then pm_assess_execution. "
+            "submit_development_task only when verdict is execute. "
+            "Do NOT mention a delay, timer, queue, buffering, or that work starts later. "
+            "Do NOT call cursorremote_do / Cursor unless verdict is execute. "
+            "Do NOT claim that Cursor already started or finished."
+        )
     return (
         "The customer may send several Telegram messages to complete one assignment. "
         "Reply NOW: acknowledge, answer questions, ask a short clarification if needed. "
@@ -199,7 +217,18 @@ def customer_result_only_instruction() -> str:
     )
 
 
-def customer_intake_flush_instruction() -> str:
+def customer_intake_flush_instruction(*, pm_mode: bool = False) -> str:
+    if pm_mode:
+        return (
+            "The quiet period ended. The user message is the accumulated customer assignment. "
+            "Do NOT blindly start Cursor and do NOT call cursorremote_do for each bullet. "
+            "Decide: small talk already answered — finish without a job; "
+            "broad idea / missing ТЗ — pm_get_spec, draft/agree spec with the customer; "
+            "concrete slice — pm_structure_task, pm_assess_execution, "
+            "submit_development_task only if verdict is execute. "
+            "You MAY write the customer now if you need questions or a spec confirmation. "
+            "Do NOT mention that you waited, buffered messages, or that a timer fired."
+        )
     return (
         "The quiet period ended. The user message is the accumulated customer assignment. "
         "Execute it now with a SINGLE cursorremote_do that covers the whole brief. "

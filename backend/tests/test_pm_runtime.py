@@ -6,9 +6,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import Settings
-from app.db import Agent, Base, WorkItem
+from app.db import Agent, Base, Customer, WorkItem
 from app.integrations import McpManager
-from app.pm_state import apply_spec_update, confirm_project_spec, get_or_create_project_state
+from app.pm_state import apply_spec_update, confirm_project_spec, get_or_create_project_state, read_project_spec
 from app.runtime import AgentRuntime
 
 
@@ -971,4 +971,82 @@ async def test_tracker_broad_card_is_not_auto_in_scope(tmp_path: Path) -> None:
         assert stored["task"]["context"].get("inside_agreed_scope") is not True
         with pytest.raises(PermissionError):
             await registry.call("submit_development_task", {})
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_update_spec_binds_customer_when_work_item_has_no_project(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'pm-spec-bind.db').as_posix()}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    mcp = McpManager()
+    mcp.sessions = {"cursorremote": FakeCursorSession()}
+    runtime = AgentRuntime(
+        Settings(mem0_enabled=False),
+        SimpleNamespace(),
+        FakeSearch(),
+        FakeEvents(),
+        mcp=mcp,
+    )
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        db.add(
+            Customer(
+                id="ozonshopai",
+                name="OzonAi",
+                agent_id=agent.id,
+                project_id="mysell",
+                notes="Telegram: @HappyBuildCom",
+            )
+        )
+        item = WorkItem(
+            agent_id=agent.id,
+            title="учет продаж",
+            goal="Сводка задания заказчика (1 сообщ.):\n1. учетная система продаж и остатков",
+            status="in_progress",
+            pm_phase="DISCUSSION",
+            priority="normal",
+        )
+        db.add(item)
+        await db.commit()
+        registry = await runtime.registry(
+            agent,
+            mcp_server_names={"cursorremote"},
+            memory_enabled=False,
+            db=db,
+            context={
+                "_pm_mode": True,
+                "work_item_id": item.id,
+                "source": "telegram",
+                "customer_id": "HappyBuildCom",
+                "project_id": "happybuild",
+            },
+        )
+        updated = await registry.call(
+            "pm_update_spec",
+            {
+                "summary": "Учёт продаж и остатков с AI и Ozon",
+                "goals": ["Вести остатки и продажи"],
+                "in_scope": ["учёт", "ozon", "openai"],
+                "out_of_scope": ["маркетплейсы кроме Ozon на первом этапе"],
+                "modules": ["inventory", "sales", "ai"],
+            },
+        )
+        await db.refresh(item)
+        assert item.project_id == "mysell"
+        assert item.customer_id == "ozonshopai"
+        assert updated["spec"]["status"] == "draft"
+        assert updated["spec"]["summary"] == "Учёт продаж и остатков с AI и Ozon"
+        state = await get_or_create_project_state(db, "mysell")
+        spec = read_project_spec(state)
+        assert spec["in_scope"] == ["учёт", "ozon", "openai"]
+        ghost = await get_or_create_project_state(db, "agent-1")
+        assert not read_project_spec(ghost).get("summary")
     await engine.dispose()

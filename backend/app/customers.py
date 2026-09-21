@@ -327,6 +327,12 @@ async def match_customer_from_text(
 ) -> Customer | None:
     """Find a customer mentioned in free text (title, intake, chat)."""
     hay_variants = _match_variants(text)
+    hay_variants |= {
+        _normalize_match_text(token)
+        for token in re.findall(r"@?[\wа-яё]{3,}", str(text or ""), flags=re.IGNORECASE)
+        if _normalize_match_text(token)
+    }
+    hay_variants = {item for item in hay_variants if item}
     if not hay_variants:
         return None
     stmt = select(Customer)
@@ -343,6 +349,7 @@ async def match_customer_from_text(
             row.project_id,
             row.name,
             Path(row.cursor_workspace or "").name if row.cursor_workspace else "",
+            *(re.findall(r"@?[\wа-яё]{3,}", str(row.notes or ""), flags=re.IGNORECASE)),
         ]
         for raw in needles:
             for needle in _match_variants(raw):
@@ -375,6 +382,72 @@ async def bind_customer_to_work_item(
         if customer.cursor_workspace:
             ctx.setdefault("cursor_workspace", customer.cursor_workspace)
     return customer
+
+
+async def ensure_work_item_project(
+    db: AsyncSession,
+    agent: Agent | None,
+    item: WorkItem,
+    *,
+    project_id: str = "",
+    context: dict[str, Any] | None = None,
+    fallback: str = "",
+) -> str:
+    """Bind a work item to a customer/project so ТЗ lands on the card, not agent-N."""
+    ctx = context if isinstance(context, dict) else {}
+    requested = str(project_id or "").strip()
+    hinted = str(ctx.get("project_id") or "").strip()
+    customer_hint = str(ctx.get("customer_id") or item.customer_id or "").strip()
+    customer = await resolve_customer(
+        db,
+        agent,
+        customer_id=customer_hint or None,
+        project_id=requested or hinted or str(item.project_id or "") or None,
+    )
+    if customer is None:
+        customer = await match_customer_from_text(
+            db,
+            agent,
+            " ".join(
+                part
+                for part in (
+                    requested,
+                    hinted,
+                    customer_hint,
+                    item.customer_id,
+                    item.project_id,
+                    item.title,
+                    item.goal,
+                )
+                if part
+            ),
+        )
+    if customer is None and agent is not None:
+        rows = list(
+            await db.scalars(
+                select(Customer).where(
+                    (Customer.agent_id == agent.id) | (Customer.agent_id.is_(None))
+                )
+            )
+        )
+        if len(rows) == 1:
+            customer = rows[0]
+    if customer is not None:
+        await bind_customer_to_work_item(db, item, customer, context=ctx)
+    pid = str(
+        item.project_id or requested or hinted or fallback or ""
+    ).strip()
+    if not pid:
+        raise ValueError("project_id is required")
+    existing = str(item.project_id or "").strip()
+    if existing and requested and existing != requested and customer is None:
+        raise PermissionError(
+            "Spec must be read for this agent's current project"
+        )
+    if not existing:
+        item.project_id = pid
+        ctx["project_id"] = pid
+    return str(item.project_id)
 
 
 async def sync_agent_memory_defaults(db: AsyncSession, customer: Customer) -> None:

@@ -23,6 +23,7 @@ from app.pm_state import (
     parse_cursor_result,
     read_project_spec,
     readiness_issues,
+    spec_summary_from_item,
     record_decision,
     record_scope_change,
     render_task_brief,
@@ -194,6 +195,22 @@ def test_broad_product_request_drafts_spec() -> None:
     verdict = assess_execution(item, {"status": "missing"})
     assert verdict["verdict"] in {"draft_spec", "discuss"}
     assert any("spec" in reason.lower() or "product" in reason.lower() for reason in verdict["reasons"])
+
+
+def test_spec_summary_strips_intake_dump() -> None:
+    item = WorkItem(
+        agent_id=1,
+        title="учет",
+        goal=(
+            "Сводка задания заказчика (1 сообщ.):\n"
+            "1. ПРивет, требуется разработать учетную систему продаж "
+            "(2026-09-21T13:22:12.828262+00:00)"
+        ),
+    )
+    summary = spec_summary_from_item(item)
+    assert "Сводка задания" not in summary
+    assert "2026-09-21" not in summary
+    assert "учетную систему продаж" in summary
 
 
 def test_bug_inside_confirmed_scope_executes() -> None:

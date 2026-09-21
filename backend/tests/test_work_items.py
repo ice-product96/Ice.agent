@@ -144,6 +144,41 @@ async def test_pm_cursor_done_requires_explicit_qa_acceptance(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_pm_discussion_cursor_idle_does_not_close_case(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-discuss-idle.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="учет",
+            goal="учетная система",
+            status="waiting_external",
+            pm_phase="DISCUSSION",
+        )
+        db.add(item)
+        await db.commit()
+        await after_agent_run(
+            db,
+            agent,
+            {"work_item_id": item.id, "_pm_mode": True, "source": "intake_flush"},
+            "Cursor idle leftover",
+            [
+                {
+                    "tool": "cursorremote_check",
+                    "status": "success",
+                    "result": {"done": True, "summary": "idle leftover"},
+                }
+            ],
+        )
+        assert item.status == "in_progress"
+        assert item.pm_phase == "DISCUSSION"
+        assert "ТЗ" in (item.next_action or "") or "уточнен" in (item.next_action or "").lower()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_leftover_idle_unsticks_waiting_external(tmp_path: Path) -> None:
     engine, sessions = await sessions_for(tmp_path / "leftover-idle.db")
     async with sessions() as db:

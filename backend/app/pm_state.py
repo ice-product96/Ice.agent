@@ -346,15 +346,39 @@ def revert_spec_to_draft(state: ProjectState) -> dict[str, Any]:
     return apply_spec_update(state, {}, force_draft=True)
 
 
+_INTAKE_HEAD_RE = re.compile(
+    r"^сводка задания заказчика[^\n]*\n?",
+    re.IGNORECASE,
+)
+_ISO_TAIL_RE = re.compile(r"\(\d{4}-\d{2}-\d{2}T[^)]+\)\s*$")
+
+
+def spec_summary_from_item(item: WorkItem) -> str:
+    text = str(item.goal or item.title or "").strip()
+    text = _INTAKE_HEAD_RE.sub("", text).strip()
+    pieces: list[str] = []
+    for raw in text.splitlines():
+        line = re.sub(r"^\d+\.\s*", "", raw).strip()
+        line = _ISO_TAIL_RE.sub("", line).strip()
+        if line:
+            pieces.append(line)
+    summary = " ".join(pieces).strip() or str(item.title or "").strip()
+    return summary[:500]
+
+
 def seed_draft_spec_from_item(state: ProjectState, item: WorkItem) -> dict[str, Any]:
     current = read_project_spec(state)
     if current.get("status") != "missing" and not spec_is_empty(current):
         return current
+    summary = spec_summary_from_item(item)
+    goals = list(item.requirements or [])[:8]
+    if not goals and summary:
+        goals = [summary]
     return apply_spec_update(
         state,
         {
-            "summary": str(item.goal or item.title or "").strip(),
-            "goals": list(item.requirements or [])[:8],
+            "summary": summary,
+            "goals": goals,
             "constraints": list(item.constraints or []),
         },
     )

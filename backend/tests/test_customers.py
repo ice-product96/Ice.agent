@@ -160,4 +160,31 @@ async def test_match_customer_from_cyrillic_brand(tmp_path: Path) -> None:
         )
         assert found is not None
         assert found.id == "uraltrade"
+        handle = await match_customer_from_text(db, agent, "HappyBuildCom уточнил ТЗ")
+        assert handle is None
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_match_customer_from_telegram_handle_in_notes(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'handle.db').as_posix()}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessions() as db:
+        agent = Agent(name="pm-agent", prompt="")
+        db.add(agent)
+        await db.flush()
+        db.add(
+            Customer(
+                id="ozonshopai",
+                name="OzonAi",
+                agent_id=agent.id,
+                project_id="mysell",
+                notes="Основной заказчик задач в Telegram: @HappyBuildCom.",
+            )
+        )
+        await db.commit()
+        found = await match_customer_from_text(db, agent, "HappyBuildCom")
+        assert found is not None
+        assert found.project_id == "mysell"

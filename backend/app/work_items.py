@@ -246,6 +246,7 @@ def should_collect_customer_intake(
     context: dict[str, Any],
     *,
     minutes: int,
+    pm_mode: bool = False,
 ) -> bool:
     if item is None or minutes <= 0:
         return False
@@ -262,6 +263,20 @@ def should_collect_customer_intake(
         return False
     if (item.metadata_json or {}).get("cursor_in_flight"):
         return False
+    if pm_mode:
+        phase = str(item.pm_phase or "").strip()
+        if phase and phase not in {"DISCUSSION", ""}:
+            return False
+        ctx = item.context_json if isinstance(item.context_json, dict) else {}
+        execution = ctx.get("execution") if isinstance(ctx.get("execution"), dict) else {}
+        if str(execution.get("verdict") or "").strip().lower() in {
+            "discuss",
+            "draft_spec",
+            "execute",
+        }:
+            return False
+        if list(item.requirements or []):
+            return False
     return True
 
 
@@ -274,6 +289,7 @@ async def begin_customer_intake(
     scheduler: Any | None,
     agent_id: int,
     attachments: list[dict[str, Any]] | None = None,
+    pm_mode: bool = False,
 ) -> WorkItem:
     """Append a customer message and (re)arm the quiet-period flush timer."""
     minutes = max(1, min(180, int(minutes)))
@@ -306,10 +322,14 @@ async def begin_customer_intake(
         db,
         item,
         "collecting",
-        next_action="Коплю сообщения заказчика, затем выполню",
+        next_action=(
+            "Разбираю запрос: уточнить, согласовать ТЗ или взять срез в работу"
+            if pm_mode
+            else "Коплю сообщения заказчика, затем выполню"
+        ),
         wait_owner="customer",
         wait_until=wait_until,
-        event_title="Сообщение накоплено",
+        event_title="Сообщение заказчика" if pm_mode else "Сообщение накоплено",
         event_detail=_clip(text, 400),
         commit=False,
     )
@@ -398,6 +418,7 @@ async def mark_intake_executing(
     item: WorkItem,
     *,
     scheduler: Any | None = None,
+    pm_mode: bool = False,
 ) -> WorkItem:
     meta = dict(item.metadata_json or {})
     blob = dict(meta.get("intake") or {}) if isinstance(meta.get("intake"), dict) else {}
@@ -415,11 +436,53 @@ async def mark_intake_executing(
         db,
         item,
         "in_progress",
-        next_action="Выполняю накопленное задание",
+        next_action=(
+            "Решаю по накопленному запросу: ТЗ, уточнение или Cursor"
+            if pm_mode
+            else "Выполняю накопленное задание"
+        ),
         wait_owner="self",
-        event_title="Новое задание — выполняю" if reflush else "Тишина закончилась — выполняю",
+        event_title=(
+            ("Новое задание — разбираю" if reflush else "Тишина закончилась — разбираю")
+            if pm_mode
+            else ("Новое задание — выполняю" if reflush else "Тишина закончилась — выполняю")
+        ),
         event_detail=compile_intake_brief(item)[:1500],
     )
+
+
+async def release_pm_intake(
+    db: AsyncSession,
+    item: WorkItem | None,
+    scheduler: Any | None = None,
+) -> WorkItem | None:
+    """Stop the quiet-period execute timer once PM already chose a stage."""
+    if item is None:
+        return None
+    blob = intake_blob(item)
+    collecting = item.status == "collecting" or bool(blob.get("armed"))
+    if not collecting:
+        return item
+    await disarm_intake_flush_job(db, item, scheduler)
+    meta = dict(item.metadata_json or {})
+    intake = dict(meta.get("intake") or {}) if isinstance(meta.get("intake"), dict) else {}
+    intake["armed"] = False
+    meta["intake"] = intake
+    item.metadata_json = meta
+    if item.status == "collecting":
+        await set_status(
+            db,
+            item,
+            "in_progress",
+            next_action=item.next_action or "Продолжаю с заказчиком по ТЗ / уточнениям",
+            wait_owner="self",
+            wait_until=None,
+            event_title="Накопление снято — этап выбран",
+            commit=False,
+        )
+    else:
+        item.wait_until = None
+    return item
 
 
 def cursor_prompt_already_active(
@@ -1056,6 +1119,31 @@ async def after_agent_run(
         )
         return item
 
+    discussing = str(item.pm_phase or "") in {
+        "",
+        "DISCUSSION",
+        "CLARIFICATION",
+        "CHANGES_REQUESTED",
+        "REQUIREMENTS_READY",
+        "CLIENT_CONFIRMED",
+        "READY_FOR_DEV",
+    }
+    if (
+        context.get("_pm_mode")
+        and discussing
+        and item.status == "waiting_external"
+    ):
+        await set_status(
+            db,
+            item,
+            "in_progress",
+            next_action=item.next_action or "Продолжаю ТЗ и уточнения с заказчиком",
+            wait_owner="self",
+            event_title="Cursor idle — кейс не закрываю",
+            event_detail=_clip(result, 400),
+        )
+        return item
+
     meta = dict(item.metadata_json or {})
     intake = meta.get("intake") if isinstance(meta.get("intake"), dict) else {}
     cursor_called = any(
@@ -1073,6 +1161,7 @@ async def after_agent_run(
         item.status == "in_progress"
         and bool(intake.get("flushing"))
         and not cursor_called
+        and not context.get("_pm_mode")
         and str(context.get("source") or "") in {"intake_flush", "employee_tick", "scheduled"}
     ):
         await set_status(
@@ -1118,6 +1207,26 @@ async def after_agent_run(
         meta["cursor_in_flight"] = False
         meta.pop("cursor_baseline_summary", None)
         item.metadata_json = meta
+        discussing = str(item.pm_phase or "") in {
+            "",
+            "DISCUSSION",
+            "CLARIFICATION",
+            "CHANGES_REQUESTED",
+            "REQUIREMENTS_READY",
+            "CLIENT_CONFIRMED",
+            "READY_FOR_DEV",
+        }
+        if context.get("_pm_mode") and discussing:
+            await set_status(
+                db,
+                item,
+                "in_progress",
+                next_action=item.next_action or "Продолжаю ТЗ и уточнения с заказчиком",
+                wait_owner="self",
+                event_title="Cursor idle — кейс не закрываю",
+                event_detail=_clip(result, 400),
+            )
+            return item
         if context.get("_pm_mode") and item.pm_phase != "DONE":
             await set_status(
                 db,
@@ -1154,6 +1263,13 @@ async def after_agent_run(
 
     if result.strip() and str(context.get("source")) == "telegram":
         if item.status == "collecting" or context.get("_intake_collecting"):
+            if context.get("_pm_mode"):
+                await release_pm_intake(
+                    db,
+                    item,
+                    getattr(employee, "scheduler", None) if employee is not None else None,
+                )
+                await db.commit()
             return item
         await set_status(
             db,
@@ -1318,8 +1434,8 @@ def build_watchdog_instruction(items: list[WorkItem]) -> str:
         "Если кейс «Жду Cursor»: только cursorremote_check. Не вызывай cursorremote_do "
         "с текстом вроде «Cursor остановился на поиске» — это дублирует задачу. Поиск не остановка.",
         "Если кейс «Коплю задание» и wait ещё не вышел — не выполняй и не зови Cursor.",
-        "Если кейс «Коплю задание» уже просрочен — выполни сводку сообщений заказчика. "
-        "Не пиши ему про таймер или что ждали.",
+        "Если кейс «Коплю задание» уже просрочен — разбери сводку: уточнить, "
+        "согласовать ТЗ или взять срез. Не зови Cursor вслепую и не пиши про таймер.",
         "Если кейс в QA — вызови pm_accept_task. Не вызывай submit_development_task "
         "и не пиши заказчику, пока QA не принята.",
         "Если Composer занят чужим заданием (automatic_resubmit_blocked) — "

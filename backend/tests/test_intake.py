@@ -7,10 +7,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.db import Agent, Base, WorkItem, utcnow
 from app.employee_policy import customer_intake_flush_instruction, customer_intake_instruction, intake_debounce_minutes
 from app.work_items import (
+    after_agent_run,
     begin_customer_intake,
     compile_intake_brief,
     cursor_prompt_already_active,
     mark_intake_executing,
+    release_pm_intake,
     should_collect_customer_intake,
     watchdog_items,
 )
@@ -22,6 +24,10 @@ class FakeScheduler:
 
     def upsert(self, job) -> None:
         self.ids.append(job.id)
+
+    def remove(self, job_id) -> None:
+        if job_id in self.ids:
+            self.ids.remove(job_id)
 
 
 async def sessions_for(path: Path):
@@ -70,6 +76,35 @@ def test_should_collect_customer_telegram_not_admin() -> None:
     assert not should_collect_customer_intake(
         item, {"source": "telegram", "is_admin": False}, minutes=15
     )
+
+
+def test_pm_mode_skips_collect_once_stage_is_chosen() -> None:
+    ctx = {"source": "telegram", "is_admin": False}
+    fresh = WorkItem(id=1, agent_id=1, title="x", status="in_progress", pm_phase="DISCUSSION")
+    assert should_collect_customer_intake(fresh, ctx, minutes=15, pm_mode=True)
+
+    later = WorkItem(id=2, agent_id=1, title="x", status="in_progress", pm_phase="CLARIFICATION")
+    assert not should_collect_customer_intake(later, ctx, minutes=15, pm_mode=True)
+
+    with_verdict = WorkItem(
+        id=3,
+        agent_id=1,
+        title="x",
+        status="in_progress",
+        pm_phase="DISCUSSION",
+        context_json={"execution": {"verdict": "draft_spec"}},
+    )
+    assert not should_collect_customer_intake(with_verdict, ctx, minutes=15, pm_mode=True)
+
+    with_reqs = WorkItem(
+        id=4,
+        agent_id=1,
+        title="x",
+        status="in_progress",
+        pm_phase="DISCUSSION",
+        requirements=["Собрать ТЗ на Ozon"],
+    )
+    assert not should_collect_customer_intake(with_reqs, ctx, minutes=15, pm_mode=True)
 
 
 @pytest.mark.asyncio
@@ -268,4 +303,151 @@ async def test_mark_intake_executing_clears_stale_cursor_flag(tmp_path: Path) ->
         assert not (again.metadata_json or {}).get("cursor_in_flight")
         assert again.status == "in_progress"
         assert int((again.metadata_json or {}).get("cursor_assignment_seq") or 0) >= 2
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pm_intake_does_not_say_will_execute_later(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-intake.db")
+    scheduler = FakeScheduler()
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.commit()
+        await db.refresh(agent)
+        item = WorkItem(agent_id=agent.id, title="Задача", status="in_progress", chat_id="77")
+        db.add(item)
+        await db.commit()
+        await db.refresh(item)
+        saved = await begin_customer_intake(
+            db,
+            item,
+            "Собери ИИ-систему для Ozon",
+            minutes=15,
+            scheduler=scheduler,
+            agent_id=agent.id,
+            pm_mode=True,
+        )
+        assert saved.status == "collecting"
+        assert "Коплю" not in (saved.next_action or "")
+        assert "затем выполню" not in (saved.next_action or "").lower()
+        assert "ТЗ" in (saved.next_action or "")
+        flushed = await mark_intake_executing(db, saved, scheduler=scheduler, pm_mode=True)
+        assert flushed.status == "in_progress"
+        assert "Коплю" not in (flushed.next_action or "")
+        assert "ТЗ" in (flushed.next_action or "")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_release_pm_intake_disarms_collecting(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-release.db")
+    scheduler = FakeScheduler()
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.commit()
+        await db.refresh(agent)
+        item = WorkItem(agent_id=agent.id, title="Задача", status="in_progress", chat_id="77")
+        db.add(item)
+        await db.commit()
+        await db.refresh(item)
+        saved = await begin_customer_intake(
+            db,
+            item,
+            "Нужен каталог",
+            minutes=15,
+            scheduler=scheduler,
+            agent_id=agent.id,
+            pm_mode=True,
+        )
+        released = await release_pm_intake(db, saved, scheduler)
+        await db.commit()
+        await db.refresh(released)
+        assert released.status == "in_progress"
+        assert released.wait_until is None
+        assert (released.metadata_json or {}).get("intake", {}).get("armed") is False
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pm_live_reply_leaves_collecting(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-live-reply.db")
+    scheduler = FakeScheduler()
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.commit()
+        await db.refresh(agent)
+        item = WorkItem(agent_id=agent.id, title="Задача", status="in_progress", chat_id="77")
+        db.add(item)
+        await db.commit()
+        await db.refresh(item)
+        saved = await begin_customer_intake(
+            db,
+            item,
+            "Сделай систему для Ozon",
+            minutes=15,
+            scheduler=scheduler,
+            agent_id=agent.id,
+            pm_mode=True,
+        )
+
+        class Employee:
+            def __init__(self) -> None:
+                self.scheduler = scheduler
+
+        await after_agent_run(
+            db,
+            agent,
+            {
+                "work_item_id": saved.id,
+                "_pm_mode": True,
+                "_intake_collecting": True,
+                "source": "telegram",
+            },
+            "Давайте сначала согласуем ТЗ: какие модули нужны?",
+            [],
+            employee=Employee(),
+        )
+        await db.refresh(saved)
+        assert saved.status == "in_progress"
+        assert saved.wait_until is None
+        assert (saved.metadata_json or {}).get("intake", {}).get("armed") is False
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pm_flush_without_cursor_does_not_wait_external(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-flush-discuss.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.commit()
+        await db.refresh(agent)
+        item = WorkItem(
+            agent_id=agent.id,
+            title="Ozon",
+            status="in_progress",
+            pm_phase="DISCUSSION",
+            metadata_json={"intake": {"flushing": True, "armed": False}},
+        )
+        db.add(item)
+        await db.commit()
+        await db.refresh(item)
+        await after_agent_run(
+            db,
+            agent,
+            {
+                "work_item_id": item.id,
+                "_pm_mode": True,
+                "_intake_flush": True,
+                "source": "intake_flush",
+            },
+            "Нужно согласовать ТЗ, пока в Cursor не отдаю.",
+            [],
+        )
+        await db.refresh(item)
+        assert item.status != "waiting_external"
+        assert item.status == "in_progress"
     await engine.dispose()
