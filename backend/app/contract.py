@@ -3082,7 +3082,13 @@ async def get_runtime_settings(db: AsyncSession) -> RuntimeSettings:
     return settings
 
 
-def runtime_json(settings: RuntimeSettings, *, memory_error: str | None = None) -> dict[str, Any]:
+def runtime_json(
+    settings: RuntimeSettings,
+    *,
+    memory_error: str | None = None,
+    judge_configured: bool = False,
+    judge_error: str | None = None,
+) -> dict[str, Any]:
     return {
         "search_provider": settings.search_provider,
         "searxng_url": settings.searxng_url,
@@ -3115,8 +3121,17 @@ def runtime_json(settings: RuntimeSettings, *, memory_error: str | None = None) 
         "judge_premium_model": settings.judge_premium_model,
         "judge_thresholds": dict(settings.judge_thresholds or {}),
         "judge_modes": dict(settings.judge_modes or {}),
+        "judge_configured": judge_configured,
+        "judge_error": judge_error,
         "updated_at": iso(settings.updated_at),
     }
+
+
+def _judge_health(request: Request) -> tuple[bool, str | None]:
+    judgment = getattr(request.app.state, "judgment", None)
+    if judgment is None:
+        return False, None
+    return bool(getattr(judgment, "configured", False)), getattr(judgment, "last_error", None)
 
 
 @router.get("/settings/runtime", dependencies=auth)
@@ -3124,9 +3139,12 @@ async def read_runtime_settings(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
+    judge_configured, judge_error = _judge_health(request)
     return runtime_json(
         await get_runtime_settings(db),
         memory_error=request.app.state.memory.last_error,
+        judge_configured=judge_configured,
+        judge_error=judge_error,
     )
 
 
@@ -3145,9 +3163,15 @@ async def update_runtime_configuration(
 ) -> dict[str, Any]:
     settings = await get_runtime_settings(db)
     try:
+        judge_configured, judge_error = _judge_health(request)
         payload = RuntimeSettingsBody.model_validate(
             {
-                **runtime_json(settings, memory_error=request.app.state.memory.last_error),
+                **runtime_json(
+                    settings,
+                    memory_error=request.app.state.memory.last_error,
+                    judge_configured=judge_configured,
+                    judge_error=judge_error,
+                ),
                 **await request.json(),
             }
         )
@@ -3205,6 +3229,10 @@ async def update_runtime_configuration(
         settings.qdrant_url = settings.qdrant_url.strip() or None
     if isinstance(settings.tavily_http_proxy, str):
         settings.tavily_http_proxy = settings.tavily_http_proxy.strip() or None
+    for attr in ("judge_model", "judge_premium_model"):
+        value = getattr(settings, attr, None)
+        if isinstance(value, str):
+            setattr(settings, attr, value.strip() or None)
     if payload.clear_tavily_api_key:
         settings.tavily_api_key_ciphertext = None
     elif payload.tavily_api_key:
@@ -3244,7 +3272,13 @@ async def update_runtime_configuration(
         await request.app.state.task_bus.stop()
         if settings.task_workers:
             await request.app.state.task_bus.start(settings.task_workers)
-    return runtime_json(settings, memory_error=request.app.state.memory.last_error)
+    judge_configured, judge_error = _judge_health(request)
+    return runtime_json(
+        settings,
+        memory_error=request.app.state.memory.last_error,
+        judge_configured=judge_configured,
+        judge_error=judge_error,
+    )
 
 
 def conversation_json(state: ConversationState) -> dict[str, Any]:

@@ -221,6 +221,13 @@ export interface RuntimeSettings {
   typing_presence: boolean
   task_workers: number
   max_tool_rounds: number
+  judge_profile_id?: ID | null
+  judge_model?: string | null
+  judge_premium_model?: string | null
+  judge_thresholds?: Record<string, number>
+  judge_modes?: Record<string, 'off' | 'shadow' | 'enforce'>
+  judge_configured?: boolean
+  judge_error?: string | null
 }
 
 export interface ConnectionHealth {

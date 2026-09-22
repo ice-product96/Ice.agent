@@ -51,7 +51,7 @@ const title: Record<Page, [string, string]> = {
   mcp: ['MCP-серверы', 'URL и доступ к внешним инструментам. Кому они доступны — в карточке агента'],
   cron: ['Расписания', 'Запуск промптов агентов по расписанию'],
   settings: ['Настройки администратора', 'Контроль доступа и маршрутизация эскалации'],
-  runtime: ['Настройки runtime', 'Поиск, память, набор текста и поведение воркеров'],
+  runtime: ['Настройки runtime', 'Поиск, память, судьи, набор текста и воркеры'],
   logs: ['Системные логи', 'Трассировка событий runtime между сервисами'],
   tasks: ['Межагентные задачи', 'Координация и делегирование работ в реальном времени'],
 }
@@ -2685,6 +2685,21 @@ function CronForm({ value, agents, onClose, onSave }: { value: Partial<CronJob>;
     <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Отмена</button><button className="primary" disabled={busy}>Сохранить расписание</button></div></form></Modal>
 }
 
+const JUDGE_FIELDS: { id: string; label: string; hint: string }[] = [
+  { id: 'message_intent', label: 'Намерение сообщения', hint: 'Работа, ответ, обрывок или приказ сбросить кейсы.' },
+  { id: 'route_customer', label: 'Карточка заказчика', hint: 'Какому заказчику принадлежит сообщение.' },
+  { id: 'approval_detect', label: 'Согласование', hint: 'ТЗ, цена или срез действительно согласованы.' },
+  { id: 'manager_reply', label: 'Ответ руководителя', hint: 'Одобрил, отклонил или дал указание.' },
+  { id: 'scope_judge', label: 'Границы ТЗ', hint: 'Задача внутри согласованного объёма.' },
+  { id: 'qa_verifier', label: 'Приёмка QA', hint: 'Критерии закрыты по отчёту исполнителя.' },
+  { id: 'cursor_completion', label: 'Завершение Cursor', hint: 'Исполнитель закончил именно эту задачу.' },
+  { id: 'delivery_gate', label: 'Письмо заказчику', hint: 'Можно отправлять или это внутренняя заметка.' },
+  { id: 'tracker_lane_map', label: 'Колонки трекера', hint: 'Какая колонка доски соответствует полосе.' },
+  { id: 'memory_extract', label: 'Извлечение фактов', hint: 'Что запомнить о заказчике и проекте.' },
+  { id: 'retrieval_plan', label: 'Поиск по памяти', hint: 'Какие запросы задать памяти перед ответом.' },
+  { id: 'known_already', label: 'Уже известно', hint: 'Не спрашивать заказчика то, что уже записано.' },
+]
+
 function RuntimeScreen() {
   const loaded = useLoad(api.settings.runtime, []); const profiles = useLoad(api.llmProfiles.list, [])
   const [form, setForm] = useState<RuntimeSettings>(); const [busy, setBusy] = useState(false)
@@ -2750,6 +2765,31 @@ function RuntimeScreen() {
         <div className="toggle-box wide"><Toggle label="Память включена" checked={form.memory_enabled} onChange={v => patch({ memory_enabled: v })}/></div>
       </div>
       {form.memory_error && <Alert message={`Память degraded: ${form.memory_error}`}/>}
+    </section>
+    <section className="panel"><SectionHead title="Судьи" text="Модель, которая решает согласование, границы ТЗ, приёмку и письмо заказчику. Без профиля рельсы остаются на старых правилах."/>
+      <div className="form-grid">
+        <Field label="Профиль LLM судей" hint="Включённый профиль с API-ключом. Его ключ и адрес использует слой судей." wide>
+          <select value={form.judge_profile_id || ''} onChange={e => patch({ judge_profile_id: e.target.value || null })}>
+            <option value="">Не выбран — судьи недоступны</option>
+            {profiles.data?.map(p => <option key={p.id} value={p.id}>{p.name} · {p.default_model}{p.enabled ? '' : ' (отключён)'}</option>)}
+          </select>
+        </Field>
+        <Field label="Дешёвая модель" hint="Пусто — модель профиля. Быстрые судьи: намерение, Cursor, память, письмо.">
+          <input value={form.judge_model || ''} onChange={e => patch({ judge_model: e.target.value || null })} placeholder="модель профиля"/>
+        </Field>
+        <Field label="Премиальная модель" hint="Согласование, границы ТЗ и приёмка QA. Пусто — та же, что дешёвая.">
+          <input value={form.judge_premium_model || ''} onChange={e => patch({ judge_premium_model: e.target.value || null })} placeholder="та же, что дешёвая"/>
+        </Field>
+        {JUDGE_FIELDS.map(judge => <Field key={judge.id} label={judge.label} hint={judge.hint}>
+          <select value={form.judge_modes?.[judge.id] || 'enforce'} onChange={e => patch({ judge_modes: { ...(form.judge_modes || {}), [judge.id]: e.target.value as 'off' | 'shadow' | 'enforce' } })}>
+            <option value="enforce">Решает</option>
+            <option value="shadow">Только записывает</option>
+            <option value="off">Выключен</option>
+          </select>
+        </Field>)}
+      </div>
+      {form.judge_error && <Alert message={`Судьи: ${form.judge_error}`}/>}
+      {form.judge_configured && !form.judge_error && <div className="inline-result standalone">Судьи подключены.</div>}
     </section>
     <section className="panel"><SectionHead title="Имитация человеческого общения" text="Присутствие «набирает» и темп исходящих сообщений"/>
       <div className="form-grid"><Field label="Мин. набор (сек)"><input min="0" step=".1" type="number" value={form.typing_min_seconds} onChange={e => number('typing_min_seconds', e.target.value)}/></Field><Field label="Макс. набор (сек)"><input min="0" step=".1" type="number" value={form.typing_max_seconds} onChange={e => number('typing_max_seconds', e.target.value)}/></Field><Field label="Джиттер набора (сек)"><input min="0" step=".1" type="number" value={form.typing_jitter_seconds} onChange={e => number('typing_jitter_seconds', e.target.value)}/></Field><Field label="Размер фрагмента сообщения"><input min="256" max="4096" type="number" value={form.typing_chunk_size} onChange={e => number('typing_chunk_size', e.target.value)}/></Field><div className="toggle-box wide"><Toggle label="Отправлять статус «онлайн» и «набирает»" checked={form.typing_presence} onChange={v => patch({ typing_presence: v })}/></div></div>
