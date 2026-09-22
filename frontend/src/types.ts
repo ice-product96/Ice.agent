@@ -374,6 +374,40 @@ export interface Consultation {
   answer_text?: string | null
   answered_by?: string | null
   answered_at?: string | null
+  telegram_message_ids?: Array<string | number>
+  telegram_delivered?: boolean
+  created_at?: string | null
+}
+
+export interface AgentJudgment {
+  id: ID
+  created_at?: string | null
+  kind: string
+  verdict: string
+  confidence?: number
+  verdict_json?: Record<string, unknown>
+  mode?: string
+  enforced?: boolean
+  model?: string | null
+  tier?: string
+  prompt_tokens?: number
+  completion_tokens?: number
+  latency_ms?: number
+  cached?: boolean
+  agreed?: boolean | null
+  error?: string | null
+  overridden_by?: string | null
+  override_verdict?: string | null
+  decision_trace_id?: string | null
+  legacy_json?: Record<string, unknown> | null
+}
+
+export interface RuntimeHealth {
+  memory_degraded?: boolean
+  memory_error?: string | null
+  judge_degraded?: boolean
+  judge_error?: string | null
+  judge_configured?: boolean
 }
 
 export interface WorkItemEvent {
@@ -440,6 +474,7 @@ export interface ProjectSchedule {
   currency?: string
   cost_requires_customer_approval?: boolean
   min_execution_ratio?: number
+  wait_estimated_duration?: boolean
   now_local?: string
 }
 
@@ -457,6 +492,7 @@ export interface ProjectCommerce {
   elapsed_cursor_minutes?: number
   min_execution_remaining_minutes?: number
   can_accept_qa?: boolean
+  wait_estimated_duration?: boolean
 }
 
 export interface ProjectSpec {
@@ -529,6 +565,8 @@ export interface WorkItem {
   updated_at?: string | null
   events?: WorkItemEvent[]
   events_page?: WorkItemEventsPage
+  judgments?: AgentJudgment[]
+  turn_costs?: Array<{ decision_trace_id?: string; calls?: number; cached?: number; prompt_tokens?: number; completion_tokens?: number }>
   intake?: {
     armed?: boolean
     count?: number
@@ -578,6 +616,7 @@ export interface EmployeeState {
   work_items?: WorkItem[]
   work_item_counts?: WorkItemCounts
   customers?: Customer[]
+  runtime_health?: RuntimeHealth
 }
 
 export interface Customer {
@@ -591,6 +630,7 @@ export interface Customer {
   is_default?: boolean
   tracker_project_id?: string
   tracker_poll_enabled?: boolean
+  wait_estimated_duration?: boolean
   spec?: ProjectSpec
   prompt_block?: string
   created_at?: string | null

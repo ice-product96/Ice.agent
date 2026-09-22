@@ -6,11 +6,13 @@ from types import SimpleNamespace
 
 from app.tracker_poll import (
     build_tracker_poll_instruction,
+    cached_section_for_lane,
     can_reuse_work_item_for_structure,
     extract_board_tasks,
     extract_sections,
     is_open_tracker_task,
     match_section_for_lane,
+    sections_fingerprint,
     should_attach_tracker_poll,
     summarize_tracker_task,
     sync_work_item_tracker_card,
@@ -139,6 +141,13 @@ def test_tracker_lane_matches_russian_columns() -> None:
     assert match_section_for_lane(sections, "in_progress")["id"] == "s2"
     assert match_section_for_lane(sections, "qa")["id"] == "s3"
     assert match_section_for_lane(sections, "completed")["id"] == "s4"
+    cache = {
+        "fingerprint": sections_fingerprint(sections),
+        "lanes": {"qa": {"section_id": "s3", "section_name": "QA"}},
+    }
+    assert cached_section_for_lane(cache, sections, "qa")["id"] == "s3"
+    stale = dict(cache, fingerprint="other")
+    assert cached_section_for_lane(stale, sections, "qa") is None
 
 
 class _Item:
@@ -260,3 +269,17 @@ def test_tracker_poll_not_attached_to_unrelated_open_case() -> None:
     assert should_attach_tracker_poll(open_case, {"count_claimable": 0}) is False
     done = SimpleNamespace(status="done", pm_phase="DONE", context_json={})
     assert should_attach_tracker_poll(done, backlog) is True
+
+
+def test_closed_work_item_is_not_reuse_blocker() -> None:
+    closed = SimpleNamespace(
+        status="done",
+        pm_phase="DONE",
+        context_json={"tracker_task_id": "card-9"},
+        metadata_json={},
+    )
+    assert work_item_is_closed(closed) is True
+    assert can_reuse_work_item_for_structure(closed, tracker_task_id="card-9") is True
+    assert (
+        can_reuse_work_item_for_structure(closed, create_new_task=True) is False
+    )

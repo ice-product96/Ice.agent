@@ -16,6 +16,7 @@ from app.cursorremote_drive import (
     send_prompt_and_drive,
     status_from_worker_task,
     summarize_cursor_state,
+    summary_looks_incomplete,
 )
 
 
@@ -126,7 +127,6 @@ def test_cursor_is_busy_statuses() -> None:
     assert cursor_is_busy({"agentStatus": "thinking"})
     assert cursor_is_busy({"agentStatus": "searching"})
     assert cursor_is_busy({"agentStatus": "exploring"})
-    assert cursor_is_busy({"agentStatus": "idle", "agentActivityLive": True})
     assert cursor_is_busy({"agentStatus": "idle", "pendingApprovalCount": 2})
     assert cursor_is_busy(
         {
@@ -134,6 +134,10 @@ def test_cursor_is_busy_statuses() -> None:
             "text": '{"agentStatus": "waiting_approval", "pendingApprovalCount": 1}',
             "annotations": None,
         }
+    )
+    # Idle leftover UI after completion is not in-flight work.
+    assert not cursor_is_busy(
+        {"agentStatus": "idle", "agentActivityLive": True, "pendingApprovalCount": 0}
     )
     assert not cursor_is_busy({"agentStatus": "idle", "pendingApprovalCount": 0})
 
@@ -150,12 +154,45 @@ def test_cursor_is_explicitly_busy_ignores_idle_leftover() -> None:
     assert cursor_is_explicitly_busy({"agentStatus": "idle", "pendingApprovalCount": 2})
 
 
+def test_incomplete_plan_summary_is_not_completion() -> None:
+    assert summary_looks_incomplete(
+        "На порту 3055 уже есть процесс Next.js. Проверяю, отвечает ли он."
+    )
+    assert summary_looks_incomplete("Запущу dev-сервер и сниму скриншоты.")
+    assert not summary_looks_incomplete(
+        "Warehouses screen added. Open /warehouses and save a stock count."
+    )
+
+
 def test_search_messages_count_as_active_work() -> None:
     assert cursor_has_active_work(
         {"messages": [{"type": "assistant", "text": "Searching the codebase…"}]}
     )
     assert cursor_has_active_work({"messages": [{"type": "plan", "label": "search"}]})
+    assert not cursor_has_active_work(
+        {
+            "messages": [
+                {
+                    "type": "plan",
+                    "label": "todos",
+                    "todosCompleted": 4,
+                    "todosTotal": 4,
+                    "description": "All done",
+                }
+            ]
+        }
+    )
     assert not cursor_has_active_work({"messages": [{"type": "human", "text": "do LAVVE"}]})
+    assert not cursor_has_active_work(
+        {
+            "messages": [
+                {
+                    "type": "assistant",
+                    "text": "Запускаю dev-сервер, проверяю HTTP 200 и сниму скриншоты.",
+                }
+            ]
+        }
+    )
 
 
 def test_pin_followup_blocks_restart_wording() -> None:
@@ -203,6 +240,28 @@ def test_summarize_cursor_state_uses_assistant_text() -> None:
     assert "do LAVVE" not in summary
 
 
+def test_summarize_keeps_completed_plan_after_done() -> None:
+    summary = summarize_cursor_state(
+        {
+            "messages": [
+                {
+                    "type": "plan",
+                    "label": "todos",
+                    "description": "Implement warehouses",
+                    "todosCompleted": 5,
+                    "todosTotal": 5,
+                },
+                {
+                    "type": "assistant",
+                    "text": "Warehouses and stock counts are in. Open /warehouses to verify.",
+                },
+            ]
+        }
+    )
+    assert "Warehouses and stock counts" in summary
+    assert "[todos 5/5]" in summary
+
+
 def test_drive_does_not_treat_immediate_idle_as_done() -> None:
     session = ScriptSession({})
     result = asyncio.run(
@@ -241,6 +300,59 @@ def test_drive_returns_done_after_busy_then_idle() -> None:
     assert result["status"] == "idle"
     assert "LAVVE changes applied" in result["summary"]
     assert "Do NOT call schedule_self" in result["next"]
+
+
+def test_drive_treats_idle_leftover_plan_as_done() -> None:
+    session = ScriptSession(
+        {
+            "get_status": [
+                {
+                    "agentStatus": "generating",
+                    "pendingApprovalCount": 0,
+                    "agentActivityLive": True,
+                },
+                {
+                    "agentStatus": "generating",
+                    "pendingApprovalCount": 0,
+                    "agentActivityLive": True,
+                },
+            ]
+            + [
+                {
+                    "agentStatus": "idle",
+                    "pendingApprovalCount": 0,
+                    "agentActivityLive": True,
+                    "summary": "Added warehouse stock screen.",
+                }
+            ]
+            * 8,
+            "wait": [{"status": "needs_input", "pendingApprovalCount": 0}],
+            "get_state": [
+                {
+                    "pendingApprovals": [],
+                    "messages": [
+                        {
+                            "type": "plan",
+                            "label": "todos",
+                            "todosCompleted": 3,
+                            "todosTotal": 3,
+                            "description": "Warehouses",
+                        },
+                        {
+                            "type": "assistant",
+                            "text": "Added warehouse stock screen.",
+                        },
+                    ],
+                }
+            ]
+            * 6,
+        }
+    )
+    result = asyncio.run(
+        drive_until_done(session, timeout_ms=2000, start_grace_ms=0, idle_debounce_ms=0, require_busy=True)
+    )
+    assert result["done"] is True
+    assert "Added warehouse stock screen" in result["summary"]
 
 
 def test_drive_rejects_unchanged_pre_prompt_summary() -> None:
@@ -658,6 +770,9 @@ def test_send_task_passes_task_id_and_chat_id() -> None:
             task_id="42",
             chat_id="777",
             project_id="lavve",
+            work_item_id=42,
+            public_base_url="https://agent.example",
+            secret_key="test-secret",
         )
     )
     sent = next(args for tool, args in session.calls if tool == "send_task")
@@ -667,9 +782,87 @@ def test_send_task_passes_task_id_and_chat_id() -> None:
     assert sent["chatId"] == "777"
     assert sent["sessionId"] == "sess-1"
     assert sent["project_id"] == "lavve"
+    assert sent["callbackUrl"].startswith(
+        "https://agent.example/api/v1/cursor/callback/42?token="
+    )
+    assert sent["webhook_url"] == sent["callbackUrl"]
     assert not any(tool == "send_prompt" for tool, _ in session.calls)
     assert result["cursor_session_id"] == "sess-1"
     assert result["cursor_remote_task_id"] == "remote-9"
+    assert result["prompt_sent"] is True
+
+
+def test_send_task_retries_without_callback_if_mcp_rejects_it() -> None:
+    idle = {"agentStatus": "idle", "pendingApprovalCount": 0, "agentActivityLive": False}
+    thinking = {
+        "agentStatus": "thinking",
+        "pendingApprovalCount": 0,
+        "agentActivityLive": True,
+    }
+    prompt = "Fix header dropdown now please"
+    running_task = {
+        "ok": True,
+        "done": False,
+        "agentStatus": "thinking",
+        "agentActivityLive": True,
+        "pendingApprovalCount": 0,
+        "task": {"id": "remote-9", "sessionId": "sess-1", "status": "running"},
+    }
+    session = ScriptSession(
+        {
+            "get_status": [idle, idle],
+            "create_session": [
+                {"ok": True, "session": {"id": "sess-1", "composerId": "cmp-1"}}
+            ],
+            "send_task": [
+                RuntimeError("additional properties 'callbackUrl' not allowed"),
+                {
+                    "ok": True,
+                    "task": {
+                        "id": "remote-9",
+                        "sessionId": "sess-1",
+                        "taskId": "42",
+                        "status": "running",
+                    },
+                },
+            ],
+            "get_task": [running_task, running_task],
+            "get_messages": [
+                {
+                    "ok": True,
+                    "messages": [
+                        {"type": "human", "text": prompt},
+                        {"type": "assistant", "text": "working"},
+                    ],
+                }
+            ],
+            "wait": [{"status": "timeout"} for _ in range(8)],
+        },
+        default=thinking,
+        tool_names=[
+            "create_session",
+            "send_task",
+            "get_task",
+            "get_messages",
+            "get_status",
+            "list_windows",
+        ],
+    )
+    result = asyncio.run(
+        send_prompt_and_drive(
+            session,
+            prompt,
+            timeout_ms=400,
+            task_id="42",
+            work_item_id=42,
+            public_base_url="https://agent.example",
+            secret_key="test-secret",
+        )
+    )
+    sends = [args for tool, args in session.calls if tool == "send_task"]
+    assert len(sends) == 2
+    assert "callbackUrl" in sends[0]
+    assert "callbackUrl" not in sends[1]
     assert result["prompt_sent"] is True
 
 

@@ -22,6 +22,7 @@ from .db import (
     LlmProfile,
     McpServer,
     MessageLog,
+    ProjectState,
     RuntimeSettings,
     TelegramAccount,
     WorkItem,
@@ -73,6 +74,7 @@ from .employee import (
     list_open_consultations,
     list_open_needs,
     need_json,
+    persist_tech_log,
     save_once_job,
 )
 from .events import EventHub
@@ -100,6 +102,8 @@ from .employee_policy import (
 from .memory_scope import (
     bind_conversation_from_config,
     build_memory_metadata,
+    check_known_already,
+    extract_and_store_memories,
     format_memory_hits,
     memory_scope_prompt,
     prefetch_memories,
@@ -124,10 +128,49 @@ from .secrets import SecretStore
 
 
 NO_TELEGRAM_REPLY = "[[NO_TELEGRAM_REPLY]]"
+_TRANSIENT_CONTEXT_KEYS = frozenset({
+    "_judgment",
+    "_llm_client",
+    "_work_item",
+    "_memory_scope",
+    "_conversation_state",
+})
+
+
+def persistable_context(context: dict[str, Any] | None) -> dict[str, Any]:
+    """Drop runtime objects that cannot be stored on MessageLog.metadata_json."""
+    return {
+        key: value
+        for key, value in (context or {}).items()
+        if key not in _TRANSIENT_CONTEXT_KEYS and not callable(value)
+    }
 
 
 class PermissionDenied(PermissionError):
     pass
+
+
+def _mark_cursor_self_retry(
+    item: WorkItem,
+    *,
+    reason: str,
+    next_action: str,
+    block_automatic_resubmit: bool = False,
+) -> None:
+    """Park the case on self so the heartbeat can retry without a manager wait."""
+    meta = dict(item.metadata_json or {})
+    meta["cursor_in_flight"] = False
+    meta["operational_wait"] = True
+    if block_automatic_resubmit:
+        meta["automatic_resubmit_blocked"] = True
+    else:
+        meta.pop("automatic_resubmit_blocked", None)
+    item.metadata_json = meta
+    item.active_cursor_run_id = None
+    item.status = "in_progress"
+    item.wait_owner = "self"
+    item.next_action = next_action
+    item.last_error = (reason or "")[:2000] or None
 
 
 async def _pm_cursor_leftover(
@@ -159,27 +202,24 @@ async def _pm_cursor_leftover(
         "CHANGES_REQUESTED",
     }:
         await transition_pm_phase(db, item, "READY_FOR_DEV", detail=detail)
-    meta = dict(item.metadata_json or {})
-    meta["cursor_in_flight"] = False
     if allow_resubmit:
-        meta.pop("automatic_resubmit_blocked", None)
-    else:
-        meta["automatic_resubmit_blocked"] = True
-    item.metadata_json = meta
-    item.active_cursor_run_id = None
-    if allow_resubmit:
-        item.status = "in_progress"
-        item.wait_owner = "self"
-        item.next_action = "submit_development_task"
+        _mark_cursor_self_retry(
+            item,
+            reason="",
+            next_action="submit_development_task",
+            block_automatic_resubmit=False,
+        )
         item.last_error = None
     else:
-        item.status = "waiting_manager"
-        item.wait_owner = "manager"
-        item.next_action = (
-            "Composer показал чужой или неструктурированный результат. "
-            "Не вызывай submit_development_task, пока Composer не свободен от другого задания."
+        _mark_cursor_self_retry(
+            item,
+            reason=error,
+            next_action=(
+                "Composer занят чужим результатом. Подожди освобождения и вызови "
+                "submit_development_task."
+            ),
+            block_automatic_resubmit=True,
         )
-        item.last_error = error[:2000]
     await add_event(
         db,
         item,
@@ -190,6 +230,7 @@ async def _pm_cursor_leftover(
             "run_id": run.id,
             "automatic_resubmit_blocked": not allow_resubmit,
             "allow_resubmit": allow_resubmit,
+            "operational_wait": True,
         },
     )
     await db.commit()
@@ -319,16 +360,54 @@ def _pm_acceptance_issues(
     item: WorkItem,
     run: CursorRun | None,
 ) -> list[str]:
-    from .pm_state import cursor_run_satisfies_acceptance
-
+    """Structural blockers for QA acceptance (phase/status/run); evidence is judged separately."""
     issues: list[str] = []
     if item.pm_phase not in {"QA", "CLIENT_REVIEW"}:
         issues.append("task is not in QA")
     if item.status == "waiting_external":
         issues.append("task is still waiting for an external run")
-    if not cursor_run_satisfies_acceptance(item, run):
-        issues.append("Cursor completion lacks passing evidence")
+    if run is None or run.status != "completed":
+        issues.append("no completed Cursor run")
     return issues
+
+
+async def _qa_run_for_item(db: AsyncSession, item: WorkItem) -> CursorRun | None:
+    from .pm_state import latest_completed_cursor_run
+
+    run = (
+        await db.get(CursorRun, item.active_cursor_run_id)
+        if item.active_cursor_run_id
+        else None
+    )
+    if run is None or run.status != "completed":
+        run = await latest_completed_cursor_run(db, item)
+    return run
+
+
+async def _note_qa_hold(
+    db: AsyncSession,
+    item: WorkItem,
+    run: CursorRun,
+    decision: Any,
+) -> None:
+    """Record once per run that QA is on hold (degraded judge / low confidence)."""
+    from .work_items import add_event
+
+    meta = dict(item.metadata_json or {})
+    marker = f"{run.id}:{decision.verdict}"
+    if meta.get("qa_hold_marker") == marker:
+        return
+    meta["qa_hold_marker"] = marker
+    item.metadata_json = meta
+    item.next_action = f"QA на паузе: {decision.reason[:180]}"
+    await add_event(
+        db,
+        item,
+        kind="progress",
+        title="QA: требуется проверка",
+        detail=decision.reason[:1000],
+        payload={"run_id": run.id, "qa": decision.as_dict()},
+    )
 
 
 async def _auto_accept_pm_qa(
@@ -336,24 +415,45 @@ async def _auto_accept_pm_qa(
     item: WorkItem,
     mcp_manager: Any = None,
     scheduler: Any = None,
+    *,
+    judgment: Any = None,
+    client: Any = None,
 ) -> dict[str, Any] | None:
-    """Close a fully evidenced QA item without relying on another LLM turn."""
-    from .pm_state import (
-        cursor_run_satisfies_acceptance,
-        latest_completed_cursor_run,
-        transition_pm_phase,
-    )
-    from .project_schedule import min_execution_remaining_minutes
+    """Close a QA item only when the QA judge (or legacy machine evidence) accepts it."""
+    from .pm_state import transition_pm_phase
+    from .project_schedule import min_execution_remaining_minutes, project_commerce_settings
+    from .qa_gate import evaluate_qa
     from .work_items import add_event, cancel_work_item_schedules
 
-    run = (
-        await db.get(CursorRun, item.active_cursor_run_id)
-        if item.active_cursor_run_id
+    run = await _qa_run_for_item(db, item)
+    if _pm_acceptance_issues(item, run):
+        return None
+    assert run is not None
+    project = (
+        await db.get(ProjectState, item.project_id)
+        if item.project_id
         else None
     )
-    if not cursor_run_satisfies_acceptance(item, run):
-        run = await latest_completed_cursor_run(db, item)
-    if _pm_acceptance_issues(item, run):
+    decision = await evaluate_qa(
+        db,
+        item,
+        run,
+        judgment=judgment,
+        client=client,
+        project_config=dict(project.config or {}) if project is not None else None,
+    )
+    if not decision.accept:
+        if decision.should_request_fix:
+            return await _auto_request_qa_fix(
+                db,
+                item,
+                run,
+                mcp_manager=mcp_manager,
+                fix_request=decision.fix_request,
+                reason=decision.reason,
+                qa=decision.as_dict(),
+            )
+        await _note_qa_hold(db, item, run, decision)
         return None
     all_runs = list(
         await db.scalars(
@@ -362,13 +462,17 @@ async def _auto_accept_pm_qa(
             .order_by(CursorRun.attempt)
         )
     )
-    if min_execution_remaining_minutes(item, all_runs) > 0:
+    settings = project_commerce_settings(project)
+    if min_execution_remaining_minutes(item, all_runs, settings=settings) > 0:
         return None
     await transition_pm_phase(
         db,
         item,
         "DONE",
-        detail="QA accepted automatically from verified Cursor evidence",
+        detail=(
+            "QA accepted automatically: "
+            + ("judge verified every criterion" if not decision.legacy else "structured evidence complete")
+        ),
         mcp=mcp_manager,
     )
     item.status = "done"
@@ -385,28 +489,27 @@ async def _auto_accept_pm_qa(
     meta["cursor_in_flight"] = False
     meta.pop("cursor_baseline_summary", None)
     meta.pop("automatic_resubmit_blocked", None)
+    meta.pop("operational_wait", None)
+    meta.pop("qa_fix_request", None)
+    meta.pop("qa_hold_marker", None)
     item.metadata_json = meta
+    completion = run.result_json or {}
+    customer_result = str(
+        decision.customer_summary
+        or completion.get("customer_response")
+        or (completion.get("implementation") or {}).get("summary")
+        or getattr(item, "last_cursor_summary", None)
+        or f"Задача «{item.title}» выполнена."
+    ).strip()
     await add_event(
         db,
         item,
         kind="completed",
         title="QA принято автоматически",
-        detail=str(
-            (run.result_json or {}).get("customer_response")
-            or ((run.result_json or {}).get("implementation") or {}).get("summary")
-            or getattr(item, "last_cursor_summary", None)
-            or ""
-        )[:1000],
-        payload={"automatic": True, "tracker_error": tracker_error},
+        detail=customer_result[:1000],
+        payload={"automatic": True, "tracker_error": tracker_error, "qa": decision.as_dict()},
     )
     await cancel_work_item_schedules(db, item, scheduler, mark_aborted=False)
-    completion = run.result_json or {}
-    customer_result = str(
-        completion.get("customer_response")
-        or (completion.get("implementation") or {}).get("summary")
-        or getattr(item, "last_cursor_summary", None)
-        or f"Задача «{item.title}» выполнена."
-    ).strip()
     return {
         "ok": True,
         "work_item_id": item.id,
@@ -419,23 +522,131 @@ async def _auto_accept_pm_qa(
     }
 
 
+async def _auto_request_qa_fix(
+    db: AsyncSession,
+    item: WorkItem,
+    run: CursorRun,
+    *,
+    mcp_manager: Any = None,
+    fix_request: str = "",
+    reason: str = "",
+    qa: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """When QA evidence is incomplete, send the case back for Cursor fixes."""
+    from .pm_state import transition_pm_phase
+    from .work_items import add_event
+
+    meta = dict(item.metadata_json or {})
+    if meta.get("qa_fix_requested_run_id") == run.id:
+        return None
+    if item.pm_phase not in {"QA", "CLIENT_REVIEW", "DEV_COMPLETE"}:
+        return None
+    detail = (reason or "QA evidence incomplete — request Cursor fixes")[:1000]
+    await transition_pm_phase(
+        db,
+        item,
+        "CHANGES_REQUESTED",
+        detail=detail,
+        mcp=mcp_manager,
+    )
+    meta["qa_fix_requested_run_id"] = run.id
+    meta["cursor_in_flight"] = False
+    meta.pop("automatic_resubmit_blocked", None)
+    meta.pop("qa_hold_marker", None)
+    if fix_request:
+        meta["qa_fix_request"] = fix_request[:8000]
+    item.metadata_json = meta
+    item.active_cursor_run_id = None
+    item.status = "in_progress"
+    item.wait_owner = "self"
+    item.next_action = (
+        "submit_development_task — доработать: " + fix_request[:200]
+        if fix_request
+        else "submit_development_task — доработать критерии приёмки"
+    )
+    item.last_error = f"QA: {reason[:300]}" if reason else "QA: нет подтверждения всех критериев приёмки"
+    await add_event(
+        db,
+        item,
+        kind="progress",
+        title="QA → доработка",
+        detail=(reason or "Автоматически: результат Cursor не покрывает критерии приёмки.")[:1000],
+        payload={
+            "run_id": run.id,
+            "automatic": True,
+            "fix_request": fix_request[:4000],
+            "qa": qa or {},
+        },
+    )
+    await db.commit()
+    return {
+        "ok": True,
+        "work_item_id": item.id,
+        "status": "in_progress",
+        "pm_phase": "CHANGES_REQUESTED",
+        "fix_requested": True,
+        "deliver_origin": False,
+    }
+
+
 async def _apply_pm_cursor_result(
     db: AsyncSession,
     item: WorkItem,
     run: CursorRun,
     result: dict[str, Any],
+    *,
+    judgment: Any = None,
+    client: Any = None,
 ) -> dict[str, Any]:
     """Persist one structured PM Cursor poll without an LLM round."""
+    from .cursor_gate import apply_completion_to_result, assess_completion
     from .cursorremote_drive import prompt_actually_started
     from .pm_state import (
         is_leftover_cursor_idle,
         parse_cursor_result,
         recover_truncated_cursor_result,
+        native_cursor_summary_as_result,
         transition_pm_phase,
         update_cursor_run,
     )
     from .work_items import add_event, stamp_cursor_prompt_sent
 
+    if result.get("done") or result.get("callback") or result.get("approvals"):
+        project = await db.get(ProjectState, item.project_id) if item.project_id else None
+        completion = await assess_completion(
+            db,
+            item,
+            run,
+            result,
+            judgment=judgment,
+            client=client,
+            project_config=dict(project.config or {}) if project is not None else None,
+        )
+        if completion.judged:
+            result = apply_completion_to_result(result, completion)
+            if completion.state == "foreign_result":
+                return await _pm_cursor_leftover(
+                    db,
+                    item,
+                    run,
+                    result,
+                    error="Cursor report belongs to another assignment",
+                    detail=completion.reason[:800] or "foreign_result",
+                    reason=(
+                        "Executor report is for another task. "
+                        "Do not accept QA and do not treat this as done."
+                    ),
+                    allow_resubmit=False,
+                )
+            if completion.state == "needs_input":
+                await add_event(
+                    db,
+                    item,
+                    kind="progress",
+                    title="Cursor ждёт ввода",
+                    detail=completion.reason[:800],
+                    payload={"completion": completion.as_dict()},
+                )
     started = prompt_actually_started(result)
     status_name = str(result.get("status") or "").strip().lower()
     composer_busy = status_name == "cursor_busy" or (
@@ -472,16 +683,13 @@ async def _apply_pm_cursor_result(
                 "READY_FOR_DEV",
                 detail="Cursor did not accept the prompt",
             )
-        meta = dict(item.metadata_json or {})
-        meta["cursor_in_flight"] = False
-        item.metadata_json = meta
-        item.active_cursor_run_id = None
-        item.status = "waiting_manager"
-        item.wait_owner = "manager"
-        item.last_error = reason
-        item.next_action = (
-            "Откройте Cursor на нужном workspace и нажмите «Продолжи» / "
-            "submit_development_task"
+        _mark_cursor_self_retry(
+            item,
+            reason=reason,
+            next_action=(
+                "Повтори submit_development_task когда Cursor на нужном workspace "
+                "(operational wait — не зови руководителя)."
+            ),
         )
         await add_event(
             db,
@@ -493,6 +701,7 @@ async def _apply_pm_cursor_result(
                 "status": result.get("status"),
                 "workspace": result.get("workspace"),
                 "windows": result.get("windows") or [],
+                "operational_wait": True,
             },
         )
         await db.commit()
@@ -504,6 +713,7 @@ async def _apply_pm_cursor_result(
             "prompt_sent": False,
             "started": False,
             "needs_workspace": True,
+            "operational_wait": True,
             "reason": reason,
             "result": result,
         }
@@ -516,9 +726,9 @@ async def _apply_pm_cursor_result(
         ctx = item.context_json if isinstance(item.context_json, dict) else {}
         min_minutes = ctx.get("min_execution_minutes")
         item.next_action = (
-            f"Wait for structured Cursor result (min {min_minutes} min by estimate)"
+            f"Wait for Cursor summary (min {min_minutes} min by estimate)"
             if min_minutes
-            else "Wait for structured Cursor result"
+            else "Wait for Cursor summary"
         )
         meta = dict(item.metadata_json or {})
         meta["cursor_in_flight"] = True
@@ -596,6 +806,36 @@ async def _apply_pm_cursor_result(
             )
             if structured is not None:
                 break
+        if structured is None and result.get("done"):
+            meta = dict(item.metadata_json or {})
+            ours = bool(
+                started
+                or result.get("seen_busy")
+                or result.get("prompt_sent")
+                or meta.get("cursor_in_flight")
+            )
+            baseline = str(result.get("baseline_summary") or "").strip()
+            if ours:
+                for candidate in candidates:
+                    text = candidate
+                    if isinstance(text, dict):
+                        text = (
+                            text.get("content")
+                            or text.get("text")
+                            or text.get("summary")
+                            or ""
+                        )
+                    if not isinstance(text, str):
+                        continue
+                    if baseline and text.strip() == baseline:
+                        continue
+                    structured = native_cursor_summary_as_result(
+                        text,
+                        expected_task_id=str(item.id),
+                        acceptance_criteria=criteria,
+                    )
+                    if structured is not None:
+                        break
     leftover_reason: tuple[str, str, str] | None = None
     task_id = str(item.id)
     if structured is not None:
@@ -642,7 +882,7 @@ async def _apply_pm_cursor_result(
             error=error,
             detail=detail,
             reason=reason,
-            allow_resubmit=not started and not composer_busy,
+            allow_resubmit=not composer_busy,
         )
 
     await update_cursor_run(
@@ -663,6 +903,13 @@ async def _apply_pm_cursor_result(
     if structured["status"] == "completed":
         item.last_cursor_summary = json.dumps(structured, ensure_ascii=False)
         item.evidence_json = dict(structured.get("verification") or {})
+        if item.pm_phase in {"READY_FOR_DEV", "BLOCKED", "CHANGES_REQUESTED"}:
+            await transition_pm_phase(
+                db,
+                item,
+                "IN_DEVELOPMENT",
+                detail="Cursor completion received",
+            )
         await transition_pm_phase(
             db, item, "DEV_COMPLETE", detail="Cursor development complete"
         )
@@ -703,9 +950,16 @@ async def _poll_pm_cursor_item(
     db: AsyncSession,
     item: WorkItem,
     cursor_session: Any,
+    *,
+    judgment: Any = None,
+    client: Any = None,
 ) -> dict[str, Any]:
     """Poll or reattach a PM Cursor run without invoking the agent LLM."""
-    from .cursorremote_drive import check_and_drive, cursor_worker_kwargs
+    from .cursorremote_drive import (
+        check_and_drive,
+        composer_is_actively_working,
+        cursor_worker_kwargs,
+    )
     from .pm_state import (
         get_or_create_cursor_run,
         transition_pm_phase,
@@ -736,7 +990,7 @@ async def _poll_pm_cursor_item(
             work_item_id=item.id,
             **cursor_worker_kwargs(item),
         )
-        if live.get("done") or live.get("seen_busy") or live.get("started"):
+        if composer_is_actively_working(live):
             attempt = int(
                 await db.scalar(
                     select(func.count())
@@ -767,7 +1021,9 @@ async def _poll_pm_cursor_item(
             meta["cursor_in_flight"] = not bool(live.get("done"))
             item.metadata_json = meta
             await db.commit()
-            return await _apply_pm_cursor_result(db, item, run, live)
+            return await _apply_pm_cursor_result(
+                db, item, run, live, judgment=judgment, client=client
+            )
         return {
             "task": work_item_json(item),
             "status": "no_active_run",
@@ -799,6 +1055,8 @@ async def _poll_pm_cursor_item(
             work_item_id=item.id,
             **cursor_worker_kwargs(item),
         ),
+        judgment=judgment,
+        client=client,
     )
 
 
@@ -981,6 +1239,7 @@ class AgentRuntime:
         telegram: TelegramGateway | None = None,
         mcp: McpManager | None = None,
         sip: Any | None = None,
+        judgment: Any | None = None,
     ) -> None:
         self.settings = settings
         self.memory = memory
@@ -989,6 +1248,11 @@ class AgentRuntime:
         self.telegram = telegram
         self.mcp = mcp
         self.sip = sip
+        if judgment is None:
+            from .judgment import JudgmentService
+
+            judgment = JudgmentService(settings, events)
+        self.judgment = judgment
         self.task_bus: TaskBus | None = None
         self.scheduler: Any = None
         self.conversations = ConversationContextService()
@@ -1005,6 +1269,28 @@ class AgentRuntime:
             lock = asyncio.Lock()
             self._agent_locks[agent_id] = lock
         return lock
+
+    async def _judge_fallback_client(self, db: AsyncSession, agent: Agent) -> Any | None:
+        """Agent's own LLM client for judges when no dedicated judge profile is configured."""
+        if self.judgment.configured:
+            return None
+        if agent.llm_profile_id is None:
+            return None
+        profile = await db.get(LlmProfile, agent.llm_profile_id)
+        if profile is None or not profile.enabled:
+            return None
+        api_key = SecretStore.from_settings(self.settings).decrypt(profile.api_key_ciphertext)
+        if not api_key:
+            return None
+        options: dict[str, Any] = dict(
+            api_key=api_key,
+            base_url=profile.base_url,
+            model=agent.model_name or profile.default_model,
+            max_rounds=1,
+        )
+        if profile.http_proxy:
+            options["http_proxy"] = profile.http_proxy
+        return LLMClient(**options)
 
     async def _cursorremote_session(
         self,
@@ -1118,15 +1404,15 @@ class AgentRuntime:
         admin_ids = set(self.telegram.admin_ids) if self.telegram else set()
 
         async def redirect_to_manager(text: str) -> dict[str, Any]:
-            sent = await self._notify_manager_status(phone, agent, context, text)
+            await self._notify_manager_status(phone, agent, context, text)
             return {
                 "ok": True,
                 "redirected_to_manager": True,
                 "customer_notified": False,
-                "recipients": len(sent),
+                "recipients": 0,
                 "reason": (
                     "Customer receives only the finished result. "
-                    "This progress note was sent to the manager."
+                    "This progress note was stored in the tech log, not Telegram."
                 ),
             }
 
@@ -1141,9 +1427,20 @@ class AgentRuntime:
                 *,
                 humanize: bool = True,
             ) -> Any:
-                if should_redirect_customer_outbound(
-                    context, registry.audit, entity, admin_ids=admin_ids
-                ):
+                from .delivery_gate import decide_customer_delivery
+
+                delivery = await decide_customer_delivery(
+                    text=str(text or ""),
+                    context=context,
+                    audit=registry.audit,
+                    entity=entity,
+                    admin_ids=admin_ids,
+                    judgment=self.judgment,
+                    work_item=(context or {}).get("_work_item"),
+                    client=(context or {}).get("_llm_client"),
+                )
+                (context or {}).setdefault("_delivery_judgment", delivery.as_dict())
+                if delivery.redirect:
                     return await redirect_to_manager(str(text or ""))
                 result = inner_send(entity, text, reply_to=reply_to, humanize=humanize)
                 return await result if inspect.isawaitable(result) else result
@@ -1160,9 +1457,19 @@ class AgentRuntime:
             inner_file = file_tool.function
 
             async def telegram_send_file(entity: Any, file: str, caption: str = "") -> Any:
-                if should_redirect_customer_outbound(
-                    context, registry.audit, entity, admin_ids=admin_ids
-                ):
+                from .delivery_gate import decide_customer_delivery
+
+                delivery = await decide_customer_delivery(
+                    text=caption,
+                    context=context,
+                    audit=registry.audit,
+                    entity=entity,
+                    admin_ids=admin_ids,
+                    judgment=self.judgment,
+                    work_item=(context or {}).get("_work_item"),
+                    client=(context or {}).get("_llm_client"),
+                )
+                if delivery.redirect:
                     note = caption.strip() or "Файл для заказчика (ещё не результат)."
                     return await redirect_to_manager(note)
                 result = inner_file(entity, file, caption=caption)
@@ -1181,9 +1488,15 @@ class AgentRuntime:
         agent: Agent,
         context: dict[str, Any],
         text: str,
+        *,
+        db: AsyncSession | None = None,
+        account_id: int | None = None,
+        kind: str = "tick",
     ) -> list[Any]:
+        """Record a tick/progress note in the tech log. Never send it to Telegram."""
+        del phone
         cleaned = (text or "").strip()
-        if not cleaned or not phone or not self.telegram or not self.telegram.admin_ids:
+        if not cleaned:
             return []
         previous = str(context.get("_manager_status_text") or "").strip()
         if previous and previous == cleaned:
@@ -1194,13 +1507,41 @@ class AgentRuntime:
             work_item_id=context.get("work_item_id"),
             source=context.get("source"),
         )
-        try:
-            sent = await self.telegram.notify_admins(str(phone), body)
-        except Exception:
-            return []
         context["_manager_status_sent"] = True
         context["_manager_status_text"] = cleaned
-        return list(sent)
+        pending = context.setdefault("_tech_logs", [])
+        if isinstance(pending, list):
+            pending.append({"text": body, "kind": kind})
+        if db is not None:
+            await self._flush_tech_logs(
+                db, agent, context, account_id=account_id
+            )
+        return []
+
+    async def _flush_tech_logs(
+        self,
+        db: AsyncSession,
+        agent: Agent,
+        context: dict[str, Any],
+        *,
+        account_id: int | None = None,
+    ) -> None:
+        pending = context.get("_tech_logs")
+        if not isinstance(pending, list) or not pending:
+            return
+        for entry in list(pending):
+            if not isinstance(entry, dict):
+                continue
+            await persist_tech_log(
+                db,
+                agent_id=agent.id,
+                text=str(entry.get("text") or ""),
+                kind=str(entry.get("kind") or "tick"),
+                account_id=account_id,
+                context=context,
+                events=self.events,
+            )
+        pending.clear()
 
     async def registry(
         self,
@@ -1502,10 +1843,7 @@ class AgentRuntime:
                 readiness_issues,
                 record_decision,
                 record_scope_change,
-                requirements_expand_spec,
-                revert_spec_to_draft,
                 stamp_autonomy_flags,
-                topic_is_spec_approval,
                 transition_pm_phase,
             )
             from .customers import ensure_work_item_project
@@ -1596,7 +1934,7 @@ class AgentRuntime:
                 # Deduplicate by ice_tracker card id when reclaiming from backlog.
                 if item is None and tracker_task_id:
                     existing_tracker = await find_work_item_for_tracker_task(
-                        db, agent.id, tracker_task_id
+                        db, agent.id, tracker_task_id, include_closed=False
                     )
                     if existing_tracker is not None:
                         item = existing_tracker
@@ -1699,7 +2037,7 @@ class AgentRuntime:
                 )
                 if customer is None:
                     customer = await match_customer_from_text(
-                        db, agent, f"{title}\n{resolved_project}"
+                        db, agent, f"{title}\n{resolved_project}", context=context
                     )
                 if uuid_re.match(resolved_project):
                     tracker_project_id = resolved_project
@@ -1809,7 +2147,6 @@ class AgentRuntime:
                         ),
                         "task": work_item_json(item),
                     }
-                previous_requirements = list(item.requirements or [])
                 previous_phase = item.pm_phase
                 apply_task_contract(item, contract)
                 project_state = await get_or_create_project_state(db, contract.project_id)
@@ -1835,17 +2172,11 @@ class AgentRuntime:
                             commerce_settings["min_execution_ratio"] or 1
                         ),
                         currency=str(commerce_settings["currency"]),
+                        wait_estimated_duration=bool(
+                            commerce_settings.get("wait_estimated_duration", True)
+                        ),
                     )
                 spec = read_project_spec(project_state)
-                if previous_phase in {
-                    "CLIENT_CONFIRMED",
-                    "READY_FOR_DEV",
-                    "REQUIREMENTS_READY",
-                } and requirements_expand_spec(item, spec, previous_requirements):
-                    spec = revert_spec_to_draft(project_state)
-                    ctx = dict(item.context_json or {})
-                    ctx.pop("execution", None)
-                    item.context_json = ctx
                 verdict = apply_execution_assessment(
                     item,
                     spec,
@@ -1865,6 +2196,22 @@ class AgentRuntime:
                     target = "CLARIFICATION"
                 else:
                     target = "REQUIREMENTS_READY" if is_task_ready(item) else "CLARIFICATION"
+                # #region agent log
+                from .pm_state import _agent_dbg as _struct_dbg
+
+                _struct_dbg(
+                    "E",
+                    "runtime.py:pm_structure_task",
+                    "structure target phase",
+                    {
+                        "item_id": getattr(item, "id", None),
+                        "from_phase": previous_phase,
+                        "target": target,
+                        "verdict": verdict.get("verdict"),
+                        "reasons": list(verdict.get("reasons") or [])[:8],
+                    },
+                )
+                # #endregion
                 if item.pm_phase != target:
                     if not can_transition(item.pm_phase, target) and item.pm_phase not in {
                         "DISCUSSION",
@@ -1986,8 +2333,16 @@ class AgentRuntime:
                 decision: str,
                 confirmed_by: str = "",
                 work_item_id: int = 0,
+                subject: str = "",
             ) -> dict[str, Any]:
-                """Persist a confirmed project decision idempotently."""
+                """Persist a confirmed project decision idempotently.
+
+                `subject` says what was approved: spec | cost | slice | development_start |
+                result | other. The approval judge verifies the live customer message really
+                approves that subject before the platform treats it as a confirmation.
+                """
+                from .approval_gate import APPROVAL_SUBJECTS, detect_approval
+
                 target_work_item_id = work_item_id or (context or {}).get("work_item_id")
                 target_item = await get_work_item(db, target_work_item_id)
                 if (
@@ -1998,14 +2353,64 @@ class AgentRuntime:
                     raise PermissionError(
                         "Decision must reference this agent's task in the same project"
                     )
+                subject = str(subject or "").strip().lower()
+                if subject and subject not in APPROVAL_SUBJECTS:
+                    raise ValueError(
+                        f"subject must be one of {', '.join(APPROVAL_SUBJECTS)}"
+                    )
+                project = await get_or_create_project_state(db, project_id)
+                from .project_schedule import project_commerce_settings, task_commerce_snapshot
+
+                try:
+                    commerce = project_commerce_settings(project)
+                    cost_snapshot = task_commerce_snapshot(
+                        target_item,
+                        hourly_rate=float(commerce.get("hourly_rate") or 0.0),
+                        currency=str(commerce.get("currency") or "RUB"),
+                    )
+                except Exception:
+                    cost_snapshot = None
+                approval = await detect_approval(
+                    db,
+                    judgment=self.judgment,
+                    context=context,
+                    subject=subject,
+                    topic=topic,
+                    decision=decision,
+                    confirmed_by=confirmed_by,
+                    item=target_item,
+                    spec=read_project_spec(project),
+                    cost=cost_snapshot if isinstance(cost_snapshot, dict) else None,
+                    project_config=dict(project.config or {}),
+                    client=(context or {}).get("_llm_client"),
+                )
+                if approval.verdict in {"not_an_approval", "rejected", "unclear", "low_confidence", "degraded"}:
+                    # Enforced judge: the message is not an explicit approval — do not
+                    # store a confirmation that would unlock development.
+                    if approval.verdict == "rejected":
+                        raise ValueError(
+                            f"The {approval.actor} rejected {approval.subject}: {approval.reason}. "
+                            "Record nothing; adjust the plan or ask what they want changed."
+                        )
+                    raise ValueError(
+                        f"Not an explicit approval of {approval.subject} ({approval.verdict}): "
+                        f"{approval.reason}. Ask the customer to confirm in plain words, then retry."
+                    )
+                actor_label = approval.actor if approval.actor != "unknown" else (confirmed_by or "")
                 row = await record_decision(
                     db,
                     project_id=project_id,
                     topic=topic,
                     decision=decision,
-                    confirmed_by=confirmed_by,
+                    confirmed_by=confirmed_by or actor_label,
                     source_message_id=str((context or {}).get("message_id") or "") or None,
                     work_item_id=target_item.id,
+                    context={
+                        "subject": approval.subject,
+                        "actor": approval.actor,
+                        "conditions": approval.conditions,
+                        "approval": approval.as_dict(),
+                    },
                 )
                 if getattr(row, "_pm_created", False):
                     await add_event(
@@ -2014,13 +2419,15 @@ class AgentRuntime:
                         kind="decision",
                         title=topic,
                         detail=decision,
-                        payload={"decision_id": row.id},
+                        payload={"decision_id": row.id, "approval": approval.as_dict()},
                     )
+                customer_approved = approval.customer_approved or (
+                    approval.legacy
+                    and is_client_confirmer(confirmed_by, source_message_id=row.source_message_id)
+                )
                 if (
-                    is_client_confirmer(
-                        confirmed_by,
-                        source_message_id=row.source_message_id,
-                    )
+                    customer_approved
+                    and approval.subject in {"slice", "development_start", "spec", "other"}
                     and target_item.pm_phase == "REQUIREMENTS_READY"
                     and is_task_ready(target_item)
                 ):
@@ -2030,17 +2437,15 @@ class AgentRuntime:
                         "CLIENT_CONFIRMED",
                         detail=decision or topic,
                         payload={
-                            "confirmed_by": confirmed_by or "customer",
+                            "confirmed_by": confirmed_by or approval.actor or "customer",
                             "source_message_id": row.source_message_id,
                             "decision_id": row.id,
+                            "subject": approval.subject,
                         },
                     )
-                from .project_schedule import mark_cost_approved, topic_is_cost_approval
+                from .project_schedule import mark_cost_approved
 
-                if topic_is_cost_approval(topic, decision) and is_client_confirmer(
-                    confirmed_by,
-                    source_message_id=row.source_message_id,
-                ):
+                if approval.subject == "cost" and customer_approved:
                     mark_cost_approved(target_item, decision_id=row.id)
                     await add_event(
                         db,
@@ -2051,11 +2456,7 @@ class AgentRuntime:
                         payload={"decision_id": row.id},
                     )
                 spec_payload: dict[str, Any] | None = None
-                if topic_is_spec_approval(topic, decision) and is_client_confirmer(
-                    confirmed_by,
-                    source_message_id=row.source_message_id,
-                ):
-                    project = await get_or_create_project_state(db, project_id)
+                if approval.subject == "spec" and customer_approved:
                     spec_payload = confirm_project_spec(
                         project, confirmed_by=confirmed_by or "customer"
                     )
@@ -2094,7 +2495,22 @@ class AgentRuntime:
                         )
                 await _disarm_pm_intake(target_item)
                 await db.commit()
-                result = {"ok": True, "decision_id": row.id, "task": work_item_json(target_item)}
+                result = {
+                    "ok": True,
+                    "decision_id": row.id,
+                    "task": work_item_json(target_item),
+                    "approval": {
+                        "subject": approval.subject,
+                        "actor": approval.actor,
+                        "verdict": approval.verdict,
+                        "conditions": approval.conditions,
+                    },
+                }
+                if approval.conditions:
+                    result["note"] = (
+                        "Approval carries conditions — honour them in the task: "
+                        + "; ".join(approval.conditions[:6])
+                    )
                 if spec_payload is not None:
                     result["spec"] = spec_payload
                 return result
@@ -2277,6 +2693,9 @@ class AgentRuntime:
                     hourly_rate=float(settings["hourly_rate"] or 0),
                     min_execution_ratio=float(settings["min_execution_ratio"] or 1),
                     currency=str(settings["currency"]),
+                    wait_estimated_duration=bool(
+                        settings.get("wait_estimated_duration", True)
+                    ),
                 )
                 await add_event(
                     db,
@@ -2416,7 +2835,7 @@ class AgentRuntime:
                 }
 
             async def pm_assess_execution(work_item_id: int = 0) -> dict[str, Any]:
-                """Decide execute vs discuss vs draft_spec. Required before submit_development_task."""
+                """Check spec confirmation and task completeness. Scope in/out of ТЗ is your judgment, not keyword overlap."""
                 item = await get_work_item(
                     db, work_item_id or (context or {}).get("work_item_id")
                 )
@@ -2476,7 +2895,7 @@ class AgentRuntime:
             registry.register(
                 pm_assess_execution,
                 "pm_assess_execution",
-                "Decide execute vs discuss vs draft_spec. Call before submit_development_task.",
+                "Check spec confirmation and task completeness. Call before submit_development_task. Scope is your judgment, not keyword overlap.",
             )
             registry.register(pm_record_decision, "pm_record_decision")
             registry.register(pm_transition_task, "pm_transition_task")
@@ -2630,16 +3049,13 @@ class AgentRuntime:
                             "READY_FOR_DEV",
                             detail=detail,
                         )
-                    meta = dict(item.metadata_json or {})
-                    meta["cursor_in_flight"] = False
-                    item.metadata_json = meta
-                    item.active_cursor_run_id = None
-                    item.status = "waiting_manager"
-                    item.wait_owner = "manager"
-                    item.last_error = reason[:2000]
-                    item.next_action = (
-                        "Откройте Cursor на нужном workspace и нажмите «Продолжи» / "
-                        "submit_development_task"
+                    _mark_cursor_self_retry(
+                        item,
+                        reason=reason,
+                        next_action=(
+                            "Повтори submit_development_task когда Cursor на нужном "
+                            "workspace (operational wait — не зови руководителя)."
+                        ),
                     )
                     await add_event(
                         db,
@@ -2651,6 +3067,7 @@ class AgentRuntime:
                             "status": result.get("status"),
                             "workspace": result.get("workspace"),
                             "windows": result.get("windows") or [],
+                            "operational_wait": True,
                         },
                     )
                     await db.commit()
@@ -2662,6 +3079,7 @@ class AgentRuntime:
                         "prompt_sent": False,
                         "started": False,
                         "needs_workspace": True,
+                        "operational_wait": True,
                         "reason": reason,
                         "next": result.get("next") or detail,
                         "result": result,
@@ -2807,7 +3225,14 @@ class AgentRuntime:
                         run: CursorRun,
                         result: dict[str, Any],
                     ) -> dict[str, Any]:
-                        applied = await _apply_pm_cursor_result(db, item, run, result)
+                        applied = await _apply_pm_cursor_result(
+                            db,
+                            item,
+                            run,
+                            result,
+                            judgment=self.judgment,
+                            client=(context or {}).get("_llm_client"),
+                        )
                         if applied.get("done"):
                             cursor_state["finished"] = True
                         return applied
@@ -2821,6 +3246,13 @@ class AgentRuntime:
                             raise ValueError(
                                 "Task is already closed. Do not call submit_development_task."
                             )
+                        if context.get("_memory_degraded") and not (
+                            (item.metadata_json or {}).get("operator_force_submit")
+                        ):
+                            raise PermissionError(
+                                "Memory backend is degraded; irreversible actions are blocked. "
+                                "Ask the operator to restore memory or force-submit from the panel."
+                            )
                         if not is_task_ready(item):
                             raise ValueError("Task requirements and acceptance criteria are incomplete")
                         project = await get_or_create_project_state(
@@ -2832,6 +3264,22 @@ class AgentRuntime:
                             project_state=project,
                             draft_if_missing=False,
                         )
+                        # #region agent log
+                        from .pm_state import _agent_dbg as _submit_dbg
+
+                        _submit_dbg(
+                            "C",
+                            "runtime.py:submit_development_task",
+                            "submit gate",
+                            {
+                                "item_id": getattr(item, "id", None),
+                                "phase": getattr(item, "pm_phase", None),
+                                "verdict": verdict.get("verdict"),
+                                "reasons": list(verdict.get("reasons") or [])[:8],
+                                "spec_status": verdict.get("spec_status"),
+                            },
+                        )
+                        # #endregion
                         if verdict.get("verdict") != "execute":
                             raise PermissionError(execution_gate_error(verdict))
                         from .employee import get_or_create_profile
@@ -2925,6 +3373,48 @@ class AgentRuntime:
                             }
                         confirmed = await item_has_client_confirmation(db, item)
                         stamp_autonomy_flags(item, client_confirmed=confirmed)
+                        from .approval_gate import judge_scope, scope_block_message
+
+                        scope = await judge_scope(
+                            db,
+                            item,
+                            spec=read_project_spec(project),
+                            autonomy_level=str(project.autonomy_level or "LEVEL_1"),
+                            judgment=self.judgment,
+                            client_confirmed=confirmed,
+                            project_config=dict(project.config or {}),
+                            client=(context or {}).get("_llm_client"),
+                        )
+                        scope_ctx = dict(item.context_json or {})
+                        scope_ctx["scope_judgment"] = {
+                            "verdict": scope.verdict,
+                            "size": scope.size,
+                            "risk": scope.risk,
+                            "outside_items": scope.outside_items[:12],
+                            "legacy": scope.legacy,
+                            "record_id": scope.judgment.record_id if scope.judgment else None,
+                        }
+                        if not scope.legacy:
+                            scope_ctx["inside_agreed_scope"] = scope.inside_scope
+                            scope_ctx["small_fix"] = scope.small_fix
+                            if scope.high_risk:
+                                scope_ctx["high_risk"] = True
+                        item.context_json = scope_ctx
+                        operator_force = bool(
+                            (item.metadata_json or {}).get("operator_force_submit")
+                        )
+                        blocked = scope_block_message(scope, client_confirmed=confirmed)
+                        if blocked and not operator_force:
+                            await add_event(
+                                db,
+                                item,
+                                kind="progress",
+                                title="Развитие заблокировано судьёй scope",
+                                detail=blocked[:1000],
+                                payload={"scope": scope.as_dict()},
+                            )
+                            await db.commit()
+                            raise PermissionError(blocked)
                         inside_scope = bool(
                             (item.context_json or {}).get("inside_agreed_scope")
                         )
@@ -2944,7 +3434,7 @@ class AgentRuntime:
                             inside_agreed_scope=inside_scope,
                             small_fix=small_fix,
                             high_risk=False,
-                        ) and not confirmed:
+                        ) and not confirmed and not operator_force:
                             extra = ""
                             if not commerce_settings["cost_requires_customer_approval"]:
                                 extra = (
@@ -3075,15 +3565,12 @@ class AgentRuntime:
                             or 0
                         ) + 1
                         brief = render_task_brief(item)
+                        if not fix_request and item.pm_phase == "CHANGES_REQUESTED":
+                            fix_request = str(
+                                (item.metadata_json or {}).get("qa_fix_request") or ""
+                            ).strip()
                         if fix_request:
                             brief += f"\n## Required fix\n{fix_request}\n"
-                        brief += (
-                            "\nReturn a JSON object with task_id, status "
-                            "(completed|blocked|failed), implementation {summary, files_changed, tests}, "
-                            "verification {tests_passed, lint_passed, acceptance_criteria: "
-                            "[{criterion, passed, evidence}]}, questions, risks, and limitations. "
-                            "Include one evidence entry for every acceptance criterion exactly as written."
-                        )
                         run, created = await get_or_create_cursor_run(
                             db,
                             item,
@@ -3097,6 +3584,10 @@ class AgentRuntime:
                                 "status": run.status,
                                 "duplicate": True,
                             }
+                        if operator_force:
+                            meta = dict(item.metadata_json or {})
+                            meta.pop("operator_force_submit", None)
+                            item.metadata_json = meta
                         await transition_pm_phase(
                             db, item, "IN_DEVELOPMENT", detail=f"Cursor run #{attempt} started"
                         )
@@ -3228,7 +3719,13 @@ class AgentRuntime:
                         )
                         if item is None or item.agent_id != agent.id:
                             raise ValueError("No active Cursor run")
-                        result = await _poll_pm_cursor_item(db, item, cursor_session)
+                        result = await _poll_pm_cursor_item(
+                            db,
+                            item,
+                            cursor_session,
+                            judgment=self.judgment,
+                            client=(context or {}).get("_llm_client"),
+                        )
                         if result.get("done"):
                             cursor_state["finished"] = True
                         return result
@@ -3299,6 +3796,10 @@ class AgentRuntime:
                         work_item_id: int = 0,
                     ) -> dict[str, Any]:
                         """Accept QA only when the latest structured verification passed."""
+                        if (context or {}).get("_memory_degraded"):
+                            raise PermissionError(
+                                "Memory backend is degraded; irreversible actions are blocked."
+                            )
                         item = await get_work_item(
                             db, work_item_id or (context or {}).get("work_item_id")
                         )
@@ -3308,26 +3809,47 @@ class AgentRuntime:
                             or item.pm_phase not in {"QA", "CLIENT_REVIEW"}
                         ):
                             raise ValueError("Task is not ready for QA acceptance")
-                        run = (
-                            await db.get(CursorRun, item.active_cursor_run_id)
-                            if item.active_cursor_run_id
+                        from .qa_gate import evaluate_qa
+
+                        run = await _qa_run_for_item(db, item)
+                        if run is None:
+                            raise ValueError(
+                                "No completed Cursor run to verify. Call get_development_status first."
+                            )
+                        if item.active_cursor_run_id != run.id:
+                            item.active_cursor_run_id = run.id
+                        qa_project = (
+                            await db.get(ProjectState, item.project_id)
+                            if item.project_id
                             else None
                         )
-                        from .pm_state import (
-                            cursor_run_satisfies_acceptance,
-                            latest_completed_cursor_run,
+                        decision = await evaluate_qa(
+                            db,
+                            item,
+                            run,
+                            judgment=self.judgment,
+                            client=(context or {}).get("_llm_client"),
+                            project_config=dict(qa_project.config or {}) if qa_project else None,
                         )
-
-                        if not cursor_run_satisfies_acceptance(item, run):
-                            completed = await latest_completed_cursor_run(db, item)
-                            if cursor_run_satisfies_acceptance(item, completed):
-                                run = completed
-                                item.active_cursor_run_id = completed.id
-                        if not cursor_run_satisfies_acceptance(item, run):
-                            raise ValueError(
-                                "Latest Cursor run lacks passing evidence for every acceptance criterion"
+                        if not decision.accept:
+                            if decision.should_request_fix:
+                                meta = dict(item.metadata_json or {})
+                                if decision.fix_request:
+                                    meta["qa_fix_request"] = decision.fix_request[:8000]
+                                item.metadata_json = meta
+                                raise ValueError(
+                                    f"QA {decision.verdict}: {decision.reason} "
+                                    "Call request_development_fix with fix_request="
+                                    f"{json.dumps(decision.fix_request[:600], ensure_ascii=False)}"
+                                )
+                            raise PermissionError(
+                                f"QA on hold ({decision.verdict}): {decision.reason} "
+                                "Do not mark done. Wait for the next check or escalate via consult_manager."
                             )
-                        from .project_schedule import min_execution_remaining_minutes
+                        from .project_schedule import (
+                            min_execution_remaining_minutes,
+                            project_commerce_settings,
+                        )
 
                         all_runs = list(
                             await db.scalars(
@@ -3336,7 +3858,11 @@ class AgentRuntime:
                                 .order_by(CursorRun.attempt)
                             )
                         )
-                        remaining = min_execution_remaining_minutes(item, all_runs)
+                        remaining = min_execution_remaining_minutes(
+                            item,
+                            all_runs,
+                            settings=project_commerce_settings(qa_project),
+                        )
                         if remaining > 0:
                             wait_until = utcnow() + timedelta(minutes=max(1, int(remaining)))
                             item.wait_until = wait_until
@@ -3385,13 +3911,16 @@ class AgentRuntime:
                         meta["cursor_in_flight"] = False
                         meta.pop("cursor_baseline_summary", None)
                         meta.pop("automatic_resubmit_blocked", None)
+                        meta.pop("qa_fix_request", None)
+                        meta.pop("qa_hold_marker", None)
                         item.metadata_json = meta
                         await add_event(
                             db,
                             item,
                             kind="accepted",
                             title="QA accepted",
-                            detail="Acceptance criteria verified",
+                            detail=decision.reason[:1000] or "Acceptance criteria verified",
+                            payload={"qa": decision.as_dict()},
                         )
                         from .work_items import cancel_work_item_schedules
 
@@ -3478,7 +4007,15 @@ class AgentRuntime:
                     )
                 from .cursorremote_drive import pin_cursor_followup_message
 
-                payload["message"] = pin_cursor_followup_message(str(payload.get("message") or message))
+                in_flight: bool | None = None
+                if follow_item is not None:
+                    in_flight = bool(
+                        (follow_item.metadata_json or {}).get("cursor_in_flight")
+                        or follow_item.status == "waiting_external"
+                    )
+                payload["message"] = pin_cursor_followup_message(
+                    str(payload.get("message") or message), cursor_in_flight=in_flight
+                )
                 job = await save_once_job(
                     db,
                     self.scheduler,
@@ -3819,6 +4356,8 @@ class AgentRuntime:
                         agent,
                         payload,
                         poll_error,
+                        db=db,
+                        kind="cursor_poll",
                     )
                 return {
                     "ok": False,
@@ -3832,9 +4371,18 @@ class AgentRuntime:
             context = dict(payload or {})
             context["_cursor_was_in_flight"] = True
             context["_pm_mode"] = pm_mode_enabled(profile)
+            context["_judgment"] = getattr(self, "judgment", None)
+            fallback = getattr(self, "_judge_fallback_client", None)
+            context["_llm_client"] = await fallback(db, agent) if callable(fallback) else None
             try:
                 if context["_pm_mode"]:
-                    result = await _poll_pm_cursor_item(db, item, cursor_session)
+                    result = await _poll_pm_cursor_item(
+                        db,
+                        item,
+                        cursor_session,
+                        judgment=self.judgment,
+                        client=context.get("_llm_client"),
+                    )
                 else:
                     from .cursorremote_drive import check_and_drive, cursor_worker_kwargs
 
@@ -3893,6 +4441,8 @@ class AgentRuntime:
                         agent,
                         payload,
                         f"CursorRemote недоступен: {exc}",
+                        db=db,
+                        kind="cursor_poll",
                     )
                 return {
                     "ok": False,
@@ -3932,7 +4482,12 @@ class AgentRuntime:
                 pm_qa = bool(context["_pm_mode"] and item.pm_phase == "QA")
                 if pm_qa:
                     accepted = await _auto_accept_pm_qa(
-                        db, item, self.mcp, scheduler=self.scheduler
+                        db,
+                        item,
+                        self.mcp,
+                        scheduler=self.scheduler,
+                        judgment=self.judgment,
+                        client=context.get("_llm_client"),
                     )
                     if accepted is not None:
                         await db.commit()
@@ -4009,6 +4564,21 @@ class AgentRuntime:
         reason: str = "heartbeat",
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """One autonomous tick under a fresh decision trace id."""
+        from .trace import trace_scope
+
+        with trace_scope():
+            return await self._tick_impl(db, agent, force=force, reason=reason, extra=extra)
+
+    async def _tick_impl(
+        self,
+        db: AsyncSession,
+        agent: Agent,
+        *,
+        force: bool = False,
+        reason: str = "heartbeat",
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not agent.enabled:
             return {"ok": False, "skipped": True, "reason": "agent_disabled"}
         async with self._lock_for(agent.id):
@@ -4035,7 +4605,12 @@ class AgentRuntime:
                 if candidate.pm_phase != "QA":
                     continue
                 accepted = await _auto_accept_pm_qa(
-                    db, candidate, self.mcp, scheduler=self.scheduler
+                    db,
+                    candidate,
+                    self.mcp,
+                    scheduler=self.scheduler,
+                    judgment=self.judgment,
+                    client=await self._judge_fallback_client(db, agent),
                 )
                 if accepted is not None:
                     await db.commit()
@@ -4227,8 +4802,13 @@ class AgentRuntime:
         message: str,
         context: dict[str, Any] | None = None,
     ) -> str:
+        from .trace import trace_scope
+
+        context = context if context is not None else {}
         async with self._lock_for(agent.id):
-            return await self._run_impl(db, agent, message, context)
+            with trace_scope(context.get("decision_trace_id")) as trace_id:
+                context["decision_trace_id"] = trace_id
+                return await self._run_impl(db, agent, message, context)
 
     async def _run_impl(
         self,
@@ -4242,6 +4822,7 @@ class AgentRuntime:
         runtime_settings = await db.get(RuntimeSettings, 1)
         if runtime_settings is None:
             raise RuntimeError("Runtime settings are not initialized")
+        self.judgment.bind_runtime_settings(runtime_settings)
         if agent.llm_profile_id is None:
             raise RuntimeError("Agent has no LLM profile assigned")
         profile = await db.get(LlmProfile, agent.llm_profile_id)
@@ -4256,13 +4837,31 @@ class AgentRuntime:
             raise RuntimeError("Assigned LLM profile has no API key")
         context = context or {}
         context["_user_message"] = message
+        context["_judgment"] = self.judgment
+        client_options: dict[str, Any] = dict(
+            api_key=api_key,
+            base_url=profile.base_url,
+            model=agent.model_name or profile.default_model,
+            max_rounds=runtime_settings.max_tool_rounds,
+        )
+        if profile.http_proxy:
+            client_options["http_proxy"] = profile.http_proxy
+        client = LLMClient(**client_options)
+        context["_llm_client"] = client
         await bind_work_item(db, agent, context, message)
         from .work_items import get_work_item, work_item_aborted
 
         if context.get("_operational_admin"):
-            from .customers import match_customer_from_text
+            from .customers import match_customer_from_text, resolve_customer
 
-            customer = await match_customer_from_text(db, agent, message)
+            wipe_scope = str(context.get("_operational_wipe_scope") or "").strip()
+            customer = None
+            if wipe_scope and wipe_scope.lower() != "all":
+                customer = await resolve_customer(db, agent, project_id=wipe_scope)
+                if customer is None:
+                    customer = await resolve_customer(db, agent, customer_id=wipe_scope)
+            if customer is None:
+                customer = await match_customer_from_text(db, agent, message, context=context)
             project_id = ""
             if customer is not None:
                 project_id = str(customer.project_id or customer.id or "").strip()
@@ -4319,15 +4918,6 @@ class AgentRuntime:
                 for name in (self.mcp.sessions if self.mcp else {})
                 if name != "cursorremote"
             }
-        client_options: dict[str, Any] = dict(
-            api_key=api_key,
-            base_url=profile.base_url,
-            model=agent.model_name or profile.default_model,
-            max_rounds=runtime_settings.max_tool_rounds,
-        )
-        if profile.http_proxy:
-            client_options["http_proxy"] = profile.http_proxy
-        client = LLMClient(**client_options)
         try:
             attachments = [
                 item
@@ -4385,6 +4975,7 @@ class AgentRuntime:
                             db,
                             agent,
                             str(message or ""),
+                            context=context,
                         )
                     if customer is not None:
                         if not (state.customer_id or "").strip():
@@ -4403,7 +4994,7 @@ class AgentRuntime:
                         direction="in",
                         message_at=inbound_at,
                         text=message,
-                        metadata_json=context,
+                        metadata_json=persistable_context(context),
                     )
                 )
                 await db.commit()
@@ -4412,14 +5003,46 @@ class AgentRuntime:
                 context["_memory_scope"] = memory_scope
             if runtime_settings.memory_enabled and memory_scope is not None:
                 try:
+                    memory_query = message
+                    if (
+                        str(context.get("source") or "")
+                        in {"employee_tick", "employee_heartbeat", "intake_flush"}
+                        or context.get("employee_tick")
+                    ):
+                        focus = await get_work_item(db, context.get("work_item_id"))
+                        if focus is not None:
+                            memory_query = " ".join(
+                                part
+                                for part in (
+                                    str(focus.goal or "").strip(),
+                                    str(focus.title or "").strip(),
+                                    str(context.get("customer_name") or "").strip(),
+                                    str(focus.project_id or "").strip(),
+                                )
+                                if part
+                            ) or message
                     memories = await prefetch_memories(
                         self.memory,
-                        message,
+                        memory_query,
                         memory_scope,
                         limit=8,
+                        judgment=self.judgment,
+                        situation={
+                            "phase": context.get("pm_phase"),
+                            "goal": memory_query,
+                            "message": message[:800],
+                            "source": context.get("source"),
+                        },
+                        db=db,
+                        agent_id=agent.id,
+                        work_item_id=context.get("work_item_id"),
                     )
+                    if getattr(self.memory, "degraded", False):
+                        context["_memory_degraded"] = True
                 except Exception:
                     memories = []
+                    if getattr(self.memory, "degraded", False) or getattr(self.memory, "last_error", None):
+                        context["_memory_degraded"] = True
             memory_context = format_memory_hits(memories)
             scope_line = memory_scope_prompt(memory_scope) if memory_scope else ""
             employee_profile = await get_or_create_profile(db, agent.id)
@@ -4525,6 +5148,7 @@ class AgentRuntime:
                         db,
                         agent,
                         f"{work_item.title}\n{work_item.goal}\n{message}",
+                        context=context,
                     )
                 if customer is not None:
                     await bind_customer_to_work_item(
@@ -4536,6 +5160,60 @@ class AgentRuntime:
                         if not (state.project_id or "").strip() and customer.project_id:
                             state.project_id = customer.project_id
                     await db.commit()
+            if work_item is not None:
+                context["_work_item"] = work_item
+                context["pm_phase"] = work_item.pm_phase
+            known_block: dict[str, Any] | None = None
+            if (
+                work_item is not None
+                and not context.get("is_admin")
+                and str(context.get("source") or "") == "telegram"
+                and message.strip()
+            ):
+                try:
+                    from .pm_state import read_project_spec
+
+                    spec_state = (
+                        await db.get(ProjectState, work_item.project_id)
+                        if work_item.project_id
+                        else None
+                    )
+                    known_result = await check_known_already(
+                        self.judgment,
+                        question=message[:2000],
+                        spec=read_project_spec(spec_state) if spec_state is not None else {},
+                        decisions=[],
+                        memories=memories,
+                        db=db,
+                        agent_id=agent.id,
+                        work_item_id=work_item.id,
+                        project_id=work_item.project_id,
+                    )
+                    if known_result is not None and known_result.verdict is not None:
+                        known_block = known_result.verdict.model_dump()
+                        context["_known_already"] = known_block
+                except Exception:
+                    known_block = None
+            turn_verdicts: list[dict[str, Any]] = []
+            if known_block:
+                turn_verdicts.append({"kind": "known_already", **known_block})
+            if context.get("_memory_degraded"):
+                turn_verdicts.append(
+                    {
+                        "kind": "memory",
+                        "verdict": "degraded",
+                        "reasoning": "Memory backend unavailable; irreversible rails stay closed.",
+                    }
+                )
+            if getattr(self.judgment, "last_error", None) and not self.judgment.configured:
+                context["_judge_degraded"] = True
+                turn_verdicts.append(
+                    {
+                        "kind": "judgment",
+                        "verdict": "degraded",
+                        "reasoning": str(self.judgment.last_error),
+                    }
+                )
             system_prompt = await assemble_system_prompt(
                 db,
                 agent,
@@ -4549,6 +5227,11 @@ class AgentRuntime:
                     or context.get("project_id")
                     or getattr(work_item, "project_id", None)
                 ),
+                phase=getattr(work_item, "pm_phase", None),
+                memories=memory_context,
+                verdicts=turn_verdicts,
+                known=known_block,
+                pm_mode=pm_mode_enabled(employee_profile),
             )
             employee_block = ""
             if employee_profile.autonomy_enabled or context.get("employee_tick"):
@@ -4651,8 +5334,12 @@ class AgentRuntime:
                     "Never claim that an external action succeeded unless its tool call "
                     "returned successfully. Report tool errors truthfully and explicitly."
                 )
-            if pm_mode_enabled(employee_profile):
-                role_instruction = pm_system_instruction() + "\n\n" + role_instruction
+            if pm_mode_enabled(employee_profile) and "project-management layer" not in system_prompt:
+                role_instruction = (
+                    pm_system_instruction(getattr(work_item, "pm_phase", None))
+                    + "\n\n"
+                    + role_instruction
+                )
             messages = [
                 {"role": "system", "content": system_prompt},
                 {
@@ -4751,52 +5438,16 @@ class AgentRuntime:
             )
             if admin_report:
                 context["_admin_action_report"] = admin_report
-                phone = (
-                    (account.phone if account else None)
-                    or context.get("reply_phone")
-                    or context.get("phone")
+                await persist_tech_log(
+                    db,
+                    agent_id=agent.id,
+                    text=admin_report,
+                    kind="actions",
+                    account_id=account.id if account else None,
+                    context=context,
+                    events=self.events,
                 )
-                if phone and self.telegram and self.telegram.admin_ids:
-                    try:
-                        exclude: set[int] = set()
-                        sender = context.get("sender_id")
-                        if sender is not None and str(sender).lstrip("-").isdigit():
-                            exclude.add(int(sender))
-                        sent_reports = await self.telegram.notify_admins(
-                            str(phone),
-                            admin_report,
-                            exclude_ids=exclude,
-                        )
-                        context["_admin_action_report_sent"] = len(sent_reports)
-                        db.add(
-                            MessageLog(
-                                agent_id=agent.id,
-                                account_id=account.id if account else None,
-                                direction="admin_report",
-                                chat_id=str(context.get("chat_id") or "") or None,
-                                user_id=str(context.get("sender_id") or "") or None,
-                                message_at=as_utc(None),
-                                text=admin_report,
-                                metadata_json={
-                                    "recipients": len(sent_reports),
-                                    "excluded_sender": bool(exclude),
-                                },
-                                work_item_id=context.get("work_item_id"),
-                            )
-                        )
-                        await db.commit()
-                        await self.events.publish(
-                            "telegram.admin_action_report",
-                            {
-                                "agent_id": agent.id,
-                                "recipients": len(sent_reports),
-                            },
-                        )
-                    except Exception as exc:
-                        await self.events.publish(
-                            "telegram.admin_action_report_failed",
-                            {"agent_id": agent.id, "error": str(exc)},
-                        )
+                context["_admin_action_report_sent"] = 0
             outbound_at = as_utc(None)
             suppressed = bool(context.get("_suppress_telegram_reply")) or (
                 result.strip() == NO_TELEGRAM_REPLY
@@ -4825,16 +5476,35 @@ class AgentRuntime:
                                 category="exchange",
                             )
                         )
-                    await self.memory.add(
-                        (
-                            f"User: {message}\nAssistant: [no reply sent]"
-                            if suppressed
-                            else f"User: {message}\nAssistant: {result}"
-                        ),
-                        user_id=user_id,
-                        agent_id=str(agent.id),
-                        metadata=exchange_metadata,
+                    extracted = await extract_and_store_memories(
+                        self.memory,
+                        memory_scope or resolve_memory_scope(context, agent, state=state),
+                        user_text=message,
+                        assistant_text="" if suppressed else result,
+                        judgment=self.judgment,
+                        known_facts=[
+                            str(item.get("memory") or "")[:240]
+                            for item in memories[:8]
+                        ],
+                        db=db,
+                        agent_id=agent.id,
+                        work_item_id=context.get("work_item_id"),
+                        source_message_id=str(context.get("message_id") or "") or None,
                     )
+                    context["_memory_extract"] = extracted
+                    if extracted.get("stored"):
+                        pass
+                    else:
+                        await self.memory.add(
+                            (
+                                f"User: {message}\nAssistant: [no reply sent]"
+                                if suppressed
+                                else f"User: {message}\nAssistant: {result}"
+                            ),
+                            user_id=user_id,
+                            agent_id=str(agent.id),
+                            metadata=exchange_metadata,
+                        )
                 except Exception:
                     pass
             if suppressed:
@@ -4889,7 +5559,20 @@ class AgentRuntime:
                     or context.get("reply_phone")
                     or context.get("phone")
                 )
-                await self._notify_manager_status(notify_phone, agent, context, result)
+                await self._notify_manager_status(
+                    notify_phone,
+                    agent,
+                    context,
+                    result,
+                    db=db,
+                    account_id=account.id if account else None,
+                )
+            await self._flush_tech_logs(
+                db,
+                agent,
+                context,
+                account_id=account.id if account else None,
+            )
             await after_agent_run(
                 db, agent, context, result, registry.audit, employee=self.employee
             )

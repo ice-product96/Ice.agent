@@ -1,0 +1,4 @@
+{"kind":"approval_detect","id":"technical-aside","expected":"not_an_approval","legacy":"approved","payload":{"message":"по технической части давайте ещё подумаем","subject":"spec"}}
+{"kind":"approval_detect","id":"explicit-spec","expected":"approved","legacy":"approved","payload":{"message":"ТЗ принимаю, можно начинать","subject":"spec"}}
+{"kind":"approval_detect","id":"price-chat","expected":"not_an_approval","legacy":"approved","payload":{"message":"а какая стоимость примерно?","subject":"cost"}}
+{"kind":"approval_detect","id":"yes-to-pending","expected":"approved","legacy":"approved","payload":{"message":"да","pending":"согласовать ТЗ"}}

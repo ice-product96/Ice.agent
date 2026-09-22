@@ -1,0 +1,4 @@
+{"kind":"message_intent","id":"short-work","expected":"work_request","legacy":"acknowledgement","payload":{"message":"Да, добавь экспорт в Excel"}}
+{"kind":"message_intent","id":"thanks","expected":"acknowledgement","legacy":"acknowledgement","payload":{"message":"спасибо"}}
+{"kind":"message_intent","id":"yes-answer","expected":"clarification_answer","legacy":"acknowledgement","payload":{"message":"да","pending":"нужен ли фильтр по дате?"}}
+{"kind":"message_intent","id":"go-on","expected":"status_request","legacy":"acknowledgement","payload":{"message":"ну что дальше"}}

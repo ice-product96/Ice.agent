@@ -223,7 +223,14 @@ async def indexed_tracker_work_items(
     index: dict[str, WorkItem] = {}
     for item in rows:
         tid = work_item_tracker_task_id(item)
-        if tid and tid not in index:
+        if not tid:
+            continue
+        existing = index.get(tid)
+        if existing is None:
+            index[tid] = item
+            continue
+        # Prefer an open case over a closed one for the same tracker card.
+        if work_item_is_closed(existing) and not work_item_is_closed(item):
             index[tid] = item
     return index
 
@@ -232,12 +239,19 @@ async def find_work_item_for_tracker_task(
     db: AsyncSession,
     agent_id: int,
     tracker_task_id: str,
+    *,
+    include_closed: bool = True,
 ) -> WorkItem | None:
     tid = str(tracker_task_id or "").strip()
     if not tid:
         return None
     index = await indexed_tracker_work_items(db, agent_id)
-    return index.get(tid)
+    item = index.get(tid)
+    if item is None:
+        return None
+    if not include_closed and work_item_is_closed(item):
+        return None
+    return item
 
 
 async def fetch_open_tracker_tasks(
@@ -355,12 +369,14 @@ async def poll_tracker_backlog(
                 }
             )
             existing = index.get(summary["tracker_task_id"])
-            if existing is not None:
+            if existing is not None and not work_item_is_closed(existing):
                 summary["work_item_id"] = existing.id
                 summary["work_item_status"] = existing.status
                 summary["pm_phase"] = existing.pm_phase
                 already.append(summary)
             else:
+                if existing is not None and work_item_is_closed(existing):
+                    summary["closed_work_item_id"] = existing.id
                 claimable.append(summary)
 
     return {
@@ -388,7 +404,8 @@ def build_tracker_poll_instruction(backlog: dict[str, Any]) -> str:
         "если false — сразу submit_development_task, не пиши заказчику про оплату; "
         "если true — согласуй сумму, затем submit. "
         "Сначала pm_get_spec / pm_assess_execution: широкая карточка — обсудить ТЗ, "
-        "не submit. Мелкий bug внутри confirmed in_scope — без «можно начинать?». "
+        "не submit. Мелкий bug, который ты считаешь внутри согласованного ТЗ — "
+        "без «можно начинать?». Не решай scope по совпадению слов. "
         "Карточка на доске — запрос посмотреть работу, не разрешение строить продукт. "
         "Не дублируй задачи, которые уже в already_tracked. Не пиши заказчику про "
         "сам факт проверки трекера. Карточку двигает платформа по фазе PM; "
@@ -552,6 +569,92 @@ def match_section_for_lane(
     return None
 
 
+def sections_fingerprint(sections: list[dict[str, str]]) -> str:
+    return "|".join(
+        f"{str(row.get('id') or '').strip()}:{str(row.get('name') or '').strip()}"
+        for row in sections
+    )
+
+
+def cached_section_for_lane(
+    cache: Any,
+    sections: list[dict[str, str]],
+    lane: str,
+) -> dict[str, str] | None:
+    if not isinstance(cache, dict):
+        return None
+    if str(cache.get("fingerprint") or "") != sections_fingerprint(sections):
+        return None
+    entry = (cache.get("lanes") or {}).get(lane)
+    if not isinstance(entry, dict):
+        return None
+    sid = str(entry.get("section_id") or "").strip()
+    name = str(entry.get("section_name") or "").strip()
+    for section in sections:
+        if (sid and str(section.get("id") or "") == sid) or (
+            name and str(section.get("name") or "") == name
+        ):
+            return section
+    return None
+
+
+async def resolve_section_for_lane(
+    sections: list[dict[str, str]],
+    lane: str,
+    *,
+    item: WorkItem | None = None,
+    db: AsyncSession | None = None,
+    judgment: Any = None,
+) -> dict[str, str] | None:
+    """Prefer a cached tracker_lane_map; judge once; aliases only as last resort."""
+    ctx = dict(getattr(item, "context_json", None) or {})
+    cached = cached_section_for_lane(ctx.get("tracker_lane_map"), sections, lane)
+    if cached:
+        return cached
+    project = None
+    if db is not None and getattr(item, "project_id", None):
+        project = await db.get(ProjectState, item.project_id)
+        if project is not None:
+            cached = cached_section_for_lane(
+                (project.config or {}).get("tracker_lane_map"), sections, lane
+            )
+            if cached:
+                return cached
+    if judgment is not None and sections:
+        result = await judgment.judge(
+            "tracker_lane_map",
+            {"sections": sections, "wanted_lane": lane},
+            db=db,
+            agent_id=getattr(item, "agent_id", None),
+            work_item_id=getattr(item, "id", None),
+            project_id=getattr(item, "project_id", None),
+            project_config=dict(project.config or {}) if project is not None else None,
+        )
+        verdict = result.verdict
+        if verdict is not None and getattr(verdict, "lanes", None):
+            mapping = {
+                "fingerprint": sections_fingerprint(sections),
+                "lanes": {
+                    row.lane: {
+                        "section_id": row.section_id,
+                        "section_name": row.section_name,
+                    }
+                    for row in verdict.lanes
+                },
+            }
+            if item is not None:
+                ctx["tracker_lane_map"] = mapping
+                item.context_json = ctx
+            if project is not None:
+                cfg = dict(project.config or {})
+                cfg["tracker_lane_map"] = mapping
+                project.config = cfg
+            found = cached_section_for_lane(mapping, sections, lane)
+            if found:
+                return found
+    return match_section_for_lane(sections, lane)
+
+
 def _task_section_id(task: MappingLike | None) -> str:
     if not isinstance(task, dict):
         return ""
@@ -593,6 +696,8 @@ async def sync_work_item_tracker_card(
     phase: str | None = None,
     mcp: Any = None,
     session: Any = None,
+    db: AsyncSession | None = None,
+    judgment: Any = None,
 ) -> dict[str, Any]:
     """Move the bound ice_tracker card to the column/status for this PM phase."""
     task_id = work_item_tracker_task_id(item)
@@ -670,7 +775,9 @@ async def sync_work_item_tracker_card(
                     sections = extract_sections({"columns": data.get("columns") or []})
             except Exception as board_exc:
                 logger.info("tracker.get_project_board failed: %s", board_exc)
-    target = match_section_for_lane(sections, lane)
+    target = await resolve_section_for_lane(
+        sections, lane, item=item, db=db, judgment=judgment
+    )
     moved = False
     completed = False
     updated_status = False

@@ -472,3 +472,68 @@ async def test_reset_project_aborts_open_cases(tmp_path: Path) -> None:
         pending = await watchdog_items(db, agent.id)
         assert [item.id for item in pending] == [other.id]
     await engine.dispose()
+
+
+def test_looks_like_non_work_reply() -> None:
+    from app.work_items import looks_like_non_work_reply
+
+    assert looks_like_non_work_reply("спасибо")
+    assert looks_like_non_work_reply("отлично что дальше?")
+    assert looks_like_non_work_reply("Давай.")
+    assert looks_like_non_work_reply("Спасибо. Да , без")
+    assert not looks_like_non_work_reply(
+        "Нужно сделать новый модуль продаж с отчётами и правами"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ack_attaches_to_recent_closed_case(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "ack-case.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        closed = WorkItem(
+            agent_id=agent.id,
+            title="Закупки",
+            goal="Закупки и приход",
+            status="done",
+            pm_phase="DONE",
+            chat_id="777",
+        )
+        db.add(closed)
+        await db.commit()
+        bound = await bind_work_item(
+            db,
+            agent,
+            {"source": "telegram", "reply_chat_id": "777", "chat_id": "777"},
+            "спасибо",
+        )
+        assert bound is not None
+        assert bound.id == closed.id
+        count = await db.scalar(select(func.count()).select_from(WorkItem))
+        assert count == 1
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_sees_operational_waiting_manager(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "ops-wait.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            title="ops",
+            status="waiting_manager",
+            wait_owner="manager",
+            next_action="Повтори submit_development_task когда Cursor на нужном workspace",
+            metadata_json={"operational_wait": True},
+            pm_phase="READY_FOR_DEV",
+        )
+        db.add(item)
+        await db.commit()
+        pending = await watchdog_items(db, agent.id)
+        assert [row.id for row in pending] == [item.id]
+    await engine.dispose()

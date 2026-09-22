@@ -1,0 +1,3 @@
+{"kind":"cursor_completion","id":"idle-no-report","expected":"working","legacy":"finished","payload":{"done":false,"agentStatus":"idle","summary":""}}
+{"kind":"cursor_completion","id":"idle-foreign","expected":"foreign_result","legacy":"finished","payload":{"done":true,"agentStatus":"idle","summary":"completed other task"}}
+{"kind":"cursor_completion","id":"real-done","expected":"finished","legacy":"finished","payload":{"done":true,"agentStatus":"idle","summary":"Implemented export and verified tests","composerId":"abc"}}

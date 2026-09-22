@@ -1,0 +1,4 @@
+{"kind":"qa_verifier","id":"thin-summary","expected":"insufficient_evidence","legacy":"accept","payload":{"criteria":["export to excel"],"summary":"already implemented, completed"}}
+{"kind":"qa_verifier","id":"all-rows-pass","expected":"accept","legacy":"accept","payload":{"criteria":["export to excel"],"verification":[{"criterion":"export to excel","passed":true,"evidence":"pytest test_export passed"}]}}
+{"kind":"qa_verifier","id":"one-fail","expected":"fix_required","legacy":"accept","payload":{"criteria":["login","export"],"verification":[{"criterion":"login","passed":true},{"criterion":"export","passed":false}]}}
+{"kind":"qa_verifier","id":"generic-done","expected":"insufficient_evidence","legacy":"accept","payload":{"criteria":["filter by date"],"summary":"всё готово, уже реализ"}}

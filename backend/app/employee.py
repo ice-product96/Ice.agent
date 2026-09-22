@@ -65,6 +65,125 @@ CONSULT_CMD_RE = re.compile(
 )
 
 
+def collect_sent_message_ids(sent: Any) -> list[Any]:
+    """Flatten Telegram send_message / notify_admins return values into message ids."""
+    ids: list[Any] = []
+
+    def walk(entry: Any) -> None:
+        if isinstance(entry, list):
+            for item in entry:
+                walk(item)
+            return
+        if isinstance(entry, dict):
+            mid = entry.get("id")
+            if mid is None:
+                mid = entry.get("message_id")
+            if mid is not None:
+                ids.append(mid)
+
+    walk(sent)
+    return ids
+
+
+def consultation_matches_telegram_reply(item: Consultation, reply_id: Any) -> bool:
+    needle = str(reply_id or "").strip()
+    if not needle:
+        return False
+    for mid in item.telegram_message_ids or []:
+        if str(mid) == needle:
+            return True
+    return False
+
+
+async def consultation_for_telegram_reply(
+    db: AsyncSession,
+    agent_id: int,
+    reply_id: Any,
+) -> Consultation | None:
+    if reply_id in (None, ""):
+        return None
+    for item in await list_open_consultations(db, agent_id):
+        if consultation_matches_telegram_reply(item, reply_id):
+            return item
+    return None
+
+
+def build_consultation_telegram_text(
+    *,
+    agent_name: str,
+    item: Consultation,
+) -> str:
+    kind = "Нужно одобрение" if item.requires_approval else "Вопрос руководителю"
+    lines = [
+        f"[Ice.agent] {kind} #{item.id} — «{agent_name}»",
+    ]
+    if item.work_item_id:
+        lines.append(f"Кейс #{item.work_item_id}")
+    lines.append("")
+    lines.append((item.question or "").strip())
+    context = (item.context or "").strip()
+    if context:
+        lines.append("")
+        lines.append("Контекст:")
+        lines.append(context[:1500])
+    lines.append("")
+    if item.requires_approval:
+        lines.append(
+            f"Ответьте на это сообщение или:\n"
+            f"/approve {item.id}\n"
+            f"/reject {item.id} причина"
+        )
+    else:
+        lines.append(
+            f"Ответьте на это сообщение или:\n/answer {item.id} ваш ответ"
+        )
+    return "\n".join(lines)
+
+
+async def persist_tech_log(
+    db: AsyncSession,
+    *,
+    agent_id: int,
+    text: str,
+    kind: str,
+    account_id: int | None = None,
+    context: dict[str, Any] | None = None,
+    events: Any = None,
+) -> None:
+    """Store employee/runtime tech notes in MessageLog (UI logs), not Telegram."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return
+    ctx = context or {}
+    work_item_id = ctx.get("work_item_id")
+    try:
+        work_item_id = int(work_item_id) if work_item_id not in (None, "") else None
+    except (TypeError, ValueError):
+        work_item_id = None
+    db.add(
+        MessageLog(
+            agent_id=agent_id,
+            account_id=account_id,
+            direction="tech",
+            chat_id=str(ctx.get("chat_id") or ctx.get("reply_chat_id") or "") or None,
+            user_id=str(ctx.get("sender_id") or "") or None,
+            text=cleaned,
+            metadata_json={
+                "kind": kind,
+                "source": ctx.get("source"),
+                "work_item_id": work_item_id,
+            },
+            work_item_id=work_item_id,
+        )
+    )
+    await db.commit()
+    if events is not None:
+        await events.publish(
+            "agent.tech_log",
+            {"agent_id": agent_id, "kind": kind, "work_item_id": work_item_id},
+        )
+
+
 def _tz(name: str) -> ZoneInfo:
     return resolve_zoneinfo(name)
 
@@ -174,6 +293,7 @@ def consultation_json(item: Consultation) -> dict[str, Any]:
         "requires_approval": item.requires_approval,
         "action_name": item.action_name,
         "telegram_message_ids": item.telegram_message_ids or [],
+        "telegram_delivered": bool(item.telegram_message_ids),
         "answer_text": item.answer_text,
         "answered_by": item.answered_by,
         "answered_at": item.answered_at.isoformat() if item.answered_at else None,
@@ -343,8 +463,14 @@ async def assemble_system_prompt(
     customer: Any | None = None,
     customer_id: str | None = None,
     project_id: str | None = None,
+    phase: str | None = None,
+    memories: str = "",
+    verdicts: list[dict[str, Any]] | None = None,
+    known: dict[str, Any] | None = None,
+    pm_mode: bool = False,
 ) -> str:
-    from .customers import customer_prompt_block, resolve_customer
+    from .customers import customer_dossier_block, customer_prompt_block, resolve_customer
+    from .prompt_compiler import compile_prompt
 
     sections = await ensure_prompt_sections(db, agent)
     if customer is None:
@@ -355,7 +481,7 @@ async def assemble_system_prompt(
             project_id=project_id,
         )
     assignment = customer_prompt_block(customer)
-    parts: list[str] = []
+    dossier = await customer_dossier_block(db, customer, agent_id=agent.id)
     labels = {
         "identity": "Личность",
         "role": "Роль",
@@ -364,20 +490,45 @@ async def assemble_system_prompt(
         "tone": "Тон общения",
         "self_notes": "Заметки сотрудника",
     }
-    inserted = False
+    identity_parts: list[str] = []
+    extra_parts: list[str] = []
     for key in PROMPT_SECTION_KEYS:
         text = (sections.get(key) or "").strip()
-        if text:
-            parts.append(f"## {labels.get(key, key)}\n{text}")
-        if key == "identity" and assignment:
-            parts.append(assignment)
-            inserted = True
-    if assignment and not inserted:
-        parts.insert(0, assignment)
-    if not parts and (agent.prompt or "").strip():
-        body = agent.prompt
-        return f"{assignment}\n\n{body}" if assignment else body
-    return "\n\n".join(parts) if parts else (agent.prompt or "You are a professional employee agent.")
+        if not text:
+            continue
+        block = f"## {labels.get(key, key)}\n{text}"
+        if key in {"identity", "role"}:
+            identity_parts.append(block)
+        else:
+            extra_parts.append(block)
+    if assignment:
+        identity_parts.insert(0, assignment)
+    if not identity_parts and not extra_parts and (agent.prompt or "").strip():
+        extra_parts.append(agent.prompt)
+    if not identity_parts and not extra_parts and not dossier:
+        extra_parts.append("You are a professional employee agent.")
+    if pm_mode or phase or verdicts or known:
+        compiled, sizes = compile_prompt(
+            phase=phase,
+            identity_sections=identity_parts,
+            dossier=dossier,
+            memories=memories,
+            verdicts=verdicts,
+            known=known,
+            extra_sections=extra_parts,
+        )
+        logger.info(
+            "assembled prompt agent=%s phase=%s tokens=%s",
+            agent.id,
+            phase,
+            sizes.get("total"),
+        )
+        return compiled
+    parts = list(identity_parts)
+    if dossier:
+        parts.append(dossier)
+    parts.extend(extra_parts)
+    return "\n\n".join(part for part in parts if part.strip())
 
 
 def is_within_workday(profile: EmployeeProfile, now: datetime | None = None) -> bool:
@@ -825,29 +976,17 @@ class EmployeeService:
 
             account = await db.get(TelegramAccount, agent.telegram_account_id)
             if account is not None:
-                kind = "APPROVAL" if requires_approval else "CONSULT"
-                text = (
-                    f"[{kind} #{item.id}] агент «{agent.name}»\n"
-                    f"{question.strip()}\n"
-                )
-                if context:
-                    text += f"\nКонтекст:\n{context.strip()[:1500]}\n"
-                if requires_approval:
-                    text += (
-                        f"\nОтветьте:\n/approve {item.id}\n/reject {item.id} причина\n"
-                        f"или /answer {item.id} текст"
-                    )
-                else:
-                    text += f"\nОтветьте: /answer {item.id} ваш ответ"
+                text = build_consultation_telegram_text(agent_name=agent.name, item=item)
                 try:
                     sent = await self.telegram.notify_admins(account.phone, text)
-                    for entry in sent:
-                        if isinstance(entry, dict) and entry.get("id") is not None:
-                            message_ids.append(entry.get("id"))
-                        elif isinstance(entry, dict) and entry.get("message_id") is not None:
-                            message_ids.append(entry.get("message_id"))
+                    message_ids = collect_sent_message_ids(sent)
                 except Exception:
                     logger.exception("Failed to notify admins for consultation %s", item.id)
+        else:
+            logger.warning(
+                "Consultation %s created without Telegram delivery (no account or gateway)",
+                item.id,
+            )
         if message_ids:
             item.telegram_message_ids = message_ids
             await db.commit()
@@ -1077,15 +1216,18 @@ class EmployeeService:
         for need in needs[:5]:
             lines.append(f"! need #{need.id} {need.title}")
         text = "\n".join(lines)
-        if self.telegram and agent.telegram_account_id is not None:
-            from .db import TelegramAccount
-
-            account = await db.get(TelegramAccount, agent.telegram_account_id)
-            if account is not None:
-                try:
-                    await self.telegram.notify_admins(account.phone, text)
-                except Exception:
-                    logger.exception("Daily digest failed for agent %s", agent.id)
+        account_id = agent.telegram_account_id
+        try:
+            await persist_tech_log(
+                db,
+                agent_id=agent.id,
+                text=text,
+                kind="digest",
+                account_id=account_id,
+                events=self.events,
+            )
+        except Exception:
+            logger.exception("Daily digest log failed for agent %s", agent.id)
         profile.last_digest_at = utcnow()
         await db.commit()
 

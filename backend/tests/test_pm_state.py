@@ -236,6 +236,67 @@ def test_bug_inside_confirmed_scope_executes() -> None:
     assert verdict["verdict"] == "execute"
 
 
+def test_confirmed_spec_does_not_use_word_overlap() -> None:
+    item = WorkItem(
+        agent_id=1,
+        title="Склады и остатки",
+        goal="Реализовать склады и учёт остатков: создание складов и остатки товаров",
+        task_type="feature",
+        requirements=[
+            "Реализовать склады и учёт остатков: создание складов и остатки товаров по складам."
+        ],
+        acceptance_criteria=[
+            "Можно создать склад и указать остатки товаров на нём.",
+            "Пользователь может увидеть остаток после сохранения.",
+        ],
+        priority="normal",
+        context_json={"estimated_duration_minutes": 120},
+    )
+    spec = {
+        "status": "confirmed",
+        "summary": "Учёт продаж",
+        "in_scope": [
+            "Первый этап (базовый учёт): организации, справочник товаров, "
+            "склады и остатки, закупки, заказы и продажи."
+        ],
+        "out_of_scope": [
+            "Следующие этапы (не входят в первый): интеграция с Ozon "
+            "(заказы, остатки, полный цикл закупка→продажа). "
+            "Интеграция OpenAI GPT (создание заказов). "
+            "Другие маркетплейсы. Чат с покупателями."
+        ],
+        "modules": ["Склады и остатки"],
+        "version": 3,
+    }
+    verdict = assess_execution(item, spec)
+    assert verdict["verdict"] == "execute"
+    assert "out_of_scope" not in " ".join(verdict["reasons"]).lower()
+    assert "in_scope" not in " ".join(verdict["reasons"]).lower()
+
+
+def test_out_of_scope_wording_does_not_auto_block() -> None:
+    item = WorkItem(
+        agent_id=1,
+        title="Интеграция с Ozon",
+        goal="Подключить заказы и остатки Ozon",
+        task_type="feature",
+        requirements=["Интеграция с Ozon: заказы и остатки."],
+        acceptance_criteria=["Пользователь может увидеть заказы Ozon в кабинете."],
+        priority="normal",
+        context_json={"estimated_duration_minutes": 90},
+    )
+    spec = {
+        "status": "confirmed",
+        "in_scope": ["склады и остатки, закупки, заказы и продажи"],
+        "out_of_scope": ["Интеграция с Ozon (заказы, остатки). OpenAI GPT."],
+        "modules": ["склады"],
+        "version": 1,
+    }
+    verdict = assess_execution(item, spec)
+    assert verdict["verdict"] == "execute"
+    assert "Request matches spec out_of_scope" not in verdict["reasons"]
+
+
 def test_topic_is_spec_approval() -> None:
     assert topic_is_spec_approval("тз")
     assert topic_is_spec_approval("spec")
@@ -473,7 +534,13 @@ def test_brief_and_result_parsing_are_canonical() -> None:
         acceptance_criteria=["Focused tests pass."],
         constraints=["Do not select an LLM."],
         edge_cases=["Retry the same Cursor request."],
-        context_json={"branch": "main"},
+        context_json={
+            "branch": "main",
+            "estimated_cost": 750.0,
+            "hourly_rate": 1500,
+            "cost_approved": True,
+            "inside_agreed_scope": True,
+        },
     )
     brief = render_task_brief(item)
     assert "# Task: PM persistence" in brief
@@ -481,6 +548,10 @@ def test_brief_and_result_parsing_are_canonical() -> None:
     assert '"branch": "main"' in brief
     assert "task_id:** 7" in brief
     assert "ice_tracker separately" in brief
+    assert "estimated_cost" not in brief
+    assert "hourly_rate" not in brief
+    assert "стоимость" not in brief.casefold()
+    assert "Do not discuss price" in brief
 
     trackerish = WorkItem(
         id=24,
@@ -544,11 +615,14 @@ def test_brief_and_result_parsing_are_canonical() -> None:
 
     assert is_leftover_cursor_idle({"done": True, "skipped_prompt": True})
     assert is_leftover_cursor_idle({"done": True})
-    assert not is_leftover_cursor_idle({"done": True, "prompt_sent": True})
+    assert is_leftover_cursor_idle({"done": True, "prompt_sent": True})
+    assert is_leftover_cursor_idle({"done": True, "started": True})
     assert not is_leftover_cursor_idle({"done": True, "seen_busy": True})
-    assert not is_leftover_cursor_idle({"done": True, "started": True})
     assert not is_leftover_cursor_idle(
-        {"done": True, "skipped_prompt": True, "started": True}
+        {"done": True, "prompt_sent": True, "seen_busy": True}
+    )
+    assert not is_leftover_cursor_idle(
+        {"done": True, "skipped_prompt": True, "started": True, "seen_busy": True}
     )
     assert not is_leftover_cursor_idle({"done": False})
 
@@ -569,8 +643,37 @@ def test_brief_and_result_parsing_are_canonical() -> None:
     assert recovered["status"] == "completed"
     assert recovered["task_id"] == "30"
     assert "master" in recovered["implementation"]["summary"]
-    assert recovered["verification"]["acceptance_criteria"][0]["passed"] is True
+    # Truncated JSON is never evidence: criteria stay unverified for the QA judge.
+    assert recovered["verification"]["acceptance_criteria"][0]["passed"] is False
+    assert recovered["verification"]["tests_passed"] is False
+    assert recovered["truncated_recovery"] is True
     assert recover_truncated_cursor_result(truncated, expected_task_id="99") is None
+
+    from app.pm_state import native_cursor_summary_as_result
+
+    native = native_cursor_summary_as_result(
+        "Warehouses screen added. Open /warehouses and save a stock count.",
+        expected_task_id="46",
+        acceptance_criteria=["Можно создать склад"],
+    )
+    assert native is not None
+    assert native["status"] == "completed"
+    assert native["native_summary"] is True
+    assert native["verification"]["tests_passed"] is False
+    assert native["verification"]["acceptance_criteria"][0]["passed"] is False
+    assert native_cursor_summary_as_result("idle", expected_task_id="46") is None
+    assert native_cursor_summary_as_result(
+        "Запускаю dev-сервер, проверяю HTTP 200 и сниму скриншоты ключевых экранов.",
+        expected_task_id="52",
+    ) is None
+    assert native_cursor_summary_as_result(
+        "Запущу dev-сервер и сниму скриншоты ключевых экранов.\n---\nСначала проверю порт.",
+        expected_task_id="52",
+    ) is None
+    assert native_cursor_summary_as_result(
+        "На порту 3055 уже есть процесс Next.js. Проверяю, отвечает ли он, и найду демо-учётку для входа.",
+        expected_task_id="52",
+    ) is None
 
     from app.pm_state import cursor_run_satisfies_acceptance
 
@@ -601,3 +704,59 @@ def test_brief_and_result_parsing_are_canonical() -> None:
         },
     )
     assert cursor_run_satisfies_acceptance(fuzzy_item, fuzzy_run)
+
+
+def test_prose_summary_never_satisfies_acceptance() -> None:
+    """Keyword-looking prose is not evidence; only the QA judge or structured rows count."""
+    from app.pm_state import cursor_run_satisfies_acceptance
+
+    item = WorkItem(
+        id=55,
+        agent_id=1,
+        title="Закупки",
+        acceptance_criteria=[
+            "Пользователь может создать закупку с несколькими товарными позициями",
+            "После проведения закупки остатки на выбранном складе корректно увеличиваются",
+        ],
+    )
+    run = CursorRun(
+        work_item_id=55,
+        project_id="mysell",
+        attempt=1,
+        idempotency_key="summary-cover",
+        status="completed",
+        result_json={
+            "implementation": {
+                "summary": (
+                    "Модуль «Закупки и приход товаров на склад» уже реализован в проекте "
+                    "и покрывает все требования из ТЗ. Дополнительных изменений не потребовалось. "
+                    "Пользователь может создать закупку с несколькими товарными позициями "
+                    "и после проведения закупки остатки на выбранном складе корректно увеличиваются."
+                )
+            },
+            "verification": {
+                "tests_passed": False,
+                "lint_passed": False,
+                "acceptance_criteria": [],
+            },
+        },
+    )
+    assert not cursor_run_satisfies_acceptance(item, run)
+    truncated_run = CursorRun(
+        work_item_id=55,
+        project_id="mysell",
+        attempt=2,
+        idempotency_key="truncated",
+        status="completed",
+        result_json={
+            "truncated_recovery": True,
+            "verification": {
+                "tests_passed": True,
+                "lint_passed": True,
+                "acceptance_criteria": [
+                    {"criterion": c, "passed": True, "evidence": "x"} for c in item.acceptance_criteria
+                ],
+            },
+        },
+    )
+    assert not cursor_run_satisfies_acceptance(item, truncated_run)

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .conversation import as_utc
 from .db import Agent, Consultation, ConversationState, MessageLog, RuntimeSettings, TelegramAccount
-from .employee import CONSULT_CMD_RE
+from .employee import CONSULT_CMD_RE, consultation_for_telegram_reply
 from .events import EventHub
 from .runtime import AgentRuntime, NO_TELEGRAM_REPLY
 from .schemas import NormalizedInboundEvent
@@ -16,6 +16,19 @@ from .work_items import find_open_for_chat
 
 ADMIN_ACK_TEXT = "Принято, обрабатываю…"
 logger = logging.getLogger(__name__)
+
+_REJECT_PREFIXES = ("reject", "нет", "no", "отклон", "-")
+
+
+def consultation_status_for_reply(requires_approval: bool, text: str) -> str:
+    """DEPRECATED prefix heuristic; ``intake_gate.classify_manager_reply`` decides."""
+    body = (text or "").strip()
+    lowered = body.lower()
+    if requires_approval:
+        if any(lowered.startswith(prefix) for prefix in _REJECT_PREFIXES):
+            return "rejected"
+        return "approved"
+    return "answered"
 
 
 class TelegramEventRouter:
@@ -254,6 +267,61 @@ class TelegramEventRouter:
                     except Exception:
                         logger.exception("consult reply failed")
                 return
+            if is_admin and not consult_match:
+                reply_item = await consultation_for_telegram_reply(
+                    db, agent.id, payload.get("reply_to_msg_id")
+                )
+                if reply_item is not None:
+                    from .intake_gate import classify_manager_reply
+
+                    answer_body = (text or "").strip()
+                    judge_client = None
+                    try:
+                        judge_client = await self.runtime._judge_fallback_client(db, agent)
+                    except Exception:
+                        judge_client = None
+                    reply_decision = await classify_manager_reply(
+                        db,
+                        judgment=getattr(self.runtime, "judgment", None),
+                        requires_approval=bool(reply_item.requires_approval),
+                        question=str(reply_item.question or ""),
+                        action_name=reply_item.action_name,
+                        text=answer_body,
+                        agent_id=agent.id,
+                        work_item_id=reply_item.work_item_id,
+                        client=judge_client,
+                    )
+                    status = reply_decision.status
+                    try:
+                        item = await self.runtime.employee.resolve_consultation(
+                            db,
+                            reply_item.id,
+                            status=status,
+                            answer_text=reply_decision.answer or answer_body,
+                            answered_by=str(payload.get("sender_id") or ""),
+                            schedule_tick=True,
+                        )
+                        confirm = (
+                            f"Консультация #{item.id}: {status}."
+                            + (" Ответ сохранён." if answer_body else "")
+                        )
+                    except Exception as exc:
+                        confirm = (
+                            f"Не удалось обработать консультацию #{reply_item.id}: {exc}"
+                        )
+                    entity = payload.get("chat_id") or payload.get("sender_id")
+                    if entity is not None:
+                        try:
+                            await self.telegram.send_message(
+                                phone,
+                                entity,
+                                confirm,
+                                reply_to=payload.get("message_id"),
+                                humanize=False,
+                            )
+                        except Exception:
+                            logger.exception("consult reply failed")
+                    return
             if is_admin_command and not is_admin:
                 db.add(MessageLog(
                     agent_id=agent.id,

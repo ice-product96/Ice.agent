@@ -11,7 +11,7 @@ import type {
   AdminSettings, Agent, AgentTask, Consultation, CronJob, Dashboard, EmployeeState, LogEntry, McpServer,
   Conversation, ConversationDetail, LlmProfile, LlmProfileWrite, MemoryItem, RuntimeSettings,
   Customer, CursorProjectOption, EmployeePolicy, EmployeePolicyCatalog,
-  PromptSectionRevision, SipAccount, SipCall, Status, TelegramAccount, WorkItem, WorkItemEvent, WorkItemEventsPage, EmployeeNeedsPage,
+  AgentJudgment, PromptSectionRevision, SipAccount, SipCall, Status, TelegramAccount, WorkItem, WorkItemEvent, WorkItemEventsPage, EmployeeNeedsPage,
   ProjectSpec,
 } from './types'
 
@@ -1089,7 +1089,7 @@ function EmployeeScreen() {
   const roster = overview.data?.items || []
   const [agentId, setAgentId] = useState('')
   const consults = useLoad(
-    () => (agentId ? api.consultations.list(agentId, 'open') : Promise.resolve({ items: [], total: 0 })),
+    () => (agentId ? api.consultations.list(agentId, 'all') : Promise.resolve({ items: [], total: 0 })),
     [agentId],
   )
   const [state, setState] = useState<EmployeeState | null>(null)
@@ -1097,7 +1097,6 @@ function EmployeeScreen() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState('')
-  const [answerDrafts, setAnswerDrafts] = useState<Record<string, string>>({})
   const [inboxFilter, setInboxFilter] = useState<'actionable' | 'in_progress' | 'collecting' | 'waiting_external' | 'waiting_customer' | 'waiting_manager' | 'failed' | 'all'>('actionable')
   const [selectedId, setSelectedId] = useState('')
   const [instructNote, setInstructNote] = useState('')
@@ -1113,7 +1112,7 @@ function EmployeeScreen() {
   const [needsVersion, setNeedsVersion] = useState(0)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [employeeTab, setEmployeeTab] = useState<'work' | 'settings'>('work')
-  const [caseTab, setCaseTab] = useState<'overview' | 'feed' | 'project'>('overview')
+  const [caseTab, setCaseTab] = useState<'overview' | 'feed' | 'project' | 'judgments'>('overview')
   const [sections, setSections] = useState<Record<string, string>>({})
   const [historyKey, setHistoryKey] = useState('')
   const [historyItems, setHistoryItems] = useState<PromptSectionRevision[]>([])
@@ -1358,7 +1357,8 @@ function EmployeeScreen() {
     }
   }
 
-  const openConsults = consults.data?.items || []
+  const consultItems = consults.data?.items || []
+  const openConsults = consultItems.filter(item => item.status === 'open')
   const workItems = state?.work_items || []
   const counts = state?.work_item_counts || {}
   const openWorkItems = workItems.filter(item => !item.aborted && item.status !== 'done')
@@ -1372,7 +1372,7 @@ function EmployeeScreen() {
   const staffJobs = (state?.jobs || []).filter(job => (job.kind || 'cron') === 'cron')
   const heartbeatJob = (state?.jobs || []).find(job => job.kind === 'heartbeat')
 
-  async function runWorkAction(action: 'resume' | 'pause' | 'close' | 'abort' | 'delete' | 'instruct' | 'flush' | 'wait' | 'reset-cursor') {
+  async function runWorkAction(action: 'resume' | 'pause' | 'close' | 'abort' | 'delete' | 'instruct' | 'flush' | 'wait' | 'reset-cursor' | 'accept-qa' | 'submit-cursor') {
     if (!agentId || !selectedId) return
     if (action === 'delete' && !confirmDelete) {
       setConfirmDelete(true)
@@ -1410,6 +1410,14 @@ function EmployeeScreen() {
         const result = await api.agents.resetWorkItemCursor(agentId, selectedId, instructNote)
         setNotice(result.message || 'Привязка к Cursor сброшена.')
       }
+      if (action === 'accept-qa') {
+        await api.agents.acceptWorkItemQa(agentId, selectedId, instructNote)
+        setNotice('QA принят оператором — кейс закрыт.')
+      }
+      if (action === 'submit-cursor') {
+        const result = await api.agents.submitWorkItemCursor(agentId, selectedId, instructNote)
+        setNotice(result.message || 'Отправка в Cursor запланирована.')
+      }
       if (action !== 'delete' && action !== 'abort') setInstructNote('')
       await load(agentId)
       if (selectedId) await refreshSelected(selectedId)
@@ -1417,39 +1425,6 @@ function EmployeeScreen() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Действие не удалось')
       setConfirmDelete(false)
-    } finally { setBusy('') }
-  }
-
-  async function resolveConsult(item: Consultation, status: 'answered' | 'approved' | 'rejected') {
-    setBusy(`consult-${item.id}`); setError(''); setNotice('')
-    try {
-      const answer = (answerDrafts[item.id] || '').trim()
-      if (status === 'answered' && !answer) {
-        setError('Напишите ответ или нажмите «Снять с очереди», если вопрос не актуален.')
-        return
-      }
-      const result = await api.consultations.resolve(item.id, { status, answer_text: answer })
-      setAnswerDrafts(d => { const next = { ...d }; delete next[item.id]; return next })
-      setNotice(result.message || 'Консультация закрыта, агент продолжит работу.')
-      await consults.refresh()
-      await load(agentId)
-      await overview.refresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Не удалось ответить')
-    } finally { setBusy('') }
-  }
-
-  async function dismissConsult(item: Consultation) {
-    setBusy(`dismiss-${item.id}`); setError(''); setNotice('')
-    try {
-      const result = await api.consultations.dismiss(item.id, answerDrafts[item.id]?.trim() || 'Не актуально')
-      setAnswerDrafts(d => { const next = { ...d }; delete next[item.id]; return next })
-      setNotice(result.message || 'Консультация снята с очереди.')
-      await consults.refresh()
-      await load(agentId)
-      await overview.refresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Не удалось снять с очереди')
     } finally { setBusy('') }
   }
 
@@ -1463,6 +1438,16 @@ function EmployeeScreen() {
         <button className="secondary" disabled={!agentId || loading} onClick={() => void load(agentId)}><RefreshCw size={15}/>Обновить</button>
       </div>}
     />
+    {(state?.runtime_health?.memory_degraded || state?.runtime_health?.judge_degraded || state?.runtime_health?.memory_error || state?.runtime_health?.judge_error) && (
+      <Alert message={
+        [
+          state?.runtime_health?.memory_degraded ? 'Память недоступна — необратимые действия заблокированы.' : '',
+          state?.runtime_health?.memory_error ? `Память: ${state.runtime_health.memory_error}` : '',
+          state?.runtime_health?.judge_degraded ? 'Судьи недоступны — рельсы работают в деградации.' : '',
+          state?.runtime_health?.judge_error && !state?.runtime_health?.judge_degraded ? `Судьи: ${state.runtime_health.judge_error}` : '',
+        ].filter(Boolean).join(' ')
+      }/>
+    )}
     {overview.loading && !overview.data ? <Loading/> : roster.length > 0 && <section className="panel employee-roster">
       <SectionHead title="Команда" text="Каждый агент работает отдельно: свой inbox, heartbeat и политика."/>
       <div className="employee-roster-grid">
@@ -1596,6 +1581,9 @@ function EmployeeScreen() {
           {(selected.project_id || selected.project) && (
             <button type="button" role="tab" aria-selected={caseTab === 'project'} className={`case-tab ${caseTab === 'project' ? 'active' : ''}`} onClick={() => setCaseTab('project')}>Проект</button>
           )}
+          <button type="button" role="tab" aria-selected={caseTab === 'judgments'} className={`case-tab ${caseTab === 'judgments' ? 'active' : ''}`} onClick={() => setCaseTab('judgments')}>
+            Решения{(selected.judgments || []).length ? ` · ${selected.judgments?.length}` : ''}
+          </button>
         </div>
 
         {caseTab === 'overview' && <>
@@ -1643,7 +1631,9 @@ function EmployeeScreen() {
                   ? (selected.commerce.cost_approved ? ' · стоимость согласована' : ' · нужно согласовать стоимость')
                   : ''}
               </small>
-              {selected.commerce?.min_execution_minutes != null && (
+              {selected.commerce?.wait_estimated_duration === false ? (
+                <small style={{ display: 'block' }}>Приёмка QA сразу после Cursor — ожидание оценки выкл.</small>
+              ) : selected.commerce?.min_execution_minutes != null && (
                 <small style={{ display: 'block' }}>
                   Мин. время Cursor: {selected.commerce.min_execution_minutes} мин
                   {selected.commerce.elapsed_cursor_minutes != null ? ` · прошло ${selected.commerce.elapsed_cursor_minutes}` : ''}
@@ -1691,12 +1681,62 @@ function EmployeeScreen() {
           <button className="secondary compact" disabled={!!busy || !instructNote.trim()} onClick={() => void runWorkAction('instruct')}>Указать</button>
           <button className="secondary compact" disabled={!!busy} onClick={() => void runWorkAction('pause')}>Пауза кейса</button>
           <button className="secondary compact" disabled={!!busy} onClick={() => void runWorkAction('reset-cursor')}>Сбросить Cursor</button>
+          <button className="secondary compact" disabled={!!busy || !['QA', 'CLIENT_REVIEW', 'DEV_COMPLETE'].includes(selected.pm_phase || '')} onClick={() => void runWorkAction('accept-qa')}>Принять QA</button>
+          <button className="secondary compact" disabled={!!busy || selected.status === 'done'} onClick={() => void runWorkAction('submit-cursor')}>В Cursor</button>
           <button className="secondary compact" disabled={!!busy} onClick={() => void runWorkAction('abort')}>Отменить кейс</button>
           <button className="danger compact" disabled={!!busy} onClick={() => void runWorkAction('delete')}>
             {confirmDelete ? 'Подтвердить удаление' : 'Удалить кейс'}
           </button>
           {confirmDelete && <button type="button" className="secondary compact" disabled={!!busy} onClick={() => setConfirmDelete(false)}>Не удалять</button>}
         </div>
+        </>}
+
+        {caseTab === 'judgments' && <>
+          <h3 className="work-timeline-title">Вердикты судей</h3>
+          {(selected.turn_costs || []).length > 0 && (
+            <small>
+              Стоимость хода: {(selected.turn_costs || []).map(cost =>
+                `${cost.decision_trace_id || '—'}: ${cost.calls || 0} вызовов · ${cost.prompt_tokens || 0}+${cost.completion_tokens || 0} ток.`
+              ).join(' · ')}
+            </small>
+          )}
+          <div className="work-timeline">
+            {(selected.judgments || []).length === 0 ? <p className="transcript-empty">Пока нет вердиктов по кейсу.</p> :
+              (selected.judgments || []).map((row: AgentJudgment) => {
+                const evidence = Array.isArray(row.verdict_json?.evidence) ? row.verdict_json?.evidence as Array<{ source?: string; text?: string }> : []
+                return (
+                  <div className={`work-event kind-${row.agreed === false ? 'blocked' : 'progress'}`} key={row.id}>
+                    <strong>{row.kind} · {row.override_verdict || row.verdict}</strong>
+                    <small>
+                      {row.created_at ? new Date(row.created_at).toLocaleString('ru-RU') : ''}
+                      {row.confidence != null ? ` · уверенность ${(row.confidence * 100).toFixed(0)}%` : ''}
+                      {row.model ? ` · ${row.model}` : ''}
+                      {row.mode ? ` · ${row.mode}` : ''}
+                      {row.agreed === false ? ' · расходится с legacy' : ''}
+                      {row.overridden_by ? ` · override ${row.overridden_by}` : ''}
+                    </small>
+                    {typeof row.verdict_json?.reasoning === 'string' && row.verdict_json.reasoning && <p>{row.verdict_json.reasoning}</p>}
+                    {evidence.slice(0, 3).map((quote, index) => (
+                      <p key={`${row.id}-q-${index}`}><em>{quote.source}: «{quote.text}»</em></p>
+                    ))}
+                    {row.error && <Alert message={row.error}/>}
+                    {!row.overridden_by && (
+                      <div className="head-actions" style={{ marginTop: 8 }}>
+                        <button className="secondary compact" disabled={!!busy} onClick={() => {
+                          const verdict = window.prompt('Новый вердикт', row.verdict || '')
+                          if (!verdict) return
+                          setBusy('override')
+                          void api.agents.overrideJudgment(agentId, selectedId, row.id, verdict, instructNote)
+                            .then(() => refreshSelected(selectedId))
+                            .catch(err => setError(err instanceof Error ? err.message : 'Не удалось отменить вердикт'))
+                            .finally(() => setBusy(''))
+                        }}>Отменить вердикт</button>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+          </div>
         </>}
 
         {caseTab === 'feed' && <>
@@ -1797,6 +1837,15 @@ function EmployeeScreen() {
                   }}
                 />
               </div>
+              <div className="toggle-box" style={{ gridColumn: '1 / -1' }}>
+                <Toggle
+                  label="Ждать заложенное время по оценке перед приёмкой QA"
+                  checked={selected.project?.config?.wait_estimated_duration !== false && selected.commerce?.wait_estimated_duration !== false}
+                  onChange={async checked => {
+                    await patchProject({ wait_estimated_duration: checked })
+                  }}
+                />
+              </div>
             </div>
             <ProjectSpecEditor
               spec={(selected.project?.spec || (selected.project?.config?.spec as ProjectSpec | undefined) || null)}
@@ -1812,25 +1861,23 @@ function EmployeeScreen() {
       <section className="panel">
         <SectionHead
           title={`Консультации (${openConsults.length} открытых)`}
-          text="Ответ закрывает вопрос и сразу запускает агента (force tick). «Снять с очереди» — для устаревших без запуска. Telegram: /answer id · /approve id · /reject id"
+          text="Только просмотр. Вопрос уходит руководителю в Telegram. Ответьте там на сообщение или командой /answer id · /approve id · /reject id. Тики и логи — во вкладке «Логи»."
         />
-        {openConsults.length === 0 ? <Empty icon={MessageCircle} title="Очередь пуста" text="Когда сотруднику что-то нужно — запрос появится здесь и у админов в Telegram."/> :
-          <div className="list-panel">{openConsults.map((item: Consultation) => <div className="server-row" key={item.id} style={{ alignItems: 'flex-start', paddingTop: 12, paddingBottom: 12 }}>
-            <span className="chip">{item.requires_approval ? 'approval' : 'consult'}</span>
+        {consultItems.length === 0 ? <Empty icon={MessageCircle} title="Пока нет консультаций" text="Когда сотруднику нужно решение, вопрос придёт в Telegram. Здесь останется копия."/> :
+          <div className="list-panel">{consultItems.map((item: Consultation) => <div className="server-row" key={item.id} style={{ alignItems: 'flex-start', paddingTop: 12, paddingBottom: 12 }}>
+            <span className="chip">{item.status === 'open' ? (item.requires_approval ? 'approval' : 'open') : item.status}</span>
             <div className="grow">
               <strong>#{item.id}{item.work_item_id ? ` · кейс #${item.work_item_id}` : ''} · агент {item.agent_id}</strong>
               <small>{item.question}</small>
               {item.context && <small>{item.context.slice(0, 240)}</small>}
-              {!item.work_item_id && <small className="consult-hint">Старая консультация без кейса — можно снять с очереди, если не актуальна.</small>}
-              <textarea rows={2} style={{ marginTop: 8, width: '100%' }} placeholder="Ответ руководителя…" value={answerDrafts[item.id] || ''} onChange={e => setAnswerDrafts(d => ({ ...d, [item.id]: e.target.value }))}/>
-              <div className="head-actions" style={{ marginTop: 8 }}>
-                <button className="secondary compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'answered')}>Ответить</button>
-                <button className="secondary compact" disabled={!!busy} onClick={() => void dismissConsult(item)}>Снять с очереди</button>
-                {item.requires_approval && <>
-                  <button className="primary compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'approved')}>Одобрить</button>
-                  <button className="danger compact" disabled={!!busy} onClick={() => void resolveConsult(item, 'rejected')}>Отклонить</button>
-                </>}
-              </div>
+              {item.status === 'open' && (
+                <small className="consult-hint">
+                  {item.telegram_delivered
+                    ? 'Ожидает ответа в Telegram.'
+                    : 'Не доставлено в Telegram — проверьте admin IDs и Telegram-аккаунт сотрудника.'}
+                </small>
+              )}
+              {item.answer_text && <small>Ответ: {item.answer_text}</small>}
             </div>
           </div>)}</div>}
       </section>
@@ -2096,6 +2143,7 @@ function CustomerForm({
     workday_end?: string
     tracker_project_id?: string
     tracker_poll_enabled?: boolean
+    wait_estimated_duration?: boolean
     spec?: ProjectSpec
   }) => Promise<void>
   refreshingProjects?: boolean
@@ -2109,6 +2157,7 @@ function CustomerForm({
   const [workdayEnd, setWorkdayEnd] = useState('18:00')
   const [trackerProjectId, setTrackerProjectId] = useState('')
   const [trackerPollEnabled, setTrackerPollEnabled] = useState(true)
+  const [waitEstimatedDuration, setWaitEstimatedDuration] = useState(value.wait_estimated_duration !== false)
   const [specDraft, setSpecDraft] = useState<ProjectSpec | undefined>(value.spec)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -2135,6 +2184,11 @@ function CustomerForm({
           ? Boolean(cfg.tracker_project_id || value.tracker_project_id)
           : Boolean(cfg.tracker_poll_enabled),
       )
+      setWaitEstimatedDuration(
+        cfg.wait_estimated_duration === undefined || cfg.wait_estimated_duration === null
+          ? (project.commerce?.wait_estimated_duration !== false)
+          : Boolean(cfg.wait_estimated_duration),
+      )
       setSpecDraft(project.spec || (cfg.spec as ProjectSpec | undefined) || value.spec)
     }).catch(() => {
       /* new project — keep defaults */
@@ -2159,6 +2213,7 @@ function CustomerForm({
           workday_end: workdayEnd,
           tracker_project_id: trackerProjectId.trim(),
           tracker_poll_enabled: trackerPollEnabled,
+          wait_estimated_duration: waitEstimatedDuration,
           spec: specDraft,
         })
         onClose()
@@ -2230,7 +2285,7 @@ function CustomerForm({
 
         <div className="form-section wide">
           <strong>Стоимость и рабочие часы</strong>
-          <small>Ставка для расчёта по оценке длительности; переключатель — нужно ли согласовывать цену с заказчиком перед Cursor.</small>
+          <small>Ставка для расчёта по оценке; переключатели — согласование цены и ожидание заложенного времени перед QA.</small>
         </div>
         <Field label="Ставка ₽/час" hint={loadingProject ? 'Загрузка настроек проекта…' : 'Например 2500'}>
           <input
@@ -2256,6 +2311,13 @@ function CustomerForm({
             label="Согласовывать стоимость с заказчиком перед Cursor"
             checked={costApproval}
             onChange={setCostApproval}
+          />
+        </div>
+        <div className="toggle-box wide">
+          <Toggle
+            label="Ждать заложенное время по оценке перед приёмкой QA"
+            checked={waitEstimatedDuration}
+            onChange={setWaitEstimatedDuration}
           />
         </div>
         <div className="toggle-box wide"><Toggle label="Заказчик по умолчанию для выбранного сотрудника" checked={Boolean(form.is_default)} onChange={v => patch({ is_default: v })}/></div>
@@ -2285,6 +2347,9 @@ function CustomerForm({
               : null,
             hourlyRate ? `Ставка: ${hourlyRate} ₽/час.` : null,
             costApproval ? 'Стоимость работ согласовывать с заказчиком.' : 'Стоимость можно не согласовывать с заказчиком.',
+            waitEstimatedDuration
+              ? 'Перед приёмкой QA ждать заложенное время по оценке.'
+              : 'После Cursor сразу QA и закрытие — не ждать оценку.',
             'Представляйся и веди работу от имени этого заказчика и этого проекта.',
           ].filter(Boolean).join('\n')}</pre>
         </section>
@@ -2307,7 +2372,7 @@ function CustomersScreen() {
     {(loaded.error || agents.error || projects.error) && <Alert message={loaded.error || agents.error || projects.error || ''}/>}
     <SectionHead
       title={`${items.length} заказчиков`}
-      text="Укажите заказчика, проект Cursor, ставку ₽/час и нужно ли согласовывать стоимость."
+      text="Укажите заказчика, проект Cursor, ставку и нужно ли ждать оценку перед приёмкой QA."
       action={<button className="primary" onClick={() => setEditing({ name: '', id: '', notes: '', project_id: '', cursor_workspace: '', is_default: true, agent_id: filterAgent || undefined })}><Plus size={17}/>Новый заказчик</button>}
     />
     <form className="filter-bar" onSubmit={e => e.preventDefault()}>
@@ -2326,7 +2391,7 @@ function CustomersScreen() {
           <span><Briefcase size={13}/>{agentName(item.agent_id)}</span>
           <span><ServerCog size={13}/>{item.project_id || '—'}</span>
         </div>
-        <div className="entity-meta"><span>{item.cursor_workspace || 'Cursor workspace не задан'}</span><span>id={item.id}</span><span>{item.tracker_project_id ? (item.tracker_poll_enabled === false ? 'трекер выкл.' : 'трекер опрос') : 'без трекера'}</span><span>ТЗ: {specStatusLabel(item.spec?.status)}</span></div>
+        <div className="entity-meta"><span>{item.cursor_workspace || 'Cursor workspace не задан'}</span><span>id={item.id}</span><span>{item.tracker_project_id ? (item.tracker_poll_enabled === false ? 'трекер выкл.' : 'трекер опрос') : 'без трекера'}</span><span>{item.wait_estimated_duration === false ? 'QA сразу' : 'ждать оценку'}</span><span>ТЗ: {specStatusLabel(item.spec?.status)}</span></div>
         {item.prompt_block && <pre className="customer-prompt-inline">{item.prompt_block}</pre>}
         <div className="card-actions">
           <button className="secondary" onClick={() => setEditing(item)}>Изменить</button>
@@ -2352,6 +2417,7 @@ function CustomersScreen() {
           is_default: Boolean(value.is_default),
           tracker_project_id: value.tracker_project_id || '',
           tracker_poll_enabled: value.tracker_poll_enabled !== false,
+          wait_estimated_duration: value.wait_estimated_duration !== false,
         }
         if (editing.id && (loaded.data || []).some(item => item.id === editing.id)) {
           await api.customers.update(String(editing.id), payload)
@@ -2364,6 +2430,7 @@ function CustomersScreen() {
             config: {
               hourly_rate: value.hourly_rate ?? null,
               cost_requires_customer_approval: Boolean(value.cost_requires_customer_approval),
+              wait_estimated_duration: value.wait_estimated_duration !== false,
               timezone: value.timezone || 'Asia/Yekaterinburg',
               workday_start: value.workday_start || '09:00',
               workday_end: value.workday_end || '18:00',
@@ -2735,7 +2802,7 @@ function LiveScreen({ mode }: { mode: 'logs' | 'tasks' }) {
   const filteredTasks = useMemo(() => tasks.filter(t => !search || `${t.title} ${t.payload || ''}`.toLowerCase().includes(search.toLowerCase())), [tasks, search])
   const loading = mode === 'logs' ? logsLoad.loading : tasksLoad.loading; const error = mode === 'logs' ? logsLoad.error : tasksLoad.error
   return <>
-    <SectionHead title={mode === 'logs' ? `${filteredLogs.length} недавних событий` : `${filteredTasks.length} задач`} text={connected ? 'Получение обновлений в реальном времени' : 'Поток недоступен — показаны данные API'} action={<div className="head-actions">{mode === 'logs' && <button className="danger" onClick={() => setClearing(true)}><Trash2 size={16}/>Удалить всё</button>}<span className={`live-pill ${connected ? '' : 'muted'}`}>{connected ? <Wifi size={14}/> : <WifiOff size={14}/>} {connected ? 'Подключено' : 'Офлайн'}</span></div>}/>
+    <SectionHead title={mode === 'logs' ? `${filteredLogs.length} недавних событий` : `${filteredTasks.length} задач`} text={mode === 'logs' ? (connected ? 'Техжурнал тиков и инструментов. Вопросы руководителю — в Telegram.' : 'Поток недоступен — показаны данные API') : (connected ? 'Получение обновлений в реальном времени' : 'Поток недоступен — показаны данные API')} action={<div className="head-actions">{mode === 'logs' && <button className="danger" onClick={() => setClearing(true)}><Trash2 size={16}/>Удалить всё</button>}<span className={`live-pill ${connected ? '' : 'muted'}`}>{connected ? <Wifi size={14}/> : <WifiOff size={14}/>} {connected ? 'Подключено' : 'Офлайн'}</span></div>}/>
     <div className="filter-bar"><div className="search-box"><Search size={17}/><input value={search} onChange={e => setSearch(e.target.value)} placeholder={mode === 'logs' ? 'Поиск по логам…' : 'Поиск по задачам…'}/></div>{mode === 'logs' && <select value={level} onChange={e => setLevel(e.target.value)}><option value="">Все уровни</option><option>debug</option><option>info</option><option>warning</option><option>error</option></select>}</div>
     {error && <Alert message={error}/>}
     {loading ? <Loading/> : mode === 'logs' ? <div className="log-view">{filteredLogs.length === 0 ? <Empty icon={FileText} title="Нет событий логов" text="События runtime появятся здесь."/> : filteredLogs.map(log => <div className="log-row" key={log.id}><time>{new Date(log.timestamp).toLocaleTimeString()}</time><span className={`log-level ${log.level}`}>{log.level}</span><strong>{log.source}</strong><p>{log.message}</p></div>)}</div> :

@@ -96,6 +96,7 @@ def test_local_memory_uses_openai_embeddings_for_openai_profile() -> None:
     assert config["embedder"]["config"]["model"] == "text-embedding-3-small"
     assert config["embedder"]["config"]["http_client_proxies"] == "http://proxy:8080"
     assert config["vector_store"]["config"]["embedding_model_dims"] == 1536
+    assert config["llm"]["config"]["is_reasoning_model"] is True
 
 
 class FakeDB:

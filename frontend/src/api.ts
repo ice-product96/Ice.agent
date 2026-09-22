@@ -1,6 +1,6 @@
 import type {
   AdminSettings, Agent, AgentTask, CronJob, Dashboard, LogEntry, McpServer,
-  Conversation, ConversationDetail, Consultation, EmployeePolicy, EmployeePolicyCatalog, EmployeeProfile, EmployeeRosterEntry, EmployeeState,
+  AgentJudgment, Conversation, ConversationDetail, Consultation, EmployeePolicy, EmployeePolicyCatalog, EmployeeProfile, EmployeeRosterEntry, EmployeeState,
   Customer, CursorProjectOption, LlmProfile, LlmProfileWrite, MemoryItem, Paginated,
   PmProjectDetail, ProjectState, PromptSectionRevision, RuntimeSettings, SipAccount, SipCall, TelegramAccount, WorkItem, WorkItemCounts, WorkItemEventsPage, EmployeeNeedsPage,
 } from './types'
@@ -124,6 +124,20 @@ export const api = {
       request<{ ok: boolean; item: WorkItem }>(
         `/agents/${id}/work-items/${workItemId}/intake-wait`,
         { method: 'POST', ...body({ minutes, note }) },
+      ),
+    workItemJudgments: (id: string, workItemId: string) =>
+      request<{ items: AgentJudgment[]; total: number }>(`/agents/${id}/work-items/${workItemId}/judgments`),
+    overrideJudgment: (id: string, workItemId: string, judgmentId: string | number, verdict: string, note = '') =>
+      request<AgentJudgment>(
+        `/agents/${id}/work-items/${workItemId}/judgments/${judgmentId}/override`,
+        { method: 'POST', ...body({ verdict, note }) },
+      ),
+    acceptWorkItemQa: (id: string, workItemId: string, note = '') =>
+      request<{ ok: boolean; item: WorkItem }>(`/agents/${id}/work-items/${workItemId}/accept-qa`, { method: 'POST', ...body({ note }) }),
+    submitWorkItemCursor: (id: string, workItemId: string, note = '') =>
+      request<{ ok: boolean; item: WorkItem; message?: string }>(
+        `/agents/${id}/work-items/${workItemId}/submit-cursor`,
+        { method: 'POST', ...body({ note }) },
       ),
     mcpServers: (id: string) =>
       request<{ agent_id: number; server_ids: number[] }>(`/agents/${id}/mcp-servers`),

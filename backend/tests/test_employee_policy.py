@@ -99,6 +99,7 @@ def test_pm_mode_is_opt_in_and_has_structured_guards() -> None:
     assert "ice_tracker card is a request" in text.lower()
     assert "the platform moves the card itself" in text.lower()
     assert "pm_reset_project" in text
+    assert "wait_estimated_duration" in text
     assert "do not wait to 'accumulate the assignment'" in text.lower()
 
 

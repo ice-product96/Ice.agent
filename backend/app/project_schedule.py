@@ -100,6 +100,9 @@ def project_commerce_settings(
         "cost_requires_customer_approval": _as_bool(
             config.get("cost_requires_customer_approval"), False
         ),
+        "wait_estimated_duration": _as_bool(
+            config.get("wait_estimated_duration"), True
+        ),
         "min_execution_ratio": max(
             0.0,
             float(_as_float(config.get("min_execution_ratio"), 1.0) or 1.0),
@@ -169,16 +172,21 @@ def apply_task_estimate(
     hourly_rate: float = 0.0,
     min_execution_ratio: float = 1.0,
     currency: str = "RUB",
+    wait_estimated_duration: bool = True,
 ) -> dict[str, Any]:
     """Stamp estimate/cost onto work-item context; returns the commerce snapshot."""
     ctx = dict(item.context_json or {})
     minutes = _as_int(estimated_duration_minutes, None)
     if minutes is None:
         minutes = _as_int(ctx.get("estimated_duration_minutes"), None)
+    ctx["wait_estimated_duration"] = bool(wait_estimated_duration)
     if minutes is not None and minutes > 0:
         ctx["estimated_duration_minutes"] = minutes
-        min_minutes = max(1, int(round(minutes * max(0.0, min_execution_ratio))))
-        ctx["min_execution_minutes"] = min_minutes
+        if wait_estimated_duration:
+            min_minutes = max(1, int(round(minutes * max(0.0, min_execution_ratio))))
+            ctx["min_execution_minutes"] = min_minutes
+        else:
+            ctx["min_execution_minutes"] = 0
         ctx["currency"] = currency
         if hourly_rate > 0:
             hours = minutes / 60.0
@@ -280,8 +288,17 @@ def cursor_elapsed_minutes(runs: list[CursorRun]) -> float:
 def min_execution_remaining_minutes(
     item: WorkItem,
     runs: list[CursorRun],
+    *,
+    settings: dict[str, Any] | None = None,
 ) -> float:
     ctx = dict(item.context_json or {}) if isinstance(item.context_json, dict) else {}
+    wait = True
+    if settings is not None:
+        wait = _as_bool(settings.get("wait_estimated_duration"), True)
+    elif "wait_estimated_duration" in ctx:
+        wait = _as_bool(ctx.get("wait_estimated_duration"), True)
+    if not wait:
+        return 0.0
     required = _as_int(ctx.get("min_execution_minutes"), None)
     if required is None or required <= 0:
         return 0.0
@@ -314,6 +331,7 @@ def schedule_snapshot(
             settings.get("cost_requires_customer_approval")
         ),
         "min_execution_ratio": settings.get("min_execution_ratio") or 1.0,
+        "wait_estimated_duration": bool(settings.get("wait_estimated_duration", True)),
         "now_local": now.astimezone(tz).strftime("%Y-%m-%d %H:%M %Z"),
     }
 
@@ -333,6 +351,9 @@ def enrich_project_state_payload(
                 "cost_requires_customer_approval"
             ],
             "min_execution_ratio": settings["min_execution_ratio"],
+            "wait_estimated_duration": bool(
+                settings.get("wait_estimated_duration", True)
+            ),
         },
     }
 
@@ -351,7 +372,7 @@ def enrich_work_item_commerce(
         currency=str(settings["currency"]),
     )
     runs = list(runs or [])
-    remaining = min_execution_remaining_minutes(item, runs)
+    remaining = min_execution_remaining_minutes(item, runs, settings=settings)
     schedule = schedule_snapshot(settings)
     next_event = None
     if item.wait_until is not None:
@@ -380,6 +401,9 @@ def enrich_work_item_commerce(
             "elapsed_cursor_minutes": round(cursor_elapsed_minutes(runs), 1),
             "min_execution_remaining_minutes": round(remaining, 1),
             "can_accept_qa": remaining <= 0,
+            "wait_estimated_duration": bool(
+                settings.get("wait_estimated_duration", True)
+            ),
         },
         "next_event": next_event,
     }

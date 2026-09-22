@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -53,6 +54,33 @@ BUSY_STATUSES = frozenset({
 IDLE_STATUSES = frozenset({"idle", "ready", "done", "complete", "completed"})
 STOPPED_STATUSES = frozenset({"error", "failed", "cancelled", "canceled", "stopped"})
 
+_INCOMPLETE_SUMMARY_RE = re.compile(
+    r"(?is)(?:"
+    r"\b(?:запускаю|запущу|проверю|проверяю|смотрю|найду|сниму|сначала)\b"
+    r"|i['’]ll\b|let me\b|going to\b|looking at\b"
+    r")"
+)
+
+# Legacy text heuristics stay on until the cursor_completion judge is enforced; the
+# judgment service flips this flag from RuntimeSettings.judge_modes.
+_TEXT_HEURISTICS_ENABLED = True
+
+
+def set_text_heuristics(enabled: bool) -> None:
+    global _TEXT_HEURISTICS_ENABLED
+    _TEXT_HEURISTICS_ENABLED = bool(enabled)
+
+
+def text_heuristics_enabled() -> bool:
+    return _TEXT_HEURISTICS_ENABLED
+
+
+def summary_looks_incomplete(text: str) -> bool:
+    """DEPRECATED regex on the summary; disabled when the completion judge is enforced."""
+    if not _TEXT_HEURISTICS_ENABLED:
+        return False
+    return bool(_INCOMPLETE_SUMMARY_RE.search(str(text or "").strip()))
+
 CURSOR_CHECK_ONLY_MESSAGE = (
     "Только cursorremote_check. Не вызывай cursorremote_do и не давай Cursor новую задачу "
     "(даже если в сводке «поиск» или кажется, что он остановился). "
@@ -68,9 +96,8 @@ FOLLOW_UP_HINT = (
 )
 
 DONE_HINT = (
-    "Cursor finished (done=true). Do NOT call schedule_self again. "
-    "Write a short result to the person who asked for this work in the original Telegram chat. "
-    "If summary is empty, still report that Cursor is idle and the task is complete."
+    "Cursor finished (done=true) and posted a summary. Do NOT call schedule_self again. "
+    "Use that summary as the result for the original Telegram chat."
 )
 
 NOT_STARTED_HINT = (
@@ -422,8 +449,17 @@ def remember_cursor_worker(item: Any | None, result: dict[str, Any] | None) -> N
         return
     meta = dict(getattr(item, "metadata_json", None) or {})
     changed = False
-    for key in ("cursor_session_id", "cursor_remote_task_id", "cursor_composer_id"):
-        value = _first_text(result.get(key))
+    for key, sources in (
+        ("cursor_session_id", ("cursor_session_id", "session_id")),
+        ("cursor_remote_task_id", ("cursor_remote_task_id", "remote_task_id")),
+        ("cursor_composer_id", ("cursor_composer_id", "composerId", "composer_id")),
+        ("cursor_window_id", ("cursor_window_id", "windowId", "window_id")),
+        ("cursor_workspace", ("cursor_workspace", "workspace", "workspacePath")),
+    ):
+        value = _first_text(*(result.get(name) for name in sources))
+        raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+        if not value and raw:
+            value = _first_text(*(raw.get(name) for name in sources))
         if value and meta.get(key) != value:
             meta[key] = value
             changed = True
@@ -504,6 +540,17 @@ def _worker_ids_from_create(payload: Any) -> dict[str, str]:
             session_blob.get("composerId"),
             session_blob.get("composer_id"),
         ),
+        "cursor_window_id": _first_text(
+            session_blob.get("workspaceId"),
+            session_blob.get("workspace_id"),
+            session_blob.get("windowId"),
+            session_blob.get("window_id"),
+        ),
+        "cursor_workspace": _first_text(
+            session_blob.get("workspacePath"),
+            session_blob.get("workspace_path"),
+            session_blob.get("workspace"),
+        ),
     }
 
 
@@ -533,16 +580,15 @@ def cursor_is_busy(status: Any) -> bool:
         return False
     if int(data.get("pendingApprovalCount") or 0) > 0:
         return True
-    if data.get("agentActivityLive"):
-        return True
     name = str(data.get("agentStatus") or data.get("status") or "").strip().lower()
     if name in STOPPED_STATUSES:
         return False
+    # Cursor may keep UI chrome after completion; idle is not in-flight work.
     if name in IDLE_STATUSES or name in {"", "unknown"}:
         return False
     if name in BUSY_STATUSES:
         return True
-    return True
+    return bool(data.get("agentActivityLive"))
 
 
 def composer_is_actively_working(result: Any) -> bool:
@@ -599,8 +645,23 @@ def prompt_visible_in_composer(state: Any, prompt: str) -> bool:
     return any(needle in haystack for needle in needles)
 
 
+_IN_FLIGHT_ASSISTANT = (
+    "searching",
+    "exploring",
+    "reading",
+    "looking through",
+    "running tool",
+    "i'll search",
+    "let me search",
+    "ищу ",
+    "читаю ",
+    "смотрю код",
+    "поиск",
+)
+
+
 def cursor_has_active_work(state: Any) -> bool:
-    """True if the chat already shows search/tools/plan — not a blank idle editor."""
+    """True if the chat shows in-flight search/tools — not leftover idle prose."""
     data = parse_mcp_payload(state)
     if not isinstance(data, dict):
         return False
@@ -610,9 +671,25 @@ def cursor_has_active_work(state: Any) -> bool:
         if not isinstance(item, dict):
             continue
         kind = str(item.get("type") or "").lower()
-        if kind in {"assistant", "plan", "tool", "tool_call", "thinking", "search"}:
+        if kind == "plan":
+            completed = item.get("todosCompleted")
+            total = item.get("todosTotal")
+            try:
+                if total is not None and int(total) > 0 and int(completed or 0) >= int(total):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            return True
+        if kind in {"tool", "tool_call", "thinking", "search"}:
             return True
         if kind == "human":
+            continue
+        if kind == "assistant":
+            # Assistant prose is not a machine signal; word markers only in legacy mode.
+            if _TEXT_HEURISTICS_ENABLED:
+                text = str(item.get("text") or "").casefold()
+                if any(marker in text for marker in _IN_FLIGHT_ASSISTANT):
+                    return True
             continue
         if str(item.get("text") or "").strip():
             return True
@@ -620,9 +697,12 @@ def cursor_has_active_work(state: Any) -> bool:
 
 
 def should_pin_cursor_followup(message: str) -> bool:
+    """DEPRECATED keyword check; pin by the case's cursor_in_flight flag instead."""
     text = (message or "").lower()
     if not text:
         return True
+    if not _TEXT_HEURISTICS_ENABLED:
+        return False
     markers = (
         "cursor",
         "cursorremote",
@@ -636,8 +716,17 @@ def should_pin_cursor_followup(message: str) -> bool:
     return any(token in text for token in markers)
 
 
-def pin_cursor_followup_message(message: str) -> str:
-    if should_pin_cursor_followup(message):
+def pin_cursor_followup_message(message: str, *, cursor_in_flight: bool | None = None) -> str:
+    """Replace a follow-up with the check-only message when the case waits on Cursor.
+
+    The machine signal is the work item's ``cursor_in_flight`` flag. The keyword scan
+    remains only while legacy text heuristics are enabled.
+    """
+    if cursor_in_flight:
+        return CURSOR_CHECK_ONLY_MESSAGE
+    if cursor_in_flight is None and should_pin_cursor_followup(message):
+        return CURSOR_CHECK_ONLY_MESSAGE
+    if cursor_in_flight is False and _TEXT_HEURISTICS_ENABLED and should_pin_cursor_followup(message):
         return CURSOR_CHECK_ONLY_MESSAGE
     return message
 
@@ -656,7 +745,8 @@ def is_cursor_poll_followup(payload: Any) -> bool:
 def summarize_cursor_state(state: Any) -> str:
     if not isinstance(state, dict):
         return ""
-    chunks: list[str] = []
+    assistant: list[str] = []
+    plans: list[str] = []
     for item in list(state.get("messages") or [])[-8:]:
         if not isinstance(item, dict):
             continue
@@ -664,15 +754,15 @@ def summarize_cursor_state(state: Any) -> str:
         if kind == "assistant":
             text = str(item.get("text") or "").strip()
             if text:
-                # Keep enough of the final JSON for PM parsing (CursorRemote often
-                # already clips each message; avoid clipping it again to a tiny stub).
-                chunks.append(text[:12000])
+                assistant.append(text[:12000])
         elif kind == "plan":
             label = str(item.get("label") or "plan")
             desc = str(item.get("description") or "").strip()
             todos = f"{item.get('todosCompleted') or 0}/{item.get('todosTotal') or 0}"
-            chunks.append(f"[{label} {todos}] {desc}"[:1500])
-    return "\n---\n".join(chunks[-4:])
+            plans.append(f"[{label} {todos}] {desc}"[:1500])
+    # Completion summary first; leftover plan UI may still be in the transcript.
+    chunks = assistant[-2:] + plans[-1:]
+    return "\n---\n".join(chunks)
 
 
 def _status_name(status: Any) -> str:
@@ -885,7 +975,7 @@ async def drive_until_done(
                     peek_state = await mcp_call(session, "get_state", {"messageLimit": 8})
             except Exception:
                 peek_state = None
-            if cursor_has_active_work(peek_state):
+            if cursor_has_active_work(peek_state) and cursor_is_busy(last):
                 seen_busy = True
                 await asyncio.sleep(2)
                 continue
@@ -929,12 +1019,13 @@ async def drive_until_done(
         if (
             baseline_summary.strip()
             and summary.strip() == baseline_summary.strip()
-        ):
+        ) or summary_looks_incomplete(summary):
             log_cursor_stage(
                 "wait_awaiting_result",
                 work_item_id=work_item_id,
                 seen_busy=seen_busy,
                 summary_chars=len(summary or ""),
+                incomplete=summary_looks_incomplete(summary),
             )
             return _result(
                 done=False,
@@ -1134,6 +1225,8 @@ async def _send_worker_task(
     attachments: list[dict[str, Any]] | None,
     delivery: dict[str, Any],
     workspace_info: dict[str, Any],
+    public_base_url: str = "",
+    secret_key: str = "",
 ) -> dict[str, Any]:
     ids = await _ensure_worker_session(
         session,
@@ -1142,6 +1235,13 @@ async def _send_worker_task(
         expected_window_id=expected_window_id,
         work_item_id=work_item_id,
     )
+    from .cursor_callback import (
+        CALLBACK_ARG_KEYS,
+        callback_args_for_send_task,
+        cursor_callback_url,
+        unknown_callback_argument,
+    )
+
     sid = ids["cursor_session_id"]
     send_payload = _omit_empty(
         {
@@ -1156,6 +1256,12 @@ async def _send_worker_task(
             "chat_id": chat_id,
         }
     )
+    callback_url = cursor_callback_url(
+        work_item_id or task_id,
+        public_base_url=public_base_url,
+        secret_key=secret_key,
+    )
+    send_payload.update(callback_args_for_send_task(callback_url))
     if attachments:
         send_payload["attachments"] = attachments
     log_cursor_stage(
@@ -1166,11 +1272,26 @@ async def _send_worker_task(
         chat_id=chat_id,
         project_id=project_id,
         prompt_chars=len(prompt),
+        callback=bool(callback_url),
     )
     try:
         sent = await mcp_call(session, "send_task", send_payload)
     except Exception as exc:
-        if session_id and "not found" in str(exc).lower():
+        if callback_url and unknown_callback_argument(exc):
+            stripped = {
+                key: value
+                for key, value in send_payload.items()
+                if key not in CALLBACK_ARG_KEYS
+            }
+            log_cursor_stage(
+                "send_task_retry_without_callback",
+                work_item_id=work_item_id,
+                error=str(exc)[:400],
+            )
+            sent = await mcp_call(session, "send_task", stripped)
+            send_payload = stripped
+            callback_url = ""
+        elif session_id and "not found" in str(exc).lower():
             ids = await _ensure_worker_session(
                 session,
                 session_id=None,
@@ -1205,11 +1326,20 @@ async def _send_worker_task(
     task_ids = _worker_ids_from_task(sent, session_id=sid)
     remote_id = task_ids.get("cursor_remote_task_id") or ""
     composer_id = ids.get("cursor_composer_id") or task_ids.get("cursor_composer_id") or ""
+    window_id = ids.get("cursor_window_id") or expected_window_id or ""
+    workspace_path = (
+        ids.get("cursor_workspace")
+        or expected_workspace
+        or workspace_info.get("workspace")
+        or ""
+    )
     log_cursor_stage(
         "send_task_ok",
         work_item_id=work_item_id,
         session_id=sid,
         remote_task_id=remote_id,
+        composer_id=composer_id or None,
+        window_id=window_id or None,
         mcp=str(sent)[:500],
     )
     landed = await wait_for_prompt_to_land(
@@ -1220,8 +1350,14 @@ async def _send_worker_task(
         remote_task_id=remote_id or None,
     )
     if not landed.get("landed") and remote_id:
-        # send_task already created a running worker task — treat as delivered.
-        landed = {**landed, "landed": True, "busy": True}
+        try:
+            worker_status = await _poll_cursor_status(
+                session, remote_task_id=remote_id
+            )
+        except Exception:
+            worker_status = None
+        if cursor_is_explicitly_busy(worker_status):
+            landed = {**landed, "landed": True, "busy": True, "status": worker_status}
     if not landed.get("landed"):
         reason = (
             "send_task returned, but Composer did not start this assignment."
@@ -1243,6 +1379,9 @@ async def _send_worker_task(
             "cursor_session_id": sid,
             "cursor_remote_task_id": remote_id,
             "cursor_composer_id": composer_id,
+            "cursor_window_id": window_id,
+            "cursor_workspace": workspace_path,
+            "workspace": workspace_path,
             "file_delivery": {
                 "method": delivery.get("method"),
                 "paths": delivery.get("paths") or [],
@@ -1259,12 +1398,17 @@ async def _send_worker_task(
         **driven,
         "sent": sent,
         "prompt_sent": True,
-        "started": True,
+        "started": bool(
+            driven.get("seen_busy") or landed.get("busy") or driven.get("started")
+        ),
         "seen_busy": bool(driven.get("seen_busy") or landed.get("busy")),
         "prompt_visible": bool(landed.get("visible")),
         "cursor_session_id": sid,
         "cursor_remote_task_id": remote_id,
         "cursor_composer_id": composer_id,
+        "cursor_window_id": window_id,
+        "cursor_workspace": workspace_path,
+        "workspace": workspace_path,
         "task_id": str(task_id or work_item_id or ""),
         "chat_id": chat_id,
         "file_delivery": {
@@ -1426,6 +1570,8 @@ async def send_prompt_and_drive(
             attachments=inline_attachments,
             delivery=delivery,
             workspace_info=ensure,
+            public_base_url=public_base_url,
+            secret_key=secret_key,
         )
     try:
         _, _, baseline_summary = await _snapshot(session)

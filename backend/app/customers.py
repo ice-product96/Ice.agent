@@ -103,17 +103,98 @@ def customer_prompt_block(customer: Customer | None, *, tracker: dict[str, Any] 
     return "\n".join(lines)
 
 
+async def customer_dossier_block(
+    db: AsyncSession,
+    customer: Customer | None,
+    *,
+    agent_id: int | None = None,
+    limit_cases: int = 5,
+    limit_decisions: int = 5,
+) -> str:
+    """Confirmed ТЗ, recent decisions and recent cases for prompt injection."""
+    if customer is None:
+        return ""
+    from .db import DecisionRecord
+    from .pm_state import read_project_spec
+
+    lines: list[str] = []
+    project_id = (customer.project_id or "").strip()
+    if project_id:
+        state = await db.get(ProjectState, project_id)
+        spec = read_project_spec(state)
+        status = str(spec.get("status") or "missing")
+        lines.append("## ТЗ проекта (не спрашивай то, что уже здесь)")
+        lines.append(f"Статус ТЗ: {status}.")
+        summary = str(spec.get("summary") or "").strip()
+        if summary:
+            lines.append(f"Сводка: {summary[:800]}")
+        for key, label in (
+            ("goals", "Цели"),
+            ("in_scope", "В скоупе"),
+            ("out_of_scope", "Вне скоупа"),
+            ("modules", "Модули"),
+        ):
+            values = [str(v).strip() for v in list(spec.get(key) or []) if str(v or "").strip()]
+            if values:
+                lines.append(f"{label}: " + "; ".join(values[:12]))
+        decisions = list(
+            await db.scalars(
+                select(DecisionRecord)
+                .where(DecisionRecord.project_id == project_id)
+                .order_by(DecisionRecord.id.desc())
+                .limit(limit_decisions)
+            )
+        )
+        if decisions:
+            lines.append("## Недавние решения по проекту")
+            for row in decisions:
+                topic = str(row.topic or "").strip() or "решение"
+                decision = str(row.decision or "").strip()[:240]
+                lines.append(f"- {topic}: {decision}")
+
+    case_filter = []
+    if agent_id is not None:
+        case_filter.append(WorkItem.agent_id == agent_id)
+    if (customer.id or "").strip():
+        case_filter.append(WorkItem.customer_id == customer.id)
+    elif project_id:
+        case_filter.append(WorkItem.project_id == project_id)
+    if case_filter:
+        cases = list(
+            await db.scalars(
+                select(WorkItem)
+                .where(*case_filter)
+                .order_by(WorkItem.id.desc())
+                .limit(limit_cases)
+            )
+        )
+        if cases:
+            lines.append("## Недавние кейсы заказчика")
+            for item in cases:
+                goal = " ".join(str(item.goal or "").split())[:140]
+                lines.append(
+                    f"- #{item.id} [{item.status}/{item.pm_phase}] {item.title}"
+                    + (f" — {goal}" if goal else "")
+                )
+    return "\n".join(lines)
+
+
 async def customer_json(customer: Customer, db: AsyncSession | None = None) -> dict[str, Any]:
     tracker = {"tracker_project_id": "", "tracker_poll_enabled": False}
     spec: dict[str, Any] = {"status": "missing"}
+    wait_estimated_duration = True
     if db is not None and (customer.project_id or "").strip():
         from .pm_state import read_project_spec
+        from .project_schedule import project_commerce_settings
         from .tracker_poll import tracker_settings
 
         state = await db.get(ProjectState, customer.project_id.strip())
         if state is not None:
             tracker = tracker_settings(state.config)
             spec = read_project_spec(state)
+            wait_estimated_duration = bool(
+                project_commerce_settings(state).get("wait_estimated_duration", True)
+            )
     return {
         "id": customer.id,
         "name": customer.name,
@@ -125,6 +206,7 @@ async def customer_json(customer: Customer, db: AsyncSession | None = None) -> d
         "is_default": bool(customer.is_default),
         "tracker_project_id": tracker.get("tracker_project_id") or "",
         "tracker_poll_enabled": bool(tracker.get("tracker_poll_enabled")),
+        "wait_estimated_duration": wait_estimated_duration,
         "spec": spec,
         "prompt_block": customer_prompt_block(customer, tracker=tracker),
         "created_at": customer.created_at.isoformat() if customer.created_at else None,
@@ -324,8 +406,126 @@ async def match_customer_from_text(
     db: AsyncSession,
     agent: Agent | None,
     text: str,
+    *,
+    context: dict[str, Any] | None = None,
 ) -> Customer | None:
-    """Find a customer mentioned in free text (title, intake, chat)."""
+    """Pick the customer a message belongs to.
+
+    Routed through the ``route_customer`` judge when it is active (judgment service and a
+    model are available in ``context``); the legacy substring/prefix matcher remains the
+    fallback and the shadow baseline.
+    """
+    ctx = context if isinstance(context, dict) else {}
+    judgment = ctx.get("_judgment")
+    client = ctx.get("_llm_client")
+    if judgment is not None or client is not None:
+        return await route_customer_from_text(
+            db, agent, text, judgment=judgment, client=client, context=ctx
+        )
+    return await _legacy_match_customer_from_text(db, agent, text)
+
+
+async def _customer_candidates(db: AsyncSession, agent: Agent | None) -> list[Customer]:
+    stmt = select(Customer)
+    if agent is not None:
+        stmt = stmt.where((Customer.agent_id == agent.id) | (Customer.agent_id.is_(None)))
+    return list(await db.scalars(stmt.order_by(Customer.id)))
+
+
+async def _recent_titles_by_customer(
+    db: AsyncSession, agent: Agent | None, limit: int = 60
+) -> dict[str, list[str]]:
+    stmt = select(WorkItem).order_by(WorkItem.id.desc()).limit(limit)
+    if agent is not None:
+        stmt = stmt.where(WorkItem.agent_id == agent.id)
+    grouped: dict[str, list[str]] = {}
+    for row in await db.scalars(stmt):
+        key = str(row.customer_id or "").strip()
+        if not key:
+            continue
+        titles = grouped.setdefault(key, [])
+        if len(titles) < 5 and row.title:
+            titles.append(str(row.title)[:120])
+    return grouped
+
+
+def routing_payload(text: str, candidates: list[Customer], titles: dict[str, list[str]]) -> dict[str, Any]:
+    return {
+        "message": str(text or "")[:4000],
+        "candidates": [
+            {
+                "customer_id": row.id,
+                "name": row.name,
+                "project_id": row.project_id or "",
+                "workspace": Path(row.cursor_workspace or "").name if row.cursor_workspace else "",
+                "notes": str(row.notes or "")[:500],
+                "is_default": bool(row.is_default),
+                "recent_case_titles": titles.get(row.id, []),
+            }
+            for row in candidates
+        ],
+    }
+
+
+async def route_customer_from_text(
+    db: AsyncSession,
+    agent: Agent | None,
+    text: str,
+    *,
+    judgment: Any,
+    client: Any | None = None,
+    context: dict[str, Any] | None = None,
+) -> Customer | None:
+    """Judge-based routing over the candidate customer cards."""
+    from .judgment import JudgmentService, RoutingVerdict
+
+    ctx = context if isinstance(context, dict) else {}
+    service = judgment or JudgmentService(settings=None)
+    mode = service.mode("route_customer")
+    legacy = await _legacy_match_customer_from_text(db, agent, text)
+    if mode == "off" or (not service.configured and client is None):
+        return legacy
+    candidates = await _customer_candidates(db, agent)
+    if not candidates or not str(text or "").strip():
+        return legacy
+    titles = await _recent_titles_by_customer(db, agent)
+    result = await service.judge(
+        "route_customer",
+        routing_payload(text, candidates, titles),
+        db=db,
+        agent_id=agent.id if agent is not None else None,
+        chat_id=ctx.get("chat_id"),
+        legacy={"verdict": "matched" if legacy is not None else "none", "customer_id": legacy.id if legacy else None},
+        client=client,
+    )
+    verdict = result.verdict if isinstance(result.verdict, RoutingVerdict) else None
+    if mode == "shadow" or verdict is None:
+        # Shadow keeps legacy; a degraded enforce also falls back — routing is reversible
+        # and the agent can still correct it via memory_set_project.
+        return legacy
+    if verdict.verdict == "matched" and result.confident and verdict.customer_id:
+        by_id = {row.id: row for row in candidates}
+        chosen = by_id.get(str(verdict.customer_id).strip())
+        if chosen is None:
+            wanted = str(verdict.customer_id).strip().casefold()
+            chosen = next(
+                (row for row in candidates if row.id.casefold() == wanted or (row.project_id or "").casefold() == wanted),
+                None,
+            )
+        if chosen is not None:
+            ctx.pop("_routing_ambiguous", None)
+            return chosen
+    if verdict.verdict == "ambiguous":
+        ctx["_routing_ambiguous"] = [str(v) for v in (verdict.alternatives or [])][:6]
+    return None
+
+
+async def _legacy_match_customer_from_text(
+    db: AsyncSession,
+    agent: Agent | None,
+    text: str,
+) -> Customer | None:
+    """DEPRECATED substring / shared-prefix matcher. Shadow baseline only."""
     hay_variants = _match_variants(text)
     hay_variants |= {
         _normalize_match_text(token)
@@ -421,6 +621,7 @@ async def ensure_work_item_project(
                 )
                 if part
             ),
+            context=ctx,
         )
     if customer is None and agent is not None:
         rows = list(
@@ -479,6 +680,7 @@ async def apply_customer_defaults(
     make_default: bool,
     tracker_project_id: str | None = None,
     tracker_poll_enabled: bool | None = None,
+    wait_estimated_duration: bool | None = None,
 ) -> None:
     if customer.agent_id is not None and make_default:
         await db.execute(
@@ -514,6 +716,8 @@ async def apply_customer_defaults(
                 config.pop("tracker_project_id", None)
         if tracker_poll_enabled is not None:
             config["tracker_poll_enabled"] = bool(tracker_poll_enabled)
+        if wait_estimated_duration is not None:
+            config["wait_estimated_duration"] = bool(wait_estimated_duration)
         state.config = config
 
 

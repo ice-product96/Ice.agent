@@ -1,0 +1,3 @@
+{"kind":"scope_judge","id":"inside-bug","expected":"inside_spec","legacy":"inside_spec","payload":{"goal":"fix date filter on invoices","spec":{"in_scope":["invoices","filters"]}}}
+{"kind":"scope_judge","id":"new-product","expected":"outside_spec","legacy":"inside_spec","payload":{"goal":"build a whole CRM","spec":{"in_scope":["invoice export"]}}}
+{"kind":"scope_judge","id":"no-spec","expected":"spec_missing","legacy":"inside_spec","payload":{"goal":"add export","spec":{}}}

@@ -4,7 +4,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import delete, func, insert, or_, select
@@ -15,7 +15,7 @@ from .db import (
     AdminSettings, Agent, AgentLink, AgentTask, CronJob, LlmProfile, McpServer,
     Consultation, ConversationState, CursorRun, Customer, DecisionRecord, EmployeeNeed, EmployeePlan, EmployeeProfile,
     MessageLog, PromptSection, RuntimeSettings, SipAccount, SipCall,
-    ProjectState, TelegramAccount, WorkItem, agent_mcp_servers, get_db,
+    ProjectState, TelegramAccount, WorkItem, AgentJudgment, agent_mcp_servers, get_db,
 )
 from .employee import (
     HEARTBEAT_JOB_PREFIX,
@@ -645,6 +645,11 @@ class WorkItemNoteBody(BaseModel):
     note: str = ""
 
 
+class JudgmentOverrideBody(BaseModel):
+    verdict: str
+    note: str = ""
+
+
 class WorkItemWaitBody(BaseModel):
     minutes: int = Field(default=15, ge=1, le=180)
     note: str = ""
@@ -789,6 +794,7 @@ class CustomerBody(BaseModel):
     is_default: bool = False
     tracker_project_id: str | None = None
     tracker_poll_enabled: bool | None = None
+    wait_estimated_duration: bool | None = None
 
 
 @router.get("/customers", dependencies=auth)
@@ -889,6 +895,7 @@ async def create_customer(
         make_default=make_default,
         tracker_project_id=payload.tracker_project_id,
         tracker_poll_enabled=payload.tracker_poll_enabled,
+        wait_estimated_duration=payload.wait_estimated_duration,
     )
     await db.commit()
     await db.refresh(customer)
@@ -925,6 +932,7 @@ async def update_customer(
         make_default=payload.is_default,
         tracker_project_id=payload.tracker_project_id,
         tracker_poll_enabled=payload.tracker_poll_enabled,
+        wait_estimated_duration=payload.wait_estimated_duration,
     )
     await db.commit()
     await db.refresh(customer)
@@ -993,6 +1001,8 @@ async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depen
             .order_by(Customer.is_default.desc(), Customer.name.asc())
         )
     ).all()
+    memory = getattr(request.app.state, "memory", None)
+    judgment = getattr(request.app.state, "judgment", None)
     return {
         "agent_id": agent.id,
         "agent_name": agent.name,
@@ -1005,6 +1015,13 @@ async def get_employee(agent_id: str, request: Request, db: AsyncSession = Depen
         "work_items": [work_item_json(item) for item in work_items],
         "work_item_counts": await counts_for_agent(db, agent.id),
         "customers": [await customer_json(row, db) for row in customers],
+        "runtime_health": {
+            "memory_degraded": bool(getattr(memory, "degraded", False)),
+            "memory_error": getattr(memory, "last_error", None),
+            "judge_degraded": bool(judgment is not None and not getattr(judgment, "configured", False) and getattr(judgment, "last_error", None)),
+            "judge_error": getattr(judgment, "last_error", None) if judgment is not None else None,
+            "judge_configured": bool(getattr(judgment, "configured", False)) if judgment is not None else False,
+        },
     }
 
 
@@ -1179,6 +1196,7 @@ async def list_employee_needs(
 async def get_agent_work_item(
     agent_id: str,
     work_item_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     from .work_items import list_events_page, work_item_json
@@ -1215,6 +1233,15 @@ async def get_agent_work_item(
     result.update(
         enrich_work_item_commerce(item, project, list(runs), profile=profile)
     )
+    from .operator import list_work_item_judgments, turn_cost_payload
+
+    judgments = await list_work_item_judgments(db, item.id)
+    result["judgments"] = judgments
+    traces = {row.get("decision_trace_id") for row in judgments if row.get("decision_trace_id")}
+    judgment = getattr(request.app.state, "judgment", None)
+    result["turn_costs"] = [
+        turn_cost_payload(judgment, trace_id) for trace_id in traces if trace_id
+    ]
     return result
 
 
@@ -1230,6 +1257,84 @@ async def list_agent_work_item_events(
 
     _, item = await _agent_work_item(db, agent_id, work_item_id)
     return await list_events_page(db, item.id, page=page, size=size)
+
+
+@router.get("/agents/{agent_id}/work-items/{work_item_id}/judgments", dependencies=auth)
+async def list_agent_work_item_judgments(
+    agent_id: str,
+    work_item_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .operator import list_work_item_judgments
+
+    _, item = await _agent_work_item(db, agent_id, work_item_id)
+    items = await list_work_item_judgments(db, item.id)
+    return {"items": items, "total": len(items)}
+
+
+@router.post(
+    "/agents/{agent_id}/work-items/{work_item_id}/judgments/{judgment_id}/override",
+    dependencies=auth,
+)
+async def override_agent_work_item_judgment(
+    agent_id: str,
+    work_item_id: int,
+    judgment_id: int,
+    payload: JudgmentOverrideBody,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .operator import override_judgment
+
+    _, item = await _agent_work_item(db, agent_id, work_item_id)
+    row = await db.get(AgentJudgment, judgment_id)
+    if row is None or row.work_item_id != item.id:
+        raise HTTPException(status_code=404, detail="Judgment not found")
+    return await override_judgment(
+        db, row, verdict=payload.verdict, note=payload.note
+    )
+
+
+@router.post("/agents/{agent_id}/work-items/{work_item_id}/accept-qa", dependencies=auth)
+async def operator_accept_work_item_qa(
+    agent_id: str,
+    work_item_id: int,
+    payload: WorkItemNoteBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .operator import operator_accept_qa
+
+    _, item = await _agent_work_item(db, agent_id, work_item_id)
+    try:
+        return await operator_accept_qa(
+            db,
+            item,
+            note=payload.note,
+            scheduler=getattr(request.app.state, "scheduler", None),
+            mcp=getattr(request.app.state, "mcp", None),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/agents/{agent_id}/work-items/{work_item_id}/submit-cursor", dependencies=auth)
+async def operator_submit_work_item_cursor(
+    agent_id: str,
+    work_item_id: int,
+    payload: WorkItemNoteBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from .operator import operator_submit_cursor
+
+    agent, item = await _agent_work_item(db, agent_id, work_item_id)
+    return await operator_submit_cursor(
+        db,
+        item,
+        note=payload.note,
+        scheduler=getattr(request.app.state, "scheduler", None),
+        agent_id=agent.id,
+    )
 
 
 @router.post("/agents/{agent_id}/work-items/{work_item_id}/resume", dependencies=auth)
@@ -1659,6 +1764,95 @@ async def download_work_asset(
         if path.is_file():
             return FileResponse(path, filename=filename or path.name)
     raise HTTPException(status_code=404, detail="Asset not found")
+
+
+@router.post("/cursor/callback/{work_item_id}")
+async def cursor_completion_callback(
+    work_item_id: int,
+    request: Request,
+    token: str = Query(""),
+    x_webhook_signature: str = Header("", alias="X-Webhook-Signature"),
+    authorization: str = Header("", alias="Authorization"),
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    from .cursor_callback import (
+        apply_cursor_callback,
+        cursor_callback_authorized,
+        normalize_cursor_callback_payload,
+        parse_cursor_callback_body,
+    )
+
+    raw = await request.body()
+    secret = settings.secret_key.get_secret_value()
+    if not cursor_callback_authorized(
+        secret=secret,
+        work_item_id=work_item_id,
+        token=token,
+        authorization=authorization,
+        raw_body=raw,
+        signature=x_webhook_signature,
+    ):
+        raise HTTPException(status_code=403, detail="Invalid callback token")
+    item = await db.get(WorkItem, work_item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Work item not found")
+    payload = normalize_cursor_callback_payload(parse_cursor_callback_body(raw))
+    applied = await apply_cursor_callback(
+        db, item, payload, **(await _callback_judge_kwargs(request, db, item))
+    )
+    return {"ok": True, **applied}
+
+
+async def _callback_judge_kwargs(request: Request, db: AsyncSession, item: WorkItem) -> dict[str, Any]:
+    judgment = getattr(request.app.state, "judgment", None)
+    runtime = getattr(request.app.state, "runtime", None)
+    client = None
+    if runtime is not None and judgment is not None and not judgment.configured:
+        agent = await db.get(Agent, item.agent_id)
+        if agent is not None:
+            try:
+                client = await runtime._judge_fallback_client(db, agent)
+            except Exception:
+                client = None
+    return {"judgment": judgment, "client": client}
+
+
+@router.post("/cursor/task-complete")
+async def cursor_task_complete_callback(
+    request: Request,
+    authorization: str = Header("", alias="Authorization"),
+    x_webhook_signature: str = Header("", alias="X-Webhook-Signature"),
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """CursorRemote global Task callback: POST closing summary, resolve in-flight case."""
+    from .cursor_callback import (
+        apply_cursor_callback,
+        cursor_callback_authorized,
+        normalize_cursor_callback_payload,
+        parse_cursor_callback_body,
+        resolve_work_item_for_task_callback,
+    )
+
+    raw = await request.body()
+    secret = settings.secret_key.get_secret_value()
+    if not cursor_callback_authorized(
+        secret=secret,
+        authorization=authorization,
+        raw_body=raw,
+        signature=x_webhook_signature,
+    ):
+        raise HTTPException(status_code=403, detail="Invalid callback token")
+    body = parse_cursor_callback_body(raw)
+    item = await resolve_work_item_for_task_callback(db, body)
+    if item is None:
+        raise HTTPException(status_code=404, detail="No matching in-flight work item")
+    payload = normalize_cursor_callback_payload(body)
+    applied = await apply_cursor_callback(
+        db, item, payload, **(await _callback_judge_kwargs(request, db, item))
+    )
+    return {"ok": True, "work_item_id": item.id, **applied}
 
 
 @router.get("/employees", dependencies=auth)
@@ -2916,6 +3110,11 @@ def runtime_json(settings: RuntimeSettings, *, memory_error: str | None = None) 
         "context_max_chars": settings.context_max_chars,
         "summarization_enabled": settings.summarization_enabled,
         "summarize_after_messages": settings.summarize_after_messages,
+        "judge_profile_id": settings.judge_profile_id,
+        "judge_model": settings.judge_model,
+        "judge_premium_model": settings.judge_premium_model,
+        "judge_thresholds": dict(settings.judge_thresholds or {}),
+        "judge_modes": dict(settings.judge_modes or {}),
         "updated_at": iso(settings.updated_at),
     }
 
@@ -2929,6 +3128,14 @@ async def read_runtime_settings(
         await get_runtime_settings(db),
         memory_error=request.app.state.memory.last_error,
     )
+
+
+@router.get("/settings/judges", dependencies=auth)
+async def read_judge_status(request: Request) -> dict[str, Any]:
+    judgment = getattr(request.app.state, "judgment", None)
+    if judgment is None:
+        return {"configured": False, "judges": {}, "error": "judgment service not started"}
+    return judgment.status()
 
 
 @router.put("/settings/runtime", dependencies=auth)
@@ -2970,6 +3177,15 @@ async def update_runtime_configuration(
         LlmProfile, payload.memory_llm_profile_id
     ) is None:
         raise HTTPException(status_code=422, detail="Memory LLM profile not found")
+    if payload.judge_profile_id is not None and await db.get(
+        LlmProfile, payload.judge_profile_id
+    ) is None:
+        raise HTTPException(status_code=422, detail="Judge LLM profile not found")
+    from .judgment import JUDGE_SPECS
+
+    for key in list(payload.judge_modes.keys()) + list(payload.judge_thresholds.keys()):
+        if key != "*" and key not in JUDGE_SPECS:
+            raise HTTPException(status_code=422, detail=f"Unknown judge: {key}")
     if (
         payload.memory_enabled
         and payload.memory_backend == "local"
@@ -3021,6 +3237,9 @@ async def update_runtime_configuration(
     )
     request.app.state.telegram.configure_runtime(settings)
     await request.app.state.memory.reconfigure(settings, secret, memory_llm)
+    judgment = getattr(request.app.state, "judgment", None)
+    if judgment is not None:
+        await judgment.configure(db, settings)
     if len(request.app.state.task_bus._workers) != settings.task_workers:
         await request.app.state.task_bus.stop()
         if settings.task_workers:
@@ -3232,7 +3451,9 @@ async def logs(
                 else "info"
             ),
             "source": (
-                str((item.metadata_json or {}).get("tool", "tool"))
+                str((item.metadata_json or {}).get("kind") or "техжурнал")
+                if item.direction in {"tech", "admin_report"}
+                else str((item.metadata_json or {}).get("tool", "tool"))
                 if item.direction == "tool"
                 else f"agent.{item.direction}"
             ),

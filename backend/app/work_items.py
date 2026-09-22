@@ -28,6 +28,94 @@ TERMINAL_STATUSES = ("done", "failed")
 MAX_RETRIES = 2
 WAIT_EXTERNAL_SLA = timedelta(minutes=30)
 WAIT_MANAGER_SLA = timedelta(minutes=60)
+RECENT_CASE_REOPEN_WINDOW = timedelta(days=3)
+
+_ACK_WORDS = frozenset(
+    {
+        "ок",
+        "окей",
+        "okay",
+        "ok",
+        "да",
+        "нет",
+        "ага",
+        "угу",
+        "спс",
+        "спасибо",
+        "благодарю",
+        "благодарочка",
+        "отлично",
+        "хорошо",
+        "супер",
+        "принято",
+        "понял",
+        "поняла",
+        "поняли",
+        "понятно",
+        "давай",
+        "thanks",
+        "thank",
+        "you",
+        "thx",
+        "cool",
+        "great",
+        "go",
+        "on",
+        "продолжай",
+        "продолжим",
+        "ждём",
+        "ждем",
+        "что",
+        "дальше",
+        "далее",
+        "без",
+        "а",
+        "и",
+    }
+)
+
+
+def looks_like_non_work_reply(message: str) -> bool:
+    """True for thanks / short acks / «что дальше?» that must not open a new case."""
+    import re
+
+    text = " ".join(str(message or "").split()).strip()
+    if not text:
+        return True
+    if len(text) > 160:
+        return False
+    lowered = text.casefold()
+    tokens = re.findall(r"[a-zа-яё0-9]+", lowered, flags=re.IGNORECASE)
+    if not tokens:
+        return True
+    if len(tokens) <= 8 and all(token in _ACK_WORDS for token in tokens):
+        return True
+    return False
+
+
+async def find_recent_for_chat(
+    db: AsyncSession,
+    agent_id: int,
+    chat_id: Any,
+    *,
+    within: timedelta = RECENT_CASE_REOPEN_WINDOW,
+) -> WorkItem | None:
+    """Latest case for a chat, including recently closed ones."""
+    if chat_id in (None, "", False):
+        return None
+    open_item = await find_open_for_chat(db, agent_id, chat_id)
+    if open_item is not None:
+        return open_item
+    cutoff = utcnow() - within
+    return await db.scalar(
+        select(WorkItem)
+        .where(
+            WorkItem.agent_id == agent_id,
+            WorkItem.chat_id == str(chat_id),
+            WorkItem.updated_at >= cutoff,
+        )
+        .order_by(WorkItem.id.desc())
+    )
 
 _WIPE_VERBS = (
     "сбрось",
@@ -761,7 +849,7 @@ async def create_work_item(
     )
     if customer is None:
         customer = await match_customer_from_text(
-            db, agent, f"{title}\n{goal}\n{context.get('message') or ''}"
+            db, agent, f"{title}\n{goal}\n{context.get('message') or ''}", context=context
         )
     if customer is not None:
         await bind_customer_to_work_item(db, item, customer, context=context)
@@ -782,6 +870,7 @@ async def bind_work_item(
 ) -> WorkItem | None:
     """Attach or create a work item for this run. Heartbeat without id stays a watchdog."""
     from .customers import bind_customer_to_work_item, match_customer_from_text, resolve_customer
+    from .intake_gate import classify_message
 
     async def _ensure_customer(item: WorkItem) -> None:
         if (item.project_id or "").strip() and (
@@ -796,17 +885,48 @@ async def bind_work_item(
         )
         if customer is None:
             customer = await match_customer_from_text(
-                db, agent, f"{item.title}\n{item.goal}\n{message}"
+                db, agent, f"{item.title}\n{item.goal}\n{message}", context=context
             )
         if customer is not None:
             await bind_customer_to_work_item(db, item, customer, context=context)
 
     existing = await get_work_item(db, context.get("work_item_id"))
-    operational = is_operational_admin_command(
-        message, is_admin=bool(context.get("is_admin"))
+    source = str(context.get("source") or "")
+    is_watchdog = bool(
+        context.get("employee_tick")
+        or source in {"employee_heartbeat", "employee_tick", "consult_resolved"}
+    )
+    chat_id = origin_chat_id(context)
+    open_case = existing if existing is not None and existing.agent_id == agent.id else None
+    recent_case: WorkItem | None = None
+    if open_case is None and chat_id not in (None, "", False):
+        open_case = await find_open_for_chat(db, agent.id, chat_id)
+        if open_case is None:
+            recent_case = await find_recent_for_chat(db, agent.id, chat_id)
+    intent = None
+    if not is_watchdog and source in {"telegram", "ui", "scheduled"}:
+        intent = await classify_message(
+            db,
+            judgment=context.get("_judgment"),
+            message=message,
+            context=context,
+            open_case=open_case,
+            recent_case=recent_case,
+            last_agent_message=str(context.get("_last_agent_message") or ""),
+            agent_id=agent.id,
+            client=context.get("_llm_client"),
+        )
+        context["_intent"] = intent.as_dict()
+    non_work = (not intent.is_work) if intent is not None else looks_like_non_work_reply(message)
+    operational = (
+        intent.operational_admin
+        if intent is not None
+        else is_operational_admin_command(message, is_admin=bool(context.get("is_admin")))
     )
     if operational:
         context["_operational_admin"] = True
+        if intent is not None and intent.wipe_scope:
+            context["_operational_wipe_scope"] = intent.wipe_scope
         context.pop("work_item_id", None)
         return None
 
@@ -831,17 +951,19 @@ async def bind_work_item(
         _context_from_item(context, existing)
         return existing
 
-    source = str(context.get("source") or "")
-    is_watchdog = bool(
-        context.get("employee_tick")
-        or source in {"employee_heartbeat", "employee_tick", "consult_resolved"}
-    )
     if is_watchdog and not context.get("work_item_id"):
         return None
 
-    chat_id = origin_chat_id(context)
     if chat_id not in (None, "", False):
-        found = await find_open_for_chat(db, agent.id, chat_id)
+        found = open_case
+        if found is None and non_work:
+            found = recent_case
+            if found is not None:
+                context["_continuation_of_closed"] = found.status in {
+                    "done",
+                    "cancelled",
+                    "canceled",
+                } or found.pm_phase in {"DONE", "CANCELLED"}
         if found is not None:
             context["work_item_id"] = found.id
             apply_origin(found, context)
@@ -849,18 +971,32 @@ async def bind_work_item(
                 found.status = "in_progress"
                 found.paused = False
                 found.wait_owner = "self"
+            elif (
+                found.status in {"done", "cancelled", "canceled"}
+                or found.pm_phase in {"DONE", "CANCELLED"}
+            ) and non_work:
+                # Soft-attach: keep phase, but let the agent answer in context.
+                found.wait_owner = "self"
             await _ensure_customer(found)
             await add_event(
                 db,
                 found,
                 kind="message_in",
-                title="Новое сообщение по кейсу",
+                title=(
+                    "Продолжение по закрытому кейсу"
+                    if context.get("_continuation_of_closed")
+                    else "Новое сообщение по кейсу"
+                ),
                 detail=_clip(message, 400),
             )
             await db.commit()
             await db.refresh(found)
             _context_from_item(context, found)
             return found
+
+    if non_work and source in {"telegram", "ui", "scheduled"}:
+        # No recent case to attach — do not invent a junk work item.
+        return None
 
     if source in {"telegram", "ui", "scheduled"} or context.get("reply_chat_id"):
         item = await create_work_item(
@@ -1022,8 +1158,8 @@ async def after_agent_run(
         await add_event(
             db,
             item,
-            kind="message_out",
-            title="Статус руководителю",
+            kind="note",
+            title="Техжурнал",
             detail=_clip(result, 700),
         )
 
@@ -1216,18 +1352,22 @@ async def after_agent_run(
             "CLIENT_CONFIRMED",
             "READY_FOR_DEV",
         }
-        if context.get("_pm_mode") and discussing:
+        pm_item = bool(context.get("_pm_mode")) or str(item.pm_phase or "") not in {
+            "",
+            "DISCUSSION",
+        }
+        if pm_item and discussing:
             await set_status(
                 db,
                 item,
                 "in_progress",
-                next_action=item.next_action or "Продолжаю ТЗ и уточнения с заказчиком",
+                next_action=item.next_action or "submit_development_task",
                 wait_owner="self",
                 event_title="Cursor idle — кейс не закрываю",
                 event_detail=_clip(result, 400),
             )
             return item
-        if context.get("_pm_mode") and item.pm_phase != "DONE":
+        if pm_item and item.pm_phase != "DONE":
             await set_status(
                 db,
                 item,
@@ -1280,6 +1420,25 @@ async def after_agent_run(
             event_title="Шаг выполнен",
             event_detail=_clip(result, 400),
         )
+        # #region agent log
+        try:
+            from .pm_state import _agent_dbg
+
+            _agent_dbg(
+                "D",
+                "work_items.py:after_agent_run",
+                "telegram turn parked",
+                {
+                    "item_id": item.id,
+                    "status": item.status,
+                    "phase": item.pm_phase,
+                    "source": str(context.get("source") or ""),
+                    "pm_mode": bool(context.get("_pm_mode")),
+                },
+            )
+        except Exception:
+            pass
+        # #endregion
     return item
 
 
@@ -1405,8 +1564,19 @@ async def watchdog_items(db: AsyncSession, agent_id: int) -> list[WorkItem]:
         if item.status == "failed":
             actionable.append(item)
             continue
-        if item.status == "waiting_manager" and item.updated_at and now - item.updated_at > WAIT_MANAGER_SLA:
-            actionable.append(item)
+        if item.status == "waiting_manager":
+            meta = item.metadata_json if isinstance(item.metadata_json, dict) else {}
+            operational = bool(meta.get("operational_wait"))
+            next_action = str(item.next_action or "")
+            looks_operational = (
+                operational
+                or "submit_development_task" in next_action
+                or "workspace" in next_action.casefold()
+            )
+            if looks_operational or (
+                item.updated_at and now - item.updated_at > WAIT_MANAGER_SLA
+            ):
+                actionable.append(item)
             continue
         if item.status == "waiting_external":
             due = item.wait_until or (
@@ -1793,8 +1963,11 @@ def work_items_context_lines(items: list[WorkItem]) -> list[str]:
         return ["Открытые кейсы: (нет — если пришла новая работа, заведи её через входящее, не через cron)."]
     lines = ["Открытые кейсы (это и есть работа, не heartbeat/cron):"]
     for item in items[:15]:
+        goal = _clip(getattr(item, "goal", "") or "", 160)
+        phase = f" | фаза {item.pm_phase}" if getattr(item, "pm_phase", "") else ""
         lines.append(
-            f"- #{item.id} [{STATUS_LABELS.get(item.status, item.status)}] {item.title} "
-            f"| {item.next_action or 'нет next_action'} | ждёт {item.wait_owner}"
+            f"- #{item.id} [{STATUS_LABELS.get(item.status, item.status)}] {item.title}"
+            f"{phase} | {item.next_action or 'нет next_action'} | ждёт {item.wait_owner}"
+            + (f" | цель: {goal}" if goal else "")
         )
     return lines

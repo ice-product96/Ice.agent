@@ -41,6 +41,20 @@ _KIND_LABELS = {
 }
 
 
+def telegram_reply_to_msg_id(message: Any) -> int | None:
+    if message is None:
+        return None
+    reply = getattr(message, "reply_to", None)
+    if reply is not None:
+        mid = getattr(reply, "reply_to_msg_id", None)
+        if mid:
+            return int(mid)
+    mid = getattr(message, "reply_to_msg_id", None)
+    if mid:
+        return int(mid)
+    return None
+
+
 def telegram_topic_id(message: Any) -> int | None:
     reply_to = getattr(message, "reply_to", None)
     if reply_to is not None:
@@ -490,6 +504,7 @@ class TelegramGateway:
             "chat_id": getattr(event, "chat_id", None) or getattr(message, "chat_id", None),
             "topic_id": telegram_topic_id(message),
             "message_id": getattr(event, "id", None) or getattr(message, "id", None),
+            "reply_to_msg_id": telegram_reply_to_msg_id(message),
             "date": telegram_datetime(
                 getattr(message, "date", None) or getattr(event, "date", None)
             ),

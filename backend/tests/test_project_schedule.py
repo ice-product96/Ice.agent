@@ -21,6 +21,7 @@ def test_project_settings_default_utc_plus_5() -> None:
     assert settings["workday_start"] == "09:00"
     assert settings["workday_end"] == "18:00"
     assert settings["cost_requires_customer_approval"] is False
+    assert settings["wait_estimated_duration"] is True
 
 
 def test_workday_gate_and_next_open() -> None:
@@ -83,6 +84,45 @@ def test_elapsed_uses_wall_clock_from_first_start() -> None:
     )
     assert cursor_elapsed_minutes([cancelled]) >= 89
     assert min_execution_remaining_minutes(item, [cancelled]) == 0
+
+
+def test_wait_estimated_duration_off_skips_min_gate() -> None:
+    from app.project_schedule import apply_task_estimate, min_execution_remaining_minutes
+
+    item = WorkItem(id=1, agent_id=1, title="t", goal="g", context_json={})
+    apply_task_estimate(
+        item,
+        estimated_duration_minutes=480,
+        hourly_rate=2500,
+        wait_estimated_duration=False,
+    )
+    assert item.context_json["estimated_duration_minutes"] == 480
+    assert item.context_json["min_execution_minutes"] == 0
+    assert item.context_json["wait_estimated_duration"] is False
+    assert min_execution_remaining_minutes(item, []) == 0
+
+    waiting = WorkItem(
+        id=2,
+        agent_id=1,
+        title="t",
+        goal="g",
+        context_json={"min_execution_minutes": 480},
+    )
+    assert min_execution_remaining_minutes(
+        waiting,
+        [],
+        settings={"wait_estimated_duration": False},
+    ) == 0
+    assert min_execution_remaining_minutes(waiting, []) == 480
+
+    skipped = project_commerce_settings(
+        ProjectState(
+            project_id="mysell",
+            autonomy_level="LEVEL_1",
+            config={"wait_estimated_duration": False},
+        )
+    )
+    assert skipped["wait_estimated_duration"] is False
 
 
 def test_cost_approval_instruction_respects_toggle() -> None:

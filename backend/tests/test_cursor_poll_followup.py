@@ -47,11 +47,18 @@ def make_runtime(session, scheduler: FakeScheduler) -> AgentRuntime:
     runtime._agent_locks = {}
     runtime.scheduler = scheduler
     runtime.employee = EmployeeService(telegram=None, scheduler=scheduler)
+    from app.judgment import JudgmentService
+
+    runtime.judgment = JudgmentService(settings=None)
 
     async def cursor_session(db, agent):
         return session
 
+    async def _judge_fallback_client(db, agent):
+        return None
+
     runtime._cursorremote_session = cursor_session
+    runtime._judge_fallback_client = _judge_fallback_client
     return runtime
 
 
@@ -793,5 +800,60 @@ async def test_idle_foreign_json_allows_resubmit(
         assert item.next_action == "submit_development_task"
         assert item.last_error is None
         assert not (item.metadata_json or {}).get("automatic_resubmit_blocked")
+        assert run.status == "cancelled"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_workspace_unavailable_is_self_retry_not_manager(
+    tmp_path: Path,
+) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-workspace.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="mysell",
+            title="Purchases",
+            status="waiting_external",
+            wait_owner="external",
+            pm_phase="IN_DEVELOPMENT",
+            metadata_json={"cursor_in_flight": True},
+        )
+        db.add(item)
+        await db.flush()
+        run = CursorRun(
+            work_item_id=item.id,
+            project_id="mysell",
+            attempt=1,
+            idempotency_key="pm-workspace",
+            status="running",
+        )
+        db.add(run)
+        await db.flush()
+        item.active_cursor_run_id = run.id
+        await db.commit()
+
+        result = await _apply_pm_cursor_result(
+            db,
+            item,
+            run,
+            {
+                "done": False,
+                "prompt_sent": False,
+                "status": "workspace_unavailable",
+                "reason": "Cursor workspace «d:/projects/mysell» is not open.",
+            },
+        )
+
+        assert result["needs_workspace"] is True
+        assert result.get("operational_wait") is True
+        assert item.status == "in_progress"
+        assert item.wait_owner == "self"
+        assert item.pm_phase == "READY_FOR_DEV"
+        assert (item.metadata_json or {}).get("operational_wait") is True
+        assert "submit_development_task" in (item.next_action or "")
         assert run.status == "cancelled"
     await engine.dispose()

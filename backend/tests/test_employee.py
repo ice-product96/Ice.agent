@@ -83,6 +83,8 @@ def test_tick_instruction_uses_scheduler() -> None:
     assert "не ставь" in text
     assert "результат тика" in text
     assert "поиск" in text.lower()
+    assert "consult_manager" in text
+    assert "внутренний журнал" in text
 
 
 def test_once_job_status_is_completed_after_run() -> None:

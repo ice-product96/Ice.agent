@@ -307,6 +307,11 @@ class RuntimeSettingsBody(BaseModel):
     context_max_chars: int = Field(30000, ge=1000, le=200000)
     summarization_enabled: bool = True
     summarize_after_messages: int = Field(80, ge=2, le=5000)
+    judge_profile_id: int | None = None
+    judge_model: str | None = None
+    judge_premium_model: str | None = None
+    judge_thresholds: dict[str, float] = Field(default_factory=dict)
+    judge_modes: dict[str, Literal["off", "shadow", "enforce"]] = Field(default_factory=dict)
 
     @field_validator("timezone")
     @classmethod

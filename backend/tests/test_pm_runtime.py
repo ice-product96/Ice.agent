@@ -80,6 +80,10 @@ async def seed_confirmed_spec(db, project_id: str, in_scope: list[str] | None = 
         },
     )
     confirm_project_spec(state, confirmed_by="customer")
+    # Tests must not depend on wall-clock working hours: 24/7 project schedule.
+    config = dict(state.config or {})
+    config.update({"workday_start": "00:00", "workday_end": "00:00", "workdays": [0, 1, 2, 3, 4, 5, 6]})
+    state.config = config
     await db.flush()
     return state
 

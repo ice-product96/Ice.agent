@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from .config import get_settings
+from .trace import current_trace_id_default
 
 
 def utcnow() -> datetime:
@@ -197,6 +198,14 @@ class RuntimeSettings(TimestampMixin, Base):
     context_max_chars: Mapped[int] = mapped_column(Integer, default=30000)
     summarization_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     summarize_after_messages: Mapped[int] = mapped_column(Integer, default=80)
+    # Judgment layer: LLM judges with structured output replace keyword heuristics.
+    judge_profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("llm_profiles.id", ondelete="SET NULL")
+    )
+    judge_model: Mapped[str | None] = mapped_column(String(120))
+    judge_premium_model: Mapped[str | None] = mapped_column(String(120))
+    judge_thresholds: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    judge_modes: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class MessageLog(Base):
@@ -232,6 +241,9 @@ class MessageLog(Base):
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     work_item_id: Mapped[int | None] = mapped_column(
         ForeignKey("work_items.id", ondelete="SET NULL"), index=True
+    )
+    decision_trace_id: Mapped[str | None] = mapped_column(
+        String(64), default=current_trace_id_default, index=True
     )
 
 
@@ -442,6 +454,9 @@ class WorkItemEvent(Base):
     title: Mapped[str] = mapped_column(String(300), default="")
     detail: Mapped[str] = mapped_column(Text, default="")
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    decision_trace_id: Mapped[str | None] = mapped_column(
+        String(64), default=current_trace_id_default, index=True
+    )
 
 
 class ProjectState(TimestampMixin, Base):
@@ -508,6 +523,51 @@ class CursorRun(TimestampMixin, Base):
     error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decision_trace_id: Mapped[str | None] = mapped_column(
+        String(64), default=current_trace_id_default, index=True
+    )
+
+
+class AgentJudgment(Base):
+    """One structured verdict from an LLM judge, with evidence and audit fields."""
+
+    __tablename__ = "agent_judgments"
+    __table_args__ = (
+        Index("ix_agent_judgments_kind_digest", "kind", "input_digest"),
+        Index("ix_agent_judgments_work_item_created", "work_item_id", "created_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    agent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agents.id", ondelete="SET NULL"), index=True
+    )
+    work_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("work_items.id", ondelete="SET NULL"), index=True
+    )
+    chat_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    project_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    decision_trace_id: Mapped[str | None] = mapped_column(
+        String(64), default=current_trace_id_default, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(48), index=True)
+    input_digest: Mapped[str] = mapped_column(String(64))
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    verdict: Mapped[str] = mapped_column(String(64), default="")
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    verdict_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    mode: Mapped[str] = mapped_column(String(16), default="shadow")  # off|shadow|enforce
+    enforced: Mapped[bool] = mapped_column(Boolean, default=False)
+    model: Mapped[str | None] = mapped_column(String(120))
+    tier: Mapped[str] = mapped_column(String(16), default="cheap")
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    cached: Mapped[bool] = mapped_column(Boolean, default=False)
+    legacy_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    agreed: Mapped[bool | None] = mapped_column(Boolean)
+    error: Mapped[str | None] = mapped_column(Text)
+    overridden_by: Mapped[str | None] = mapped_column(String(64))
+    override_verdict: Mapped[str | None] = mapped_column(String(64))
 
 
 settings = get_settings()
@@ -547,6 +607,14 @@ async def create_schema() -> None:
             "ALTER TABLE conversation_states ADD COLUMN IF NOT EXISTS customer_id VARCHAR(120)",
             "ALTER TABLE consultations ADD COLUMN IF NOT EXISTS work_item_id INTEGER",
             "ALTER TABLE message_logs ADD COLUMN IF NOT EXISTS work_item_id INTEGER",
+            "ALTER TABLE message_logs ADD COLUMN IF NOT EXISTS decision_trace_id VARCHAR(64)",
+            "ALTER TABLE work_item_events ADD COLUMN IF NOT EXISTS decision_trace_id VARCHAR(64)",
+            "ALTER TABLE cursor_runs ADD COLUMN IF NOT EXISTS decision_trace_id VARCHAR(64)",
+            "ALTER TABLE runtime_settings ADD COLUMN IF NOT EXISTS judge_profile_id INTEGER",
+            "ALTER TABLE runtime_settings ADD COLUMN IF NOT EXISTS judge_model VARCHAR(120)",
+            "ALTER TABLE runtime_settings ADD COLUMN IF NOT EXISTS judge_premium_model VARCHAR(120)",
+            "ALTER TABLE runtime_settings ADD COLUMN IF NOT EXISTS judge_thresholds JSON DEFAULT '{}'",
+            "ALTER TABLE runtime_settings ADD COLUMN IF NOT EXISTS judge_modes JSON DEFAULT '{}'",
             (
                 "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS "
                 "task_type VARCHAR(64) DEFAULT 'task' NOT NULL"

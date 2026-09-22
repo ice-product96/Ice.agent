@@ -18,6 +18,37 @@ from .db import CursorRun, DecisionRecord, ProjectState, WorkItem, WorkItemEvent
 
 logger = logging.getLogger(__name__)
 
+
+def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
+    # #region agent log
+    try:
+        import time
+
+        payload = {
+            "sessionId": "2ac83f",
+            "runId": "post-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        for path in (
+            r"d:\projects\ice.agent\debug-2ac83f.log",
+            "/app/data/debug-2ac83f.log",
+            "/tmp/debug-2ac83f.log",
+            "debug-2ac83f.log",
+        ):
+            try:
+                with open(path, "a", encoding="utf-8") as handle:
+                    handle.write(line)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # #endregion
+
 PM_PHASES = (
     "DISCUSSION",
     "CLARIFICATION",
@@ -174,26 +205,6 @@ SPEC_STATUSES = ("missing", "draft", "confirmed")
 EXECUTION_VERDICTS = ("execute", "discuss", "draft_spec")
 FEATURE_EXECUTE_MAX_MINUTES = 480
 SPEC_SCOPE_FIELDS = ("in_scope", "out_of_scope", "modules", "goals")
-WHOLE_PRODUCT_RE = re.compile(
-    r"(построить|создать|разработать|сделать)\s+"
-    r"(ai[- ]?систем|систем[уыае]|платформ|продукт|маркетплейс|сервис)|"
-    r"(ai[- ]?систем[аыуе].{0,60}для\s+работы)|"
-    r"(весь\s+продукт|продукт\s+целиком|с\s+нуля|"
-    r"end[- ]to[- ]end\s+platform)",
-    re.IGNORECASE,
-)
-SCENARIO_RE = re.compile(
-    r"(когда|если|пользователь\s+может|when\b|if\b|user\s+can|"
-    r"given\b|после того|должен\s+видеть|shows|returns|persists|"
-    r"отображ|visible|swipe|hover|tap|expand|scroll|pass)",
-    re.IGNORECASE,
-)
-OUTCOME_RE = re.compile(
-    r"(persist|pass|change|visible|scroll|expand|return|show|open|"
-    r"cancel|fix|work|отображ|открыв|закрыв|виден|видима|сохраня|"
-    r"не\s+перекрыв|раскрыв|swipe|hover|tap)",
-    re.IGNORECASE,
-)
 
 
 def _string_list(value: Any) -> list[str]:
@@ -384,108 +395,6 @@ def seed_draft_spec_from_item(state: ProjectState, item: WorkItem) -> dict[str, 
     )
 
 
-def _norm_tokens(text: str) -> set[str]:
-    return {
-        token
-        for token in re.split(r"[^\wа-яё]+", str(text or "").casefold())
-        if len(token) > 2
-    }
-
-
-def texts_overlap(left: str, right: str) -> bool:
-    a = str(left or "").strip().casefold()
-    b = str(right or "").strip().casefold()
-    if not a or not b:
-        return False
-    if a in b or b in a:
-        return True
-    left_tokens = _norm_tokens(a)
-    right_tokens = _norm_tokens(b)
-    if left_tokens & right_tokens:
-        return True
-    for x in left_tokens:
-        for y in right_tokens:
-            if len(x) >= 4 and len(y) >= 4 and (x.startswith(y) or y.startswith(x)):
-                return True
-    return False
-
-
-def item_blob(item: WorkItem) -> str:
-    parts = [
-        str(item.title or ""),
-        str(item.goal or ""),
-        *list(item.requirements or []),
-        *list(item.acceptance_criteria or []),
-    ]
-    return " ".join(part for part in parts if str(part).strip())
-
-
-def item_intersects_scope(
-    item: WorkItem,
-    spec: Mapping[str, Any] | None,
-) -> tuple[bool, bool]:
-    blob = item_blob(item)
-    data = spec or {}
-    in_hit = any(
-        texts_overlap(blob, phrase)
-        for phrase in list(data.get("in_scope") or []) + list(data.get("modules") or [])
-    )
-    out_hit = any(
-        texts_overlap(blob, phrase) for phrase in list(data.get("out_of_scope") or [])
-    )
-    return in_hit, out_hit
-
-
-def requirements_expand_spec(
-    item: WorkItem,
-    spec: Mapping[str, Any] | None,
-    previous_requirements: list[str] | None,
-) -> bool:
-    previous = {str(value).strip().casefold() for value in (previous_requirements or [])}
-    added = [
-        requirement
-        for requirement in list(item.requirements or [])
-        if str(requirement).strip().casefold() not in previous
-    ]
-    if not added:
-        return False
-    scope = list((spec or {}).get("in_scope") or []) + list(
-        (spec or {}).get("modules") or []
-    )
-    if not scope:
-        return True
-    return any(
-        not any(texts_overlap(requirement, phrase) for phrase in scope)
-        for requirement in added
-    )
-
-
-def looks_like_whole_product(item: WorkItem) -> bool:
-    blob = item_blob(item)
-    if not WHOLE_PRODUCT_RE.search(blob):
-        return False
-    criteria = [str(value).strip() for value in list(item.acceptance_criteria or []) if str(value).strip()]
-    specific = sum(1 for value in criteria if len(value) > 18 and OUTCOME_RE.search(value))
-    return specific < 2
-
-
-def has_testable_criteria(item: WorkItem) -> bool:
-    criteria = [
-        str(value).strip()
-        for value in list(item.acceptance_criteria or [])
-        if str(value).strip()
-    ]
-    if not criteria:
-        return False
-    if any(SCENARIO_RE.search(value) or OUTCOME_RE.search(value) for value in criteria):
-        return True
-    if str(item.task_type or "").strip().lower() == "bug" and any(
-        len(value) >= 12 for value in criteria
-    ):
-        return True
-    return len(criteria) >= 2 and all(len(value) >= 12 for value in criteria[:2])
-
-
 def assess_execution(
     item: WorkItem,
     spec: Mapping[str, Any] | None = None,
@@ -522,22 +431,6 @@ def assess_execution(
         reasons.extend(issues)
         questions.append("Уточните цель, требования и проверяемые критерии приёмки.")
 
-    if looks_like_whole_product(item):
-        demote("draft_spec" if status in {"missing", "draft"} else "discuss")
-        reasons.append("Request describes the whole product rather than a slice")
-        questions.append(
-            "Какой конкретный срез делаем сейчас (модуль, сценарий, актор)?"
-        )
-
-    if not has_testable_criteria(item) and list(item.acceptance_criteria or []):
-        demote("discuss")
-        reasons.append(
-            "Acceptance criteria are not testable (need when/if/user-can scenarios)"
-        )
-        questions.append(
-            "Добавьте проверяемые критерии: когда / если / пользователь может …"
-        )
-
     minutes = estimated_duration_minutes(item)
     if (
         str(item.task_type or "").strip().lower() == "feature"
@@ -550,28 +443,28 @@ def assess_execution(
             "Можно ли сузить срез до одного рабочего дня, или это несколько этапов?"
         )
 
-    in_hit, out_hit = item_intersects_scope(item, spec_norm)
-    if status == "confirmed":
-        if out_hit:
-            demote("discuss")
-            reasons.append("Request matches spec out_of_scope")
-            questions.append("Это сознательное расширение ТЗ или задача вне продукта?")
-        elif not in_hit and (
-            spec_norm.get("in_scope") or spec_norm.get("modules")
-        ):
-            demote("discuss")
-            reasons.append("Request does not intersect spec.in_scope")
-            questions.append(
-                "Уточните срез внутри in_scope или расширьте ТЗ и согласуйте заново."
-            )
-
-    return {
+    result = {
         "verdict": verdict,
         "reasons": _uniq(reasons),
         "questions": _uniq(questions),
         "spec_version": int(spec_norm.get("version") or 0),
         "spec_status": status,
     }
+    # #region agent log
+    _agent_dbg(
+        "A",
+        "pm_state.py:assess_execution",
+        "execution verdict (no lexical scope)",
+        {
+            "item_id": getattr(item, "id", None),
+            "phase": getattr(item, "pm_phase", None),
+            "task_type": getattr(item, "task_type", None),
+            "lexical_scope": False,
+            **result,
+        },
+    )
+    # #endregion
+    return result
 
 
 def stamp_execution_verdict(
@@ -852,6 +745,55 @@ def _lines(values: list[str]) -> str:
     return "\n".join(f"- {value}" for value in values)
 
 
+_CURSOR_BRIEF_DROP_KEYS = {
+    "tracker",
+    "tracker_project_id",
+    "tracker_task_ids",
+    "board_id",
+    "card_id",
+    "card_ids",
+    "section_id",
+    "ice_tracker",
+    "related_tracker_tasks",
+    "estimated_cost",
+    "estimated_duration_minutes",
+    "min_execution_minutes",
+    "min_execution_ratio",
+    "hourly_rate",
+    "currency",
+    "cost_approved",
+    "cost_decision_id",
+    "cost_requires_customer_approval",
+    "ask_customer_about_cost",
+    "elapsed_cursor_minutes",
+    "min_execution_remaining_minutes",
+    "wait_estimated_duration",
+    "execution",
+    "inside_agreed_scope",
+    "small_fix",
+    "high_risk",
+    "owner_approved",
+}
+_CURSOR_BRIEF_DROP_MARKERS = (
+    "cost",
+    "price",
+    "оплат",
+    "стоим",
+    "hourly",
+    "tracker_",
+)
+
+
+def _cursor_brief_drops_context_key(key: Any) -> bool:
+    name = str(key or "").strip()
+    if not name:
+        return True
+    lowered = name.casefold()
+    if lowered in _CURSOR_BRIEF_DROP_KEYS:
+        return True
+    return any(marker in lowered for marker in _CURSOR_BRIEF_DROP_MARKERS)
+
+
 def render_task_brief(item: WorkItem) -> str:
     title = str(item.title or "").strip() or f"Work item {item.id}"
     task_type = str(item.task_type or "task")
@@ -881,29 +823,18 @@ def render_task_brief(item: WorkItem) -> str:
     if edge_cases:
         sections.append(f"## Edge cases\n{edge_cases}")
     context = dict(item.context_json or {}) if isinstance(item.context_json, dict) else {}
-    # Keep only engineering context for Cursor — drop tracker/board/card noise.
-    drop_keys = {
-        "tracker",
-        "tracker_project_id",
-        "tracker_task_ids",
-        "board_id",
-        "card_id",
-        "card_ids",
-        "section_id",
-        "ice_tracker",
-        "related_tracker_tasks",
-    }
     clean_context = {
         key: value
         for key, value in context.items()
-        if key not in drop_keys and not str(key).lower().startswith("tracker_")
+        if not _cursor_brief_drops_context_key(key)
     }
     if clean_context:
         payload = json.dumps(clean_context, ensure_ascii=False, sort_keys=True, indent=2)
         sections.append(f"## Context\n```json\n{payload}\n```")
     sections.append(
-        "Work only on this engineering brief. Do not update trackers, boards, or cards — "
-        "the project manager handles ice_tracker separately."
+        "Work only on this engineering brief. When finished, write a short summary of "
+        "what you implemented and how to verify it. Do not discuss price, cost, or schedule. "
+        "Do not update trackers, boards, or cards — the project manager handles ice_tracker separately."
     )
     return "\n\n".join(sections).strip() + "\n"
 
@@ -942,9 +873,12 @@ def is_leftover_cursor_idle(result: Mapping[str, Any] | None) -> bool:
     ):
         # skipped_prompt alone means "did not send"; if Composer was busy for us, keep it.
         return True
-    if result.get("prompt_sent"):
+    if result.get("done") and not result.get("seen_busy"):
+        # Instant idle after send_task is leftover plan/UI, not a finished job.
+        return True
+    if result.get("prompt_sent") and result.get("seen_busy"):
         return False
-    if result.get("seen_busy") or result.get("started"):
+    if result.get("seen_busy"):
         return False
     # check_and_drive / busy-skip path: idle Composer from another chat.
     return bool(result.get("done"))
@@ -960,34 +894,95 @@ def _evidence_row_passed(row: Mapping[str, Any] | None) -> bool:
     return row.get("passed") is True and bool(str(row.get("evidence") or "").strip())
 
 
+def _cursor_result_summary_text(run: CursorRun | None) -> str:
+    if run is None:
+        return ""
+    payload = run.result_json if isinstance(run.result_json, dict) else {}
+    impl = payload.get("implementation") if isinstance(payload.get("implementation"), dict) else {}
+    parts = [
+        str(impl.get("summary") or "").strip(),
+        str(payload.get("summary") or "").strip(),
+        str(payload.get("customer_response") or "").strip(),
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+_DONE_SUMMARY_MARKERS = (
+    "уже реализ",
+    "уже есть",
+    "уже в проект",
+    "покрывает все",
+    "дополнительных изменений не",
+    "не потребовалось",
+    "implemented",
+    "already implemented",
+    "covers all",
+    "no additional",
+    "fully covered",
+)
+
+
+def summary_covers_acceptance(item: WorkItem, run: CursorRun | None) -> bool:
+    """DEPRECATED keyword heuristic. Kept only for shadow comparison in evals.
+
+    No longer consulted by ``cursor_run_satisfies_acceptance``: prose that mentions the
+    right words is not evidence. The ``qa_verifier`` judge decides from meaning.
+    """
+    if run is None or run.status != "completed":
+        return False
+    criteria = [
+        str(value).strip()
+        for value in list(item.acceptance_criteria or [])
+        if str(value or "").strip()
+    ]
+    if not criteria:
+        return False
+    text = _norm_criterion(_cursor_result_summary_text(run))
+    if len(text) < 80:
+        return False
+    if not any(marker in text for marker in _DONE_SUMMARY_MARKERS):
+        return False
+    for criterion in criteria:
+        tokens = [
+            token
+            for token in _norm_criterion(criterion).split()
+            if len(token) > 3
+        ]
+        if not tokens:
+            continue
+        hits = sum(1 for token in tokens if token in text)
+        if hits < max(1, (len(tokens) + 1) // 2):
+            return False
+    return True
+
+
 def match_acceptance_evidence(
     criterion: str,
     rows: list[Any] | None,
 ) -> dict[str, Any] | None:
-    """Match one stored criterion to Cursor evidence, allowing whitespace/case drift."""
+    """Match one stored criterion to Cursor evidence, allowing whitespace/case drift only."""
     want = _norm_criterion(criterion)
     if not want:
         return None
-    mapped: dict[str, dict[str, Any]] = {}
     for row in rows or []:
         if not isinstance(row, dict):
             continue
-        key = _norm_criterion(row.get("criterion"))
-        if key:
-            mapped[key] = row
-    if want in mapped:
-        return mapped[want]
-    for key, row in mapped.items():
-        if want in key or key in want:
+        if _norm_criterion(row.get("criterion")) == want:
             return row
     return None
 
 
 def cursor_run_satisfies_acceptance(item: WorkItem, run: CursorRun | None) -> bool:
-    """True when a completed Cursor run has passing evidence for every criterion."""
+    """Machine-signal path: structured verification rows pass for every criterion.
+
+    This is a legacy signal used for shadow comparison and as the fallback when no QA
+    judge is configured. Recovered/truncated or prose-only results never satisfy it.
+    """
     if run is None or run.status != "completed":
         return False
     payload = run.result_json if isinstance(run.result_json, dict) else {}
+    if payload.get("truncated_recovery") or payload.get("native_summary"):
+        return False
     verification = payload.get("verification")
     if not isinstance(verification, dict):
         return False
@@ -1016,15 +1011,26 @@ async def latest_completed_cursor_run(
     db: AsyncSession,
     item: WorkItem,
 ) -> CursorRun | None:
-    return await db.scalar(
-        select(CursorRun)
-        .where(
-            CursorRun.work_item_id == item.id,
-            CursorRun.status == "completed",
+    from .cursorremote_drive import summary_looks_incomplete
+
+    runs = list(
+        await db.scalars(
+            select(CursorRun)
+            .where(
+                CursorRun.work_item_id == item.id,
+                CursorRun.status == "completed",
+            )
+            .order_by(CursorRun.attempt.desc(), CursorRun.id.desc())
         )
-        .order_by(CursorRun.attempt.desc(), CursorRun.id.desc())
-        .limit(1)
     )
+    for run in runs:
+        data = run.result_json if isinstance(run.result_json, dict) else {}
+        impl = data.get("implementation") if isinstance(data.get("implementation"), dict) else {}
+        summary = str(impl.get("summary") or data.get("summary") or "")
+        if data.get("native_summary") and summary_looks_incomplete(summary):
+            continue
+        return run
+    return None
 
 
 def recover_truncated_cursor_result(
@@ -1068,21 +1074,14 @@ def recover_truncated_cursor_result(
         text_c = str(criterion or "").strip()
         if not text_c:
             continue
+        # Truncated JSON is not evidence: every criterion stays unverified for QA.
         criteria_payload.append(
             {
                 "criterion": text_c,
-                "passed": status == "completed",
-                "evidence": "Recovered from truncated Cursor JSON; verify on deploy/prod.",
+                "passed": False,
+                "evidence": "Recovered from truncated Cursor JSON; not verified.",
             }
         )
-    if not criteria_payload and status == "completed":
-        criteria_payload = [
-            {
-                "criterion": "Structured Cursor completion recovered despite truncated payload",
-                "passed": True,
-                "evidence": raw[:800],
-            }
-        ]
     return {
         "task_id": str(expected_task_id),
         "status": status,
@@ -1092,8 +1091,8 @@ def recover_truncated_cursor_result(
             "tests": [],
         },
         "verification": {
-            "tests_passed": status == "completed",
-            "lint_passed": status == "completed",
+            "tests_passed": False,
+            "lint_passed": False,
             "acceptance_criteria": criteria_payload,
         },
         "questions": [],
@@ -1102,6 +1101,55 @@ def recover_truncated_cursor_result(
         ],
         "limitations": ["Recovered from truncated Cursor payload"],
         "truncated_recovery": True,
+    }
+
+
+def native_cursor_summary_as_result(
+    summary: str,
+    *,
+    expected_task_id: str,
+    acceptance_criteria: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Treat Cursor's post-run prose summary as a completion for QA."""
+    text = str(summary or "").strip()
+    if len(text) < 24:
+        return None
+    from .cursorremote_drive import summary_looks_incomplete
+
+    if summary_looks_incomplete(text):
+        return None
+    tid_match = re.search(r'"task_id"\s*:\s*"?(\d+)"?', text)
+    if tid_match is not None and tid_match.group(1) != str(expected_task_id).strip():
+        return None
+    criteria_payload: list[dict[str, Any]] = []
+    for criterion in acceptance_criteria or []:
+        text_c = str(criterion or "").strip()
+        if not text_c:
+            continue
+        criteria_payload.append(
+            {
+                "criterion": text_c,
+                "passed": False,
+                "evidence": "Cursor posted a completion summary; verify this criterion in QA.",
+            }
+        )
+    return {
+        "task_id": str(expected_task_id),
+        "status": "completed",
+        "implementation": {
+            "summary": text[:8000],
+            "files_changed": [],
+            "tests": [],
+        },
+        "verification": {
+            "tests_passed": False,
+            "lint_passed": False,
+            "acceptance_criteria": criteria_payload,
+        },
+        "questions": [],
+        "risks": ["Native Cursor summary — PM must verify acceptance criteria."],
+        "limitations": ["No structured JSON payload; used Cursor completion summary."],
+        "native_summary": True,
     }
 
 
@@ -1201,7 +1249,7 @@ async def transition_pm_phase(
         from .tracker_poll import sync_work_item_tracker_card
 
         tracker_result = await sync_work_item_tracker_card(
-            item, phase=to_phase, mcp=mcp
+            item, phase=to_phase, mcp=mcp, db=db
         )
     except Exception as exc:
         logger.warning(

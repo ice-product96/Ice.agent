@@ -31,6 +31,15 @@ def _is_tools_reasoning_conflict(exc: BaseException) -> bool:
     return "reasoning_effort" in text and "function tools" in text
 
 
+def _response_format_unsupported(exc: BaseException) -> bool:
+    """Provider rejected strict json_schema response_format (older compatible APIs)."""
+    status = getattr(exc, "status_code", None)
+    if status not in (None, 400, 404, 422):
+        return False
+    text = str(exc).lower()
+    return "response_format" in text or "json_schema" in text or "structured output" in text
+
+
 def _attachment_mime(attachment: dict[str, Any]) -> str:
     mime = str(attachment.get("mime_type") or "").strip().lower()
     if mime == "image/jpg":
@@ -329,6 +338,66 @@ class LLMClient:
             "Повторите короткое указание или откройте кейс в панели и нажмите «Продолжи»."
         )
 
+    async def structured(
+        self,
+        *,
+        system: str,
+        user: str | list[dict[str, Any]],
+        schema: dict[str, Any],
+        schema_name: str,
+        model: str | None = None,
+        timeout: float = 45.0,
+    ) -> tuple[str, dict[str, Any]]:
+        """One completion constrained to a JSON schema. Returns (json_text, usage).
+
+        Uses strict json_schema response_format; falls back to json_object mode with the
+        schema embedded in the prompt for OpenAI-compatible providers that reject it.
+        Raises on transport / provider errors so callers can fail closed.
+        """
+        target_model = (model or self.model or "").strip()
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        strict_format = {
+            "type": "json_schema",
+            "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+        }
+        kwargs: dict[str, Any] = {
+            "model": target_model,
+            "messages": messages,
+            "response_format": strict_format,
+            "timeout": timeout,
+        }
+        try:
+            response = await self.client.chat.completions.create(**kwargs)
+        except APIStatusError as exc:
+            if not _response_format_unsupported(exc):
+                raise
+            logger.info("llm.structured fallback to json_object model=%s: %s", target_model, exc)
+            fallback_messages = list(messages)
+            fallback_messages[0] = {
+                "role": "system",
+                "content": (
+                    f"{system}\n\nReturn ONLY a JSON object that validates against this JSON schema:\n"
+                    f"{json.dumps(schema, ensure_ascii=False)}"
+                ),
+            }
+            kwargs["messages"] = fallback_messages
+            kwargs["response_format"] = {"type": "json_object"}
+            response = await self.client.chat.completions.create(**kwargs)
+        message = response.choices[0].message
+        text = (message.content or "").strip()
+        if not text:
+            raise RuntimeError("structured completion returned empty content")
+        usage = getattr(response, "usage", None)
+        meta = {
+            "model": getattr(response, "model", None) or target_model,
+            "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
+            "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
+        }
+        return text, meta
+
     async def transcribe_audio(
         self,
         data: bytes,
@@ -405,6 +474,10 @@ class MemoryStore:
         }
         if llm.get("base_url"):
             config["openai_base_url"] = llm["base_url"]
+        # mem0 defaults temperature/top_p to 0.1; gpt-5.6-* rejects both.
+        # is_reasoning_model strips them from the request (mem0's GPT-5 path).
+        if "gpt-5.6" in (model or "").strip().lower():
+            config["is_reasoning_model"] = True
         return {"provider": "openai", "config": config}
 
     @staticmethod
@@ -618,6 +691,11 @@ class MemoryStore:
         self._history[key] = [{"event": "ADD", "memory": text}]
         return self._fallback[key]
 
+    @property
+    def degraded(self) -> bool:
+        """True when a backend was configured but is unavailable. Fail closed."""
+        return self._client is None and bool(self.last_error)
+
     async def search_scoped(
         self,
         query: str,
@@ -625,6 +703,7 @@ class MemoryStore:
         user_id: str | None = None,
         agent_id: str | None = None,
         project_id: str | None = None,
+        customer_id: str | None = None,
         filters: dict[str, Any] | None = None,
         include_global: bool = True,
         limit: int = 10,
@@ -635,7 +714,7 @@ class MemoryStore:
 
         def add_items(items: list[dict[str, Any]]) -> None:
             for item in items:
-                identity = str(item.get("id") or id(item))
+                identity = str(item.get("id") or item.get("memory") or id(item))
                 if identity in seen:
                     continue
                 seen.add(identity)
@@ -643,40 +722,50 @@ class MemoryStore:
 
         extra_filters = dict(filters or {})
         normalized_project = str(project_id or "").strip()
-        if normalized_project:
-            add_items(
-                await self.search(
-                    query,
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    filters={**extra_filters, "project_id": normalized_project},
-                    limit=limit,
+        normalized_customer = str(customer_id or "").strip()
+        if normalized_customer and "customer_id" not in extra_filters:
+            extra_filters["customer_id"] = normalized_customer
+
+        customer_user = f"customer:{normalized_customer}" if normalized_customer else None
+        search_users = [user_id]
+        if customer_user and customer_user != user_id:
+            search_users.append(customer_user)
+
+        for search_user in search_users:
+            if normalized_project:
+                add_items(
+                    await self.search(
+                        query,
+                        user_id=search_user,
+                        agent_id=agent_id,
+                        filters={**extra_filters, "project_id": normalized_project},
+                        limit=limit,
+                    )
                 )
-            )
-        if include_global:
-            broad = await self.search(
-                query,
-                user_id=user_id,
-                agent_id=agent_id,
-                filters=extra_filters or None,
-                limit=max(limit, limit * 2),
-            )
-            global_items = [
-                item
-                for item in broad
-                if not str((item.get("metadata") or {}).get("project_id") or "").strip()
-            ]
-            add_items(global_items)
-        elif not normalized_project:
-            add_items(
-                await self.search(
+            if include_global:
+                broad = await self.search(
                     query,
-                    user_id=user_id,
+                    user_id=search_user,
                     agent_id=agent_id,
                     filters=extra_filters or None,
-                    limit=limit,
+                    limit=max(limit, limit * 2),
                 )
-            )
+                global_items = [
+                    item
+                    for item in broad
+                    if not str((item.get("metadata") or {}).get("project_id") or "").strip()
+                ]
+                add_items(global_items)
+            elif not normalized_project:
+                add_items(
+                    await self.search(
+                        query,
+                        user_id=search_user,
+                        agent_id=agent_id,
+                        filters=extra_filters or None,
+                        limit=limit,
+                    )
+                )
         return merged[:limit]
 
     async def search(
@@ -698,13 +787,23 @@ class MemoryStore:
                 limit=limit,
             )
             items.extend(self._items(result))
-        words = query.lower().split()
-        items.extend(
-            item for item in self._fallback.values()
+            return items[:limit]
+        # In-process store (tests / no backend). Rank by overlap; do not drop
+        # scope matches — substring filtering is not a decision path.
+        words = [word for word in str(query or "").lower().split() if word]
+        scoped = [
+            item
+            for item in self._fallback.values()
             if self._matches(item, scope, filters)
-            and (not words or any(word in item["memory"].lower() for word in words))
-        )
-        return items[:limit]
+        ]
+        if words:
+            scoped.sort(
+                key=lambda item: sum(
+                    1 for word in words if word in str(item.get("memory") or "").lower()
+                ),
+                reverse=True,
+            )
+        return scoped[:limit]
 
     async def get(self, memory_id: str) -> dict[str, Any] | None:
         if self._client:

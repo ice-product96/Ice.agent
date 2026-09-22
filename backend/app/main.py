@@ -41,7 +41,10 @@ async def lifespan(app: FastAPI):
     sip = SipGateway(settings, events, memory)
     mcp = McpManager()
     search = WebSearch()
-    runtime = AgentRuntime(settings, memory, search, events, telegram, mcp, sip=sip)
+    from .judgment import JudgmentService
+
+    judgment = JudgmentService(settings, events)
+    runtime = AgentRuntime(settings, memory, search, events, telegram, mcp, sip=sip, judgment=judgment)
     task_bus = TaskBus(SessionLocal, events)
     runtime.bind_task_bus(task_bus)
     task_bus.bind_runtime(runtime)
@@ -75,6 +78,10 @@ async def lifespan(app: FastAPI):
                 )
                 server.env = {}
         await db.commit()
+        try:
+            await judgment.configure(db, runtime_settings)
+        except Exception as exc:
+            await events.publish("judgment.startup_failed", {"error": str(exc)})
     if admin_settings:
         telegram.set_admin_ids(admin_settings.telegram_ids)
     telegram.configure_runtime(runtime_settings)
@@ -409,6 +416,7 @@ async def lifespan(app: FastAPI):
     app.state.sip = sip
     app.state.mcp = mcp
     app.state.runtime = runtime
+    app.state.judgment = judgment
     app.state.task_bus = task_bus
     app.state.telegram_router = telegram_router
     app.state.scheduler = scheduler
