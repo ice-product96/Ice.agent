@@ -13,6 +13,7 @@ from app.runtime import (
     _apply_pm_cursor_result,
     _auto_accept_pm_qa,
     _tick_focus_item,
+    release_idle_cursor_for_force_tick,
 )
 
 
@@ -917,4 +918,128 @@ async def test_delivered_awaiting_result_keeps_the_same_cursor_chat(
         )
         assert (item.metadata_json or {}).get("cursor_remote_task_id") == "task-59"
         assert "submit_development_task" not in (item.next_action or "")
+    await engine.dispose()
+
+
+class _ForceTickCursor:
+    def __init__(self, status: str) -> None:
+        self.status = status
+
+    async def call_tool(self, tool: str, arguments: dict | None = None):
+        status = self.status
+
+        class _Content:
+            def model_dump(self) -> dict:
+                return {
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "agentStatus": status,
+                            "pendingApprovalCount": 0,
+                            "agentActivityLive": status == "thinking",
+                        }
+                    ),
+                }
+
+        class _Resp:
+            isError = False
+            content = [_Content()]
+
+        return _Resp()
+
+
+@pytest.mark.asyncio
+async def test_force_tick_releases_idle_cursor_but_keeps_the_chat(
+    tmp_path: Path,
+) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-force-tick.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="mysell",
+            title="Purchases",
+            status="waiting_external",
+            wait_owner="external",
+            pm_phase="IN_DEVELOPMENT",
+            metadata_json={
+                "cursor_in_flight": True,
+                "cursor_session_id": "session-59",
+                "cursor_remote_task_id": "task-59",
+            },
+        )
+        db.add(item)
+        await db.flush()
+        run = CursorRun(
+            work_item_id=item.id,
+            project_id="mysell",
+            attempt=1,
+            idempotency_key="pm-force-idle",
+            status="running",
+        )
+        db.add(run)
+        await db.flush()
+        item.active_cursor_run_id = run.id
+        await db.commit()
+
+        released = await release_idle_cursor_for_force_tick(
+            db, [item], _ForceTickCursor("idle")
+        )
+
+        assert released == [item.id]
+        assert run.status == "cancelled"
+        assert item.active_cursor_run_id is None
+        assert item.pm_phase == "READY_FOR_DEV"
+        assert item.status == "in_progress"
+        assert item.metadata_json["cursor_session_id"] == "session-59"
+        assert "cursor_remote_task_id" not in item.metadata_json
+        assert item.metadata_json["cursor_in_flight"] is False
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_force_tick_leaves_a_busy_cursor_chat_alone(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-force-busy.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="mysell",
+            title="Purchases",
+            status="waiting_external",
+            wait_owner="external",
+            pm_phase="IN_DEVELOPMENT",
+            metadata_json={
+                "cursor_in_flight": True,
+                "cursor_session_id": "session-59",
+                "cursor_remote_task_id": "task-59",
+            },
+        )
+        db.add(item)
+        await db.flush()
+        run = CursorRun(
+            work_item_id=item.id,
+            project_id="mysell",
+            attempt=1,
+            idempotency_key="pm-force-busy",
+            status="running",
+        )
+        db.add(run)
+        await db.flush()
+        item.active_cursor_run_id = run.id
+        await db.commit()
+
+        released = await release_idle_cursor_for_force_tick(
+            db, [item], _ForceTickCursor("thinking")
+        )
+
+        assert released == []
+        assert run.status == "running"
+        assert item.active_cursor_run_id == run.id
+        assert item.metadata_json["cursor_session_id"] == "session-59"
+        assert item.metadata_json["cursor_remote_task_id"] == "task-59"
     await engine.dispose()

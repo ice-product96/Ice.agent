@@ -1067,6 +1067,84 @@ async def _poll_pm_cursor_item(
     )
 
 
+async def release_idle_cursor_for_force_tick(
+    db: AsyncSession,
+    items: list[Any],
+    cursor_session: Any,
+) -> list[int]:
+    """Drop a running Cursor row when the executor is idle so a manual tick can continue.
+
+    The session id stays on the case, so the next submit reuses that chat.
+    A live executor is left alone.
+    """
+    from .cursorremote_drive import cursor_worker_kwargs, peek_composer
+    from .pm_state import transition_pm_phase
+    from .work_items import add_event
+
+    released: list[int] = []
+    for item in items:
+        if item.pm_phase not in {
+            "IN_DEVELOPMENT",
+            "READY_FOR_DEV",
+            "BLOCKED",
+            "CHANGES_REQUESTED",
+        }:
+            continue
+        run = (
+            await db.get(CursorRun, item.active_cursor_run_id)
+            if item.active_cursor_run_id
+            else None
+        )
+        if run is None or run.status not in {"pending", "running"}:
+            continue
+        try:
+            peek = await peek_composer(
+                cursor_session,
+                work_item_id=item.id,
+                remote_task_id=cursor_worker_kwargs(item).get("remote_task_id"),
+            )
+        except Exception:
+            continue
+        if not peek.get("ok") or peek.get("busy"):
+            continue
+        run.status = "cancelled"
+        run.error = "Force tick: executor was idle"
+        run.completed_at = utcnow()
+        item.active_cursor_run_id = None
+        meta = dict(item.metadata_json or {})
+        meta["cursor_in_flight"] = False
+        meta.pop("cursor_remote_task_id", None)
+        item.metadata_json = meta
+        if item.pm_phase == "IN_DEVELOPMENT":
+            await transition_pm_phase(
+                db,
+                item,
+                "READY_FOR_DEV",
+                detail="Force tick: Cursor idle, continue the same chat",
+            )
+        item.status = "in_progress"
+        item.wait_owner = "self"
+        item.wait_until = None
+        item.next_action = (
+            "submit_development_task в уже открытый чат Cursor, новый чат не создавай"
+        )
+        await add_event(
+            db,
+            item,
+            kind="cursor",
+            title="Force tick: Cursor простаивал",
+            detail=(
+                "Запуск снят с ожидания. Сессия чата сохранена — "
+                "следующая отправка продолжит её."
+            ),
+            payload={"peek_status": peek.get("agentStatus")},
+        )
+        released.append(item.id)
+    if released:
+        await db.commit()
+    return released
+
+
 class TaskBus:
     def __init__(self, sessions: async_sessionmaker[AsyncSession], events: EventHub) -> None:
         self.sessions = sessions
@@ -4749,6 +4827,14 @@ class AgentRuntime:
             if work_item_aborted(tick_item):
                 return {"ok": True, "skipped": True, "reason": "work_item_aborted"}
             cursor_session = await self._cursorremote_session(db, agent)
+            if force and cursor_session is not None and pending:
+                released = await release_idle_cursor_for_force_tick(
+                    db, pending, cursor_session
+                )
+                if released:
+                    pending = await watchdog_items(db, agent.id)
+                    if not extra_work_item_id and pending:
+                        context["work_item_id"] = _tick_focus_item(pending).id
             if cursor_session is not None:
                 poll_items = list(pending)
                 if tick_item is not None and all(item.id != tick_item.id for item in poll_items):
@@ -4766,6 +4852,13 @@ class AgentRuntime:
                 message = build_watchdog_instruction(pending)
             else:
                 message = build_employee_tick_instruction(profile)
+            if force:
+                message = (
+                    "Это ручной force tick. Не откладывай кейс новым ожиданием, "
+                    "если Cursor не занят. Если у кейса уже есть чат — продолжи его, "
+                    "новый чат не создавай.\n\n"
+                    + message
+                )
             if tracker_backlog and int(tracker_backlog.get("count_claimable") or 0) > 0:
                 from .tracker_poll import (
                     build_tracker_poll_instruction,

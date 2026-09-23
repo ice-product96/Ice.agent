@@ -1531,8 +1531,12 @@ function EmployeeScreen() {
               finally { setBusy('') }
             }}>{state.profile.paused ? 'Снять паузу агента' : 'Пауза агента'}</button>
             <button className="primary" disabled={!!busy} onClick={async () => {
-              setBusy('tick')
-              try { await api.agents.tickEmployee(agentId); await load(agentId) }
+              setBusy('tick'); setError(''); setNotice('')
+              try {
+                const result = await api.agents.tickEmployee(agentId)
+                setNotice(result.message || 'Тик запущен')
+                await load(agentId)
+              }
               catch (err) { setError(err instanceof Error ? err.message : 'Тик не удался') }
               finally { setBusy('') }
             }}>{busy === 'tick' ? <LoaderCircle className="spin" size={15}/> : <Play size={15}/>}Force tick</button>

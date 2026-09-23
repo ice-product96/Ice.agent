@@ -95,7 +95,7 @@ export const api = {
       ),
     pauseEmployee: (id: string, paused = true) =>
       request<{ ok: boolean; paused: boolean }>(`/agents/${id}/employee/pause?paused=${paused ? 'true' : 'false'}`, { method: 'POST' }),
-    tickEmployee: (id: string) => request<{ ok: boolean; skipped?: boolean; reason?: string; result?: string }>(`/agents/${id}/employee/tick`, { method: 'POST' }),
+    tickEmployee: (id: string) => request<{ ok: boolean; scheduled?: boolean; skipped?: boolean; reason?: string; result?: string; message?: string }>(`/agents/${id}/employee/tick`, { method: 'POST' }),
     workItems: (id: string, status = 'open') =>
       request<{ items: WorkItem[]; counts: WorkItemCounts }>(`/agents/${id}/work-items${qs({ status, limit: 80 })}`),
     workItem: (id: string, workItemId: string) => request<WorkItem>(`/agents/${id}/work-items/${workItemId}`),

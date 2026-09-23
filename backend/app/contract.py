@@ -1146,10 +1146,20 @@ async def force_employee_tick(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     agent = await one(db, Agent, agent_id)
-    runtime = getattr(request.app.state, "runtime", None)
-    if runtime is None:
-        raise HTTPException(status_code=503, detail="Runtime unavailable")
-    return await runtime.tick(db, agent, force=True, reason="manual")
+    scheduler = getattr(request.app.state, "scheduler", None)
+    job = await schedule_immediate_tick(
+        db,
+        scheduler,
+        agent.id,
+        reason="manual",
+        force=True,
+    )
+    return {
+        "ok": True,
+        "scheduled": True,
+        "job_id": job.id,
+        "message": "Тик запущен в фоне. Кейс с простаивающим Cursor продолжится в том же чате.",
+    }
 
 
 async def _agent_work_item(db: AsyncSession, agent_id: str, work_item_id: int) -> tuple[Agent, Any]:
