@@ -999,7 +999,7 @@ class _ForceTickCursor:
 
 
 @pytest.mark.asyncio
-async def test_force_tick_releases_idle_cursor_but_keeps_the_chat(
+async def test_force_tick_does_not_drop_an_idle_cursor_chat(
     tmp_path: Path,
 ) -> None:
     engine, sessions = await sessions_for(tmp_path / "pm-force-tick.db")
@@ -1038,14 +1038,12 @@ async def test_force_tick_releases_idle_cursor_but_keeps_the_chat(
             db, [item], _ForceTickCursor("idle")
         )
 
-        assert released == [item.id]
-        assert run.status == "cancelled"
-        assert item.active_cursor_run_id is None
-        assert item.pm_phase == "READY_FOR_DEV"
-        assert item.status == "in_progress"
+        assert released == []
+        assert run.status == "running"
+        assert item.active_cursor_run_id == run.id
+        assert item.pm_phase == "IN_DEVELOPMENT"
         assert item.metadata_json["cursor_session_id"] == "session-59"
-        assert "cursor_remote_task_id" not in item.metadata_json
-        assert item.metadata_json["cursor_in_flight"] is False
+        assert item.metadata_json["cursor_remote_task_id"] == "task-59"
     await engine.dispose()
 
 

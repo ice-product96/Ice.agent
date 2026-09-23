@@ -1083,77 +1083,13 @@ async def release_idle_cursor_for_force_tick(
     items: list[Any],
     cursor_session: Any,
 ) -> list[int]:
-    """Drop a running Cursor row when the executor is idle so a manual tick can continue.
+    """Do not turn an idle Cursor chat into another send_task.
 
-    The session id stays on the case, so the next submit reuses that chat.
-    A live executor is left alone.
+    A force tick used to cancel the run and ask for submit_development_task.
+    That opened a second task in Cursor for the same case.
     """
-    from .cursorremote_drive import cursor_worker_kwargs, peek_composer
-    from .pm_state import transition_pm_phase
-    from .work_items import add_event
-
-    released: list[int] = []
-    for item in items:
-        if item.pm_phase not in {
-            "IN_DEVELOPMENT",
-            "READY_FOR_DEV",
-            "BLOCKED",
-            "CHANGES_REQUESTED",
-        }:
-            continue
-        run = (
-            await db.get(CursorRun, item.active_cursor_run_id)
-            if item.active_cursor_run_id
-            else None
-        )
-        if run is None or run.status not in {"pending", "running"}:
-            continue
-        try:
-            peek = await peek_composer(
-                cursor_session,
-                work_item_id=item.id,
-                remote_task_id=cursor_worker_kwargs(item).get("remote_task_id"),
-            )
-        except Exception:
-            continue
-        if not peek.get("ok") or peek.get("busy"):
-            continue
-        run.status = "cancelled"
-        run.error = "Force tick: executor was idle"
-        run.completed_at = utcnow()
-        item.active_cursor_run_id = None
-        meta = dict(item.metadata_json or {})
-        meta["cursor_in_flight"] = False
-        meta.pop("cursor_remote_task_id", None)
-        item.metadata_json = meta
-        if item.pm_phase == "IN_DEVELOPMENT":
-            await transition_pm_phase(
-                db,
-                item,
-                "READY_FOR_DEV",
-                detail="Force tick: Cursor idle, continue the same chat",
-            )
-        item.status = "in_progress"
-        item.wait_owner = "self"
-        item.wait_until = None
-        item.next_action = (
-            "submit_development_task в уже открытый чат Cursor, новый чат не создавай"
-        )
-        await add_event(
-            db,
-            item,
-            kind="cursor",
-            title="Force tick: Cursor простаивал",
-            detail=(
-                "Запуск снят с ожидания. Сессия чата сохранена — "
-                "следующая отправка продолжит её."
-            ),
-            payload={"peek_status": peek.get("agentStatus")},
-        )
-        released.append(item.id)
-    if released:
-        await db.commit()
-    return released
+    del db, items, cursor_session
+    return []
 
 
 class TaskBus:
@@ -3680,6 +3616,49 @@ class AgentRuntime:
                                     ),
                                 },
                             }
+                        if not operator_force:
+                            bound = dict(item.metadata_json or {})
+                            session_id = str(bound.get("cursor_session_id") or "").strip()
+                            remote_id = str(bound.get("cursor_remote_task_id") or "").strip()
+                            if not session_id and not remote_id:
+                                prior = await db.scalar(
+                                    select(CursorRun)
+                                    .where(CursorRun.work_item_id == item.id)
+                                    .order_by(CursorRun.id.desc())
+                                    .limit(1)
+                                )
+                                prior_result = (
+                                    prior.result_json
+                                    if prior is not None
+                                    and isinstance(prior.result_json, dict)
+                                    else {}
+                                )
+                                session_id = str(
+                                    prior_result.get("cursor_session_id") or ""
+                                ).strip()
+                                remote_id = str(
+                                    prior_result.get("cursor_remote_task_id") or ""
+                                ).strip()
+                                if session_id or remote_id:
+                                    if session_id:
+                                        bound["cursor_session_id"] = session_id
+                                    if remote_id:
+                                        bound["cursor_remote_task_id"] = remote_id
+                                    bound["cursor_in_flight"] = True
+                                    item.metadata_json = bound
+                            if session_id or remote_id:
+                                await db.commit()
+                                return {
+                                    "task_id": str(item.id),
+                                    "status": "already_sent",
+                                    "done": False,
+                                    "prompt_sent": False,
+                                    "duplicate": True,
+                                    "reason": (
+                                        "This case already has a Cursor task. "
+                                        "Call get_development_status. Do not send another task."
+                                    ),
+                                }
                         attempt = int(
                             await db.scalar(
                                 select(func.count())
