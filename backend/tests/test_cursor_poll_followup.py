@@ -857,3 +857,64 @@ async def test_workspace_unavailable_is_self_retry_not_manager(
         assert "submit_development_task" in (item.next_action or "")
         assert run.status == "cancelled"
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_delivered_awaiting_result_keeps_the_same_cursor_chat(
+    tmp_path: Path,
+) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-awaiting.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="mysell",
+            title="Purchases",
+            status="in_progress",
+            wait_owner="self",
+            pm_phase="IN_DEVELOPMENT",
+        )
+        db.add(item)
+        await db.flush()
+        run = CursorRun(
+            work_item_id=item.id,
+            project_id="mysell",
+            attempt=19,
+            idempotency_key="pm-awaiting",
+            status="running",
+        )
+        db.add(run)
+        await db.flush()
+        item.active_cursor_run_id = run.id
+        await db.commit()
+
+        result = await _apply_pm_cursor_result(
+            db,
+            item,
+            run,
+            {
+                "done": False,
+                "prompt_sent": True,
+                "started": False,
+                "seen_busy": False,
+                "status": "awaiting_result",
+                "summary": "Проверю текущее состояние модуля закупок и прихода.",
+                "cursor_session_id": "6008f189-8c35-4e29-8e57-86d7e132ab8f",
+                "cursor_remote_task_id": "task-59",
+            },
+        )
+
+        assert result["status"] == "in_progress"
+        assert result["done"] is False
+        assert run.status == "running"
+        assert item.pm_phase == "IN_DEVELOPMENT"
+        assert item.status == "waiting_external"
+        assert item.active_cursor_run_id == run.id
+        assert (item.metadata_json or {}).get("cursor_session_id") == (
+            "6008f189-8c35-4e29-8e57-86d7e132ab8f"
+        )
+        assert (item.metadata_json or {}).get("cursor_remote_task_id") == "task-59"
+        assert "submit_development_task" not in (item.next_action or "")
+    await engine.dispose()

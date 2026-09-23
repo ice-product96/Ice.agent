@@ -647,8 +647,15 @@ async def _apply_pm_cursor_result(
                     detail=completion.reason[:800],
                     payload={"completion": completion.as_dict()},
                 )
-    started = prompt_actually_started(result)
     status_name = str(result.get("status") or "").strip().lower()
+    # send_task already opened a chat and the executor started writing. An idle
+    # status probe must not cancel that chat and make the next tick open another one.
+    delivered_waiting = bool(result.get("prompt_sent")) and status_name in {
+        "awaiting_result",
+        "working",
+        "timeout",
+    }
+    started = prompt_actually_started(result) or delivered_waiting
     composer_busy = status_name == "cursor_busy" or (
         bool(result.get("skipped_prompt")) and bool(result.get("seen_busy"))
     )
@@ -3526,6 +3533,27 @@ class AgentRuntime:
                                 "error": peek.get("error"),
                             },
                         )
+                        active_run = (
+                            await db.get(CursorRun, item.active_cursor_run_id)
+                            if item.active_cursor_run_id
+                            else None
+                        )
+                        if active_run is not None and active_run.status in {
+                            "pending",
+                            "running",
+                        }:
+                            return {
+                                "task_id": str(item.id),
+                                "run_id": active_run.id,
+                                "status": "in_progress",
+                                "done": False,
+                                "duplicate": True,
+                                "prompt_sent": False,
+                                "reason": (
+                                    "This case already has a Cursor chat in progress. "
+                                    "Call get_development_status. Do not open another chat."
+                                ),
+                            }
                         if peek.get("busy"):
                             await add_event(
                                 db,
