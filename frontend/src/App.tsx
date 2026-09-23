@@ -1376,6 +1376,8 @@ function EmployeeScreen() {
     if (!agentId || !selectedId) return
     if (action === 'delete' && !confirmDelete) {
       setConfirmDelete(true)
+      setNotice('Нажмите «Подтвердить удаление» ещё раз — кейс будет удалён вместе с запуском Cursor.')
+      setError('')
       return
     }
     setBusy(action); setError(''); setNotice('')
@@ -1691,8 +1693,12 @@ function EmployeeScreen() {
           <button className="danger compact" disabled={!!busy} onClick={() => void runWorkAction('delete')}>
             {confirmDelete ? 'Подтвердить удаление' : 'Удалить кейс'}
           </button>
-          {confirmDelete && <button type="button" className="secondary compact" disabled={!!busy} onClick={() => setConfirmDelete(false)}>Не удалять</button>}
+          {confirmDelete && <button type="button" className="secondary compact" disabled={!!busy} onClick={() => { setConfirmDelete(false); setNotice('') }}>Не удалять</button>}
         </div>
+        {(error || notice) && <div className="work-action-feedback">
+          {error && <Alert message={error}/>}
+          {notice && !error && <p className="notice-banner">{notice}</p>}
+        </div>}
         </>}
 
         {caseTab === 'judgments' && <>

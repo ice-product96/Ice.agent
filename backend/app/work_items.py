@@ -1603,6 +1603,9 @@ def build_watchdog_instruction(items: list[WorkItem]) -> str:
         "по тому же заказчику. Закрытый кейс не переиспользуй.",
         "Если кейс «Жду Cursor»: только cursorremote_check. Не вызывай cursorremote_do "
         "с текстом вроде «Cursor остановился на поиске» — это дублирует задачу. Поиск не остановка.",
+        "Если ниже сказано, что кейс уже отправлялся в Cursor несколько раз — это та же задача. "
+        "Не открывай новый чат и не начинай с нуля. Продолжи сохранённую сессию или закрой кейс, "
+        "если работа уже сделана.",
         "Если кейс «Коплю задание» и wait ещё не вышел — не выполняй и не зови Cursor.",
         "Если кейс «Коплю задание» уже просрочен — разбери сводку: уточнить, "
         "согласовать ТЗ или взять срез. Не зови Cursor вслепую и не пиши про таймер.",
@@ -1730,18 +1733,9 @@ async def abort_work_item(
     scheduler: Any | None = None,
 ) -> WorkItem:
     if item.pm_phase not in {"DISCUSSION", "DONE", "CANCELLED"}:
-        from .db import CursorRun
         from .pm_state import can_transition, transition_pm_phase
 
-        active_run = (
-            await db.get(CursorRun, item.active_cursor_run_id)
-            if item.active_cursor_run_id
-            else None
-        )
-        if active_run is not None and active_run.status in {"pending", "running"}:
-            raise ValueError(
-                "Cannot abort while Cursor is active without confirmed remote termination"
-            )
+        await detach_cursor_run(db, item)
         if can_transition(item.pm_phase, "CANCELLED"):
             await transition_pm_phase(
                 db,
@@ -1794,6 +1788,69 @@ async def close_work_item(
     )
 
 
+async def detach_cursor_run(db: AsyncSession, item: WorkItem) -> None:
+    """Drop a locally tracked Cursor run so the operator can delete, abort, or reset.
+
+    The remote chat is not killed from here. The case simply stops treating the
+    run as active, which is what blocked those actions after a stale 'running' flag.
+    """
+    from .db import CursorRun
+
+    run = (
+        await db.get(CursorRun, item.active_cursor_run_id)
+        if item.active_cursor_run_id
+        else None
+    )
+    if run is not None and run.status in {"pending", "running"}:
+        run.status = "cancelled"
+        run.error = (run.error or "Оператор остановил привязку к Cursor")[:2000]
+        run.completed_at = utcnow()
+    item.active_cursor_run_id = None
+    meta = dict(item.metadata_json or {})
+    meta["cursor_in_flight"] = False
+    item.metadata_json = meta
+    await db.flush()
+
+
+async def cursor_attempt_note(db: AsyncSession, items: list[WorkItem]) -> str:
+    """Tell the agent when the same case was already sent to Cursor more than once."""
+    from .db import CursorRun
+
+    lines: list[str] = []
+    for item in items[:8]:
+        total = int(
+            await db.scalar(
+                select(func.count())
+                .select_from(CursorRun)
+                .where(CursorRun.work_item_id == item.id)
+            )
+            or 0
+        )
+        if total < 2:
+            continue
+        recent = list(
+            await db.scalars(
+                select(CursorRun)
+                .where(CursorRun.work_item_id == item.id)
+                .order_by(CursorRun.id.desc())
+                .limit(4)
+            )
+        )
+        bits = [f"#{run.attempt} {run.status}" for run in reversed(recent)]
+        session = str((item.metadata_json or {}).get("cursor_session_id") or "").strip()
+        same_chat = (
+            f" Сессия чата сохранена ({session})."
+            if session
+            else ""
+        )
+        lines.append(
+            f"Кейс #{item.id} уже отправлялся в Cursor {total} раз ({', '.join(bits)}). "
+            "Это одна и та же задача, не новая. Не открывай новый чат и не начинай работу с нуля."
+            f"{same_chat} Продолжи существующий чат или закрой кейс, если результат уже есть."
+        )
+    return "\n".join(lines)
+
+
 async def delete_work_item(
     db: AsyncSession,
     item: WorkItem,
@@ -1802,6 +1859,7 @@ async def delete_work_item(
 ) -> None:
     from sqlalchemy import delete
 
+    await detach_cursor_run(db, item)
     await cancel_work_item_schedules(db, item, scheduler, mark_aborted=True)
     await db.execute(delete(WorkItemEvent).where(WorkItemEvent.work_item_id == item.id))
     await db.delete(item)

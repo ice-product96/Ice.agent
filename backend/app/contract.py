@@ -1429,16 +1429,6 @@ async def abort_agent_work_item(
             "item": work_item_json(item),
             "message": "Кейс уже отменён.",
         }
-    if item.active_cursor_run_id:
-        active_run = await db.get(CursorRun, item.active_cursor_run_id)
-        if active_run is not None and active_run.status in {"pending", "running"}:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Cursor run is still active; cancellation requires confirmed "
-                    "remote termination"
-                ),
-            )
     scheduler = getattr(request.app.state, "scheduler", None)
     await abort_work_item(db, item, note=payload.note, scheduler=scheduler)
     return {
@@ -1458,13 +1448,6 @@ async def delete_agent_work_item(
     from .work_items import delete_work_item
 
     _, item = await _agent_work_item(db, agent_id, work_item_id)
-    if item.active_cursor_run_id:
-        active_run = await db.get(CursorRun, item.active_cursor_run_id)
-        if active_run is not None and active_run.status in {"pending", "running"}:
-            raise HTTPException(
-                status_code=409,
-                detail="Cannot delete a task while Cursor execution is active",
-            )
     scheduler = getattr(request.app.state, "scheduler", None)
     await delete_work_item(db, item, scheduler=scheduler)
     return {"ok": True, "deleted_id": work_item_id}
@@ -1519,20 +1502,11 @@ async def reset_agent_work_item_cursor(
     note = (payload.note or "").strip() or "Сброс привязки case→Cursor по указанию руководителя."
     if item.pm_phase in {"DONE", "CANCELLED"}:
         raise HTTPException(status_code=409, detail="Closed PM task cannot reset Cursor")
+    from .work_items import detach_cursor_run
+
+    await detach_cursor_run(db, item)
     if item.pm_phase != "DISCUSSION":
         from .pm_state import transition_pm_phase
-
-        if item.active_cursor_run_id:
-            active_run = await db.get(CursorRun, item.active_cursor_run_id)
-            if active_run is not None and active_run.status in {"pending", "running"}:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Cursor run is still active; reset is unsafe until remote "
-                        "execution reaches a terminal state"
-                    ),
-                )
-            item.active_cursor_run_id = None
         if item.pm_phase == "IN_DEVELOPMENT":
             await transition_pm_phase(db, item, "BLOCKED", detail=note)
         if item.pm_phase in {"DEV_COMPLETE", "QA", "CLIENT_REVIEW"}:

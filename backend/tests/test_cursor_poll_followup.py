@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import Agent, Base, CronJob, CursorRun, WorkItem, utcnow
+from app.work_items import cursor_attempt_note, delete_work_item, detach_cursor_run
 from app.employee import EmployeeService
 from app.runtime import (
     AgentRuntime,
@@ -1042,4 +1043,63 @@ async def test_force_tick_leaves_a_busy_cursor_chat_alone(tmp_path: Path) -> Non
         assert item.active_cursor_run_id == run.id
         assert item.metadata_json["cursor_session_id"] == "session-59"
         assert item.metadata_json["cursor_remote_task_id"] == "task-59"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_operator_can_delete_a_case_with_a_running_cursor_flag(
+    tmp_path: Path,
+) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-delete-running.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="mysell",
+            title="Purchases",
+            status="waiting_external",
+            pm_phase="IN_DEVELOPMENT",
+            metadata_json={"cursor_in_flight": True, "cursor_session_id": "session-59"},
+        )
+        db.add(item)
+        await db.flush()
+        run = CursorRun(
+            work_item_id=item.id,
+            project_id="mysell",
+            attempt=11,
+            idempotency_key="pm-delete-running",
+            status="running",
+        )
+        db.add(run)
+        await db.flush()
+        item.active_cursor_run_id = run.id
+        await db.commit()
+        item_id = item.id
+
+        await detach_cursor_run(db, item)
+        assert item.active_cursor_run_id is None
+        assert run.status == "cancelled"
+        assert item.metadata_json["cursor_in_flight"] is False
+        assert item.metadata_json["cursor_session_id"] == "session-59"
+
+        note = await cursor_attempt_note(db, [item])
+        assert "уже отправлялся в Cursor" not in note
+
+        second = CursorRun(
+            work_item_id=item.id,
+            project_id="mysell",
+            attempt=12,
+            idempotency_key="pm-delete-running-2",
+            status="cancelled",
+        )
+        db.add(second)
+        await db.commit()
+        note = await cursor_attempt_note(db, [item])
+        assert "уже отправлялся в Cursor 2 раз" in note
+        assert "session-59" in note
+
+        await delete_work_item(db, item)
+        assert await db.get(WorkItem, item_id) is None
     await engine.dispose()

@@ -2407,9 +2407,16 @@ class AgentRuntime:
                             "attempt": row.attempt,
                             "status": row.status,
                             "error": row.error,
+                            "summary": str(
+                                (row.result_json or {}).get("summary") or ""
+                            )[:400],
                         }
                         for row in runs
                     ],
+                    "repeated_cursor_work": len(runs) > 1,
+                    "cursor_session_id": str(
+                        (item.metadata_json or {}).get("cursor_session_id") or ""
+                    ),
                 }
 
             async def pm_record_decision(
@@ -4859,6 +4866,11 @@ class AgentRuntime:
                     "новый чат не создавай.\n\n"
                     + message
                 )
+            from .work_items import cursor_attempt_note
+
+            attempt_note = await cursor_attempt_note(db, pending)
+            if attempt_note:
+                message = f"{message}\n\n{attempt_note}"
             if tracker_backlog and int(tracker_backlog.get("count_claimable") or 0) > 0:
                 from .tracker_poll import (
                     build_tracker_poll_instruction,
