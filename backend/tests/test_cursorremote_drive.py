@@ -792,6 +792,67 @@ def test_send_task_passes_task_id_and_chat_id() -> None:
     assert result["prompt_sent"] is True
 
 
+def test_send_task_keeps_the_worker_task_when_composer_stays_idle() -> None:
+    idle = {"agentStatus": "idle", "pendingApprovalCount": 0, "agentActivityLive": False}
+    prompt = "Implement orders, sales and write-offs"
+    session = ScriptSession(
+        {
+            "get_status": [idle],
+            "create_session": [
+                {"ok": True, "session": {"id": "sess-63", "composerId": "cmp-63"}}
+            ],
+            "send_task": [
+                {
+                    "ok": True,
+                    "task": {
+                        "id": "remote-63",
+                        "sessionId": "sess-63",
+                        "status": "queued",
+                    },
+                }
+            ],
+            "get_task": [
+                {
+                    "ok": True,
+                    "done": False,
+                    "agentStatus": "idle",
+                    "agentActivityLive": False,
+                    "pendingApprovalCount": 0,
+                    "task": {"id": "remote-63", "status": "queued"},
+                }
+            ],
+            "get_messages": [{"ok": True, "messages": []}],
+        },
+        default=idle,
+        tool_names=[
+            "create_session",
+            "send_task",
+            "get_task",
+            "get_messages",
+            "get_status",
+            "list_windows",
+        ],
+    )
+    result = asyncio.run(
+        send_prompt_and_drive(
+            session,
+            prompt,
+            timeout_ms=200,
+            task_id="63",
+            work_item_id=63,
+            public_base_url="https://agent.example",
+            secret_key="test-secret",
+        )
+    )
+    assert result["ok"] is True
+    assert result["done"] is False
+    assert result["prompt_sent"] is True
+    assert result["status"] == "awaiting_result"
+    assert result["cursor_session_id"] == "sess-63"
+    assert result["cursor_remote_task_id"] == "remote-63"
+    assert result["status"] != "not_started"
+
+
 def test_send_task_retries_without_callback_if_mcp_rejects_it() -> None:
     idle = {"agentStatus": "idle", "pendingApprovalCount": 0, "agentActivityLive": False}
     thinking = {

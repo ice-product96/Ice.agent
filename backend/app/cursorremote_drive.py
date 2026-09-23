@@ -1358,6 +1358,42 @@ async def _send_worker_task(
             worker_status = None
         if cursor_is_explicitly_busy(worker_status):
             landed = {**landed, "landed": True, "busy": True, "status": worker_status}
+        else:
+            # send_task already created a worker task. The composer window often
+            # stays idle for a while, which is not "the prompt was rejected".
+            log_cursor_stage(
+                "send_task_accepted_waiting",
+                work_item_id=work_item_id,
+                session_id=sid,
+                remote_task_id=remote_id,
+            )
+            return {
+                "ok": True,
+                "done": False,
+                "sent": sent,
+                "prompt_sent": True,
+                "started": True,
+                "seen_busy": False,
+                "status": "awaiting_result",
+                "reason": "",
+                "summary": landed.get("summary") or "",
+                "next": FOLLOW_UP_HINT,
+                "workspace": workspace_path or workspace_info.get("workspace"),
+                "windows": workspace_info.get("windows") or [],
+                "last": worker_status or landed.get("status"),
+                "cursor_session_id": sid,
+                "cursor_remote_task_id": remote_id,
+                "cursor_composer_id": composer_id,
+                "cursor_window_id": window_id,
+                "cursor_workspace": workspace_path,
+                "workspace": workspace_path,
+                "task_id": str(task_id or work_item_id or ""),
+                "chat_id": chat_id,
+                "file_delivery": {
+                    "method": delivery.get("method"),
+                    "paths": delivery.get("paths") or [],
+                },
+            }
     if not landed.get("landed"):
         reason = (
             "send_task returned, but Composer did not start this assignment."
