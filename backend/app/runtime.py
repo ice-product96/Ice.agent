@@ -655,6 +655,17 @@ async def _apply_pm_cursor_result(
         "working",
         "timeout",
     }
+    if not delivered_waiting and status_name == "working" and str(
+        result.get("summary") or ""
+    ).strip():
+        delivered_waiting = True
+    if not delivered_waiting and str(result.get("cursor_remote_task_id") or "").strip():
+        delivered_waiting = status_name in {
+            "not_started",
+            "awaiting_result",
+            "working",
+            "timeout",
+        }
     started = prompt_actually_started(result) or delivered_waiting
     composer_busy = status_name == "cursor_busy" or (
         bool(result.get("skipped_prompt")) and bool(result.get("seen_busy"))

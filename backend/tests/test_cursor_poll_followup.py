@@ -922,6 +922,55 @@ async def test_delivered_awaiting_result_keeps_the_same_cursor_chat(
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_working_summary_is_not_treated_as_rejected(tmp_path: Path) -> None:
+    engine, sessions = await sessions_for(tmp_path / "pm-working-summary.db")
+    async with sessions() as db:
+        agent = Agent(name="pm")
+        db.add(agent)
+        await db.flush()
+        item = WorkItem(
+            agent_id=agent.id,
+            project_id="mysell",
+            title="Orders",
+            status="in_progress",
+            wait_owner="self",
+            pm_phase="IN_DEVELOPMENT",
+        )
+        db.add(item)
+        await db.flush()
+        run = CursorRun(
+            work_item_id=item.id,
+            project_id="mysell",
+            attempt=1,
+            idempotency_key="pm-working-summary",
+            status="running",
+        )
+        db.add(run)
+        await db.flush()
+        item.active_cursor_run_id = run.id
+        await db.commit()
+
+        result = await _apply_pm_cursor_result(
+            db,
+            item,
+            run,
+            {
+                "done": False,
+                "prompt_sent": False,
+                "started": False,
+                "seen_busy": False,
+                "status": "working",
+                "summary": "В схеме есть закупки и склады, клиентов пока нет.",
+            },
+        )
+
+        assert result["status"] == "in_progress"
+        assert run.status == "running"
+        assert item.pm_phase == "IN_DEVELOPMENT"
+    await engine.dispose()
+
+
 class _ForceTickCursor:
     def __init__(self, status: str) -> None:
         self.status = status
